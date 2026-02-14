@@ -1,0 +1,78 @@
+// src/gaia/eval/evaluateSoft.ts
+import type { ExtractedForEval, PlanetKind } from "./extractForEval";
+
+export type SoftParams = {
+  wOuter: number;
+  wTouch: number;
+  wFavor: number;
+  wAvoid: number;
+  favorTargets: PlanetKind[];
+  avoidTargets: PlanetKind[];
+};
+
+export type SoftBreakdown = {
+  outerTouchPenalty: {
+    outerNormalCount: number;
+    touchNormalCount: number;
+    penaltyOuter: number;
+    penaltyTouch: number;
+    penaltyTotal: number;
+  };
+  favor: {
+    targets: PlanetKind[];
+    sumPoints: number;
+    score: number;
+  };
+  avoid: {
+    targets: PlanetKind[];
+    sumPoints: number;
+    score: number;
+  };
+};
+
+export type SoftEvalResult = {
+  score: number;
+  breakdown: SoftBreakdown;
+};
+
+// NOTE: points は現時点で LogicalMap 側に無い前提のため 0 扱い。
+// 将来: extractForEval で points を持たせる、または sectorTiles 参照で付与。
+export function evaluateSoft(extracted: ExtractedForEval, params: SoftParams): SoftEvalResult {
+  const outerNormalCount = extracted.audit.outerNormalCount;
+  const touchNormalCount = extracted.audit.touchNormalCount;
+
+  const penaltyOuter = -params.wOuter * outerNormalCount;
+  const penaltyTouch = -params.wTouch * touchNormalCount;
+  const penaltyTotal = penaltyOuter + penaltyTouch;
+
+  const favor = evalTargets(extracted, params.favorTargets, params.wFavor, +1);
+  const avoid = evalTargets(extracted, params.avoidTargets, params.wAvoid, -1);
+
+  const breakdown: SoftBreakdown = {
+    outerTouchPenalty: { outerNormalCount, touchNormalCount, penaltyOuter, penaltyTouch, penaltyTotal },
+    favor,
+    avoid,
+  };
+
+  const score = penaltyTotal + favor.score + avoid.score;
+  return { score, breakdown };
+}
+
+function evalTargets(
+  extracted: ExtractedForEval,
+  targets: PlanetKind[],
+  w: number,
+  sign: 1 | -1
+): { targets: PlanetKind[]; sumPoints: number; score: number } {
+  const set = new Set(targets);
+  let sum = 0;
+
+  for (const cell of extracted.planetCells) {
+    if (!cell.planetKind) continue;
+    if (!set.has(cell.planetKind)) continue;
+    // 現時点では points を持たないため 0
+    sum += 0;
+  }
+
+  return { targets, sumPoints: sum, score: sign * w * sum };
+}

@@ -1,0 +1,178 @@
+"use client";
+
+import React, { useMemo, useState } from "react";
+import { buildLogicalMap } from "@/gaia/logicalMap/buildLogicalMap";
+
+type Axial = { q: number; r: number };
+
+function padRight(s: string, n: number) {
+  if (s.length >= n) return s;
+  return s + " ".repeat(n - s.length);
+}
+
+function cellLabel(cell: any, cellWidth: number) {
+  // Spec: show planet name as-is (BLACK, WHITE, ...)
+  if (!cell) return padRight(".", cellWidth);
+  if (cell.kind === "planet") return padRight(String(cell.planetType ?? "PLANET"), cellWidth);
+  if (cell.kind === "special") return padRight("SPECIAL", cellWidth);
+  // space/empty
+  return padRight(".", cellWidth);
+}
+
+/**
+ * Render an axial-hex grid as "hex-shaped" ASCII with indentation by row.
+ * We print rows by r from minR..maxR and q from minQ..maxQ.
+ *
+ * This is a pragmatic debug renderer:
+ * - Each row is staggered by indentation so adjacency "looks" hex-like.
+ * - Each cell is rendered as a fixed-width token (planet name or '.').
+ */
+function renderHexDump(result: any, opts?: { cellWidth?: number; maxCols?: number }) {
+  const cellWidth = Math.max(4, opts?.cellWidth ?? 8);
+  const cellsByKey: Map<string, any> | undefined = result?.cellsByKey;
+  const bounds = result?.bounds;
+  if (!cellsByKey || !bounds) return "[no cells]";
+
+  const minQ = Number(bounds.minQ ?? 0);
+  const maxQ = Number(bounds.maxQ ?? 0);
+  const minR = Number(bounds.minR ?? 0);
+  const maxR = Number(bounds.maxR ?? 0);
+
+  // Safety guard for huge dumps (informational only)
+  const maxCols = opts?.maxCols ?? 120;
+  const qSpan = maxQ - minQ + 1;
+  const approxLineLen = qSpan * (cellWidth + 1) + Math.abs(maxR - minR) * (cellWidth / 2);
+  const warnHuge = approxLineLen > maxCols * 4;
+
+  const lines: string[] = [];
+  lines.push(
+    `Legend: token=${cellWidth} chars, '.'=space/empty | q:[${minQ},${maxQ}] r:[${minR},${maxR}] cells=${cellsByKey.size}`
+  );
+  if (warnHuge) {
+    lines.push(`(note) dump may be wide; reduce zoom or adjust bounds/centers if needed.`);
+  }
+  lines.push("");
+
+  for (let r = minR; r <= maxR; r++) {
+    // simple stagger: each next row indents by half a cell
+    const indentUnits = r - minR;
+    const indent = " ".repeat(Math.floor((cellWidth / 2) * indentUnits));
+
+    const rowTokens: string[] = [];
+    for (let q = minQ; q <= maxQ; q++) {
+      const k = `${q},${r}`;
+      const cell = cellsByKey.get(k);
+      rowTokens.push(cellLabel(cell, cellWidth));
+    }
+
+    lines.push(`${padRight(String(r), 4)}| ${indent}${rowTokens.join(" ")}`);
+  }
+
+  return lines.join("\n");
+}
+
+export default function Page() {
+  const [seed, setSeed] = useState<string>("0");
+  const [templateId, setTemplateId] = useState<string>("3p_lostFleet");
+  const [result, setResult] = useState<any>(null);
+  const [err, setErr] = useState<string>("");
+
+  const collisions = result?.collisions ?? [];
+  const collisionsBySlot: Record<string, number> = result?.collisionsBySlot ?? {};
+  const collisionCount = result?.collisionCount ?? 0;
+
+  const hexDump = useMemo(() => {
+    if (!result) return "";
+    return renderHexDump(result, { cellWidth: 9 });
+  }, [result]);
+
+  return (
+    <div style={{ padding: 16, fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif" }}>
+      <h2>Logical Map (Seed → Placement → Cells) – Debug</h2>
+
+      <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+        <label>
+          Template:
+          <input
+            value={templateId}
+            onChange={(e) => setTemplateId(e.target.value)}
+            style={{ marginLeft: 8, padding: 6, width: 180 }}
+          />
+        </label>
+
+        <label>
+          Seed:
+          <input value={seed} onChange={(e) => setSeed(e.target.value)} style={{ marginLeft: 8, padding: 6, width: 120 }} />
+        </label>
+
+        <button
+          onClick={() => {
+            setErr("");
+            try {
+              const r = buildLogicalMap({ seed, templateId });
+              setResult(r);
+            } catch (e: any) {
+              setResult(null);
+              setErr(String(e?.message ?? e));
+            }
+          }}
+          style={{ padding: "6px 12px" }}
+        >
+          Run
+        </button>
+      </div>
+
+      {err && (
+        <pre style={{ marginTop: 12, background: "#2b0000", color: "#ffd0d0", padding: 12, overflow: "auto" }}>
+          {err}
+        </pre>
+      )}
+
+      {result && (
+        <div style={{ marginTop: 16 }}>
+          <h3>Summary</h3>
+          <div>
+            <strong>templateId:</strong> {result.templateId}{" "}
+            <strong style={{ marginLeft: 12 }}>seed:</strong> {String(result.seed)}
+          </div>
+          <div style={{ marginTop: 6 }}>
+            <strong>cells:</strong> {result.cellsByKey?.size ?? 0}{" "}
+            <strong style={{ marginLeft: 12 }}>collisions:</strong> {collisionCount}
+          </div>
+
+          <h3 style={{ marginTop: 16 }}>Logical Map Dump (Hex-like)</h3>
+          <pre style={{ background: "#0b1020", color: "#d7e3ff", padding: 12, overflow: "auto", maxHeight: 520 }}>
+            {hexDump}
+          </pre>
+
+          <h3 style={{ marginTop: 16 }}>Collision Report</h3>
+
+          <h4>By Slot (desc)</h4>
+          <pre style={{ background: "#111", color: "#c8ffb0", padding: 12, overflow: "auto", maxHeight: 220 }}>
+            {Object.entries(collisionsBySlot)
+              .sort((a, b) => (b[1] ?? 0) - (a[1] ?? 0))
+              .map(([slotId, count]) => `${slotId}: ${count}`)
+              .join("\n") || "(none)"}
+          </pre>
+
+          <h4>Details (first 50)</h4>
+          <pre style={{ background: "#111", color: "#9fe7ff", padding: 12, overflow: "auto", maxHeight: 420 }}>
+            {collisions
+              .slice(0, 50)
+              .map((c: any, i: number) => {
+                const A = c.a;
+                const B = c.b;
+                return [
+                  `#${i + 1} at ${c.key}`,
+                  ` A: ${A.slotId}/${A.sectorId} rot=${A.rot} local=${A.localKey} center=(${A.slotCenter.q},${A.slotCenter.r})`,
+                  ` B: ${B.slotId}/${B.sectorId} rot=${B.rot} local=${B.localKey} center=(${B.slotCenter.q},${B.slotCenter.r})`,
+                  "",
+                ].join("\n");
+              })
+              .join("\n") || "(none)"}
+          </pre>
+        </div>
+      )}
+    </div>
+  );
+}

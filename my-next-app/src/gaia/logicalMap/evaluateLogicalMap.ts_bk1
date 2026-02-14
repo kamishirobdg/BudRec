@@ -1,0 +1,105 @@
+// src/gaia/logicalMap/evaluateLogicalMap.ts
+import { buildOuterTouchSets, isOuterCell, isTouchCell } from "./outerTouch";
+
+export type Axial = { q: number; r: number };
+
+export type LogicalCell = {
+  pos: Axial;
+  kind: string; // "planet" | "space" | ...
+  planetType?: string | null;
+  tags?: string[];
+  slotId: string;
+  sectorId: string;
+  localKey: string;
+};
+
+export type LogicalMap = {
+  templateId: string;
+  seed: number;
+  cellsByKey: Map<string, LogicalCell>;
+  placement: Array<{ slotId: string; sectorId: string; rot: number }>;
+};
+
+export type EvalOuterTouchPenaltyOptions = {
+  /** outer上に通常惑星があれば減点（0で無効） */
+  wOuter: number;
+  /** touch上に通常惑星があれば減点（0で無効） */
+  wTouch: number;
+};
+
+export type EvaluateLogicalMapOptions = {
+  outerTouchPenalty?: Partial<EvalOuterTouchPenaltyOptions>;
+};
+
+export type EvalOuterTouchPenaltyBreakdown = {
+  outerPlanetCountAll: number;
+  touchPlanetCountAll: number;
+  penaltyOuter: number;
+  penaltyTouch: number;
+  penaltyTotal: number;
+};
+
+export type EvalBreakdown = {
+  outerTouchPenalty: EvalOuterTouchPenaltyBreakdown;
+  // 今後：distribution / scout / favor-disfavor 等をここに追加
+};
+
+export type EvalResult = {
+  total: number;
+  breakdown: EvalBreakdown;
+};
+
+/** “通常惑星” 判定：基本7色のみ（GAIA/TRANSDIM等は除外） */
+const BASIC_PLANET_TYPES = new Set([
+  "BLACK",
+  "BLUE",
+  "BROWN",
+  "ORANGE",
+  "RED",
+  "WHITE",
+  "YELLOW",
+]);
+
+function isNormalPlanet(cell: LogicalCell): boolean {
+  if (String(cell.kind).toLowerCase() !== "planet") return false;
+  const pt = String(cell.planetType ?? "").toUpperCase();
+  return BASIC_PLANET_TYPES.has(pt);
+}
+
+export function evaluateLogicalMap(logicalMap: LogicalMap, opts?: EvaluateLogicalMapOptions): EvalResult {
+  const templateId = String(logicalMap.templateId);
+  const sets = buildOuterTouchSets(templateId);
+
+  const wOuter = Number(opts?.outerTouchPenalty?.wOuter ?? 0);
+  const wTouch = Number(opts?.outerTouchPenalty?.wTouch ?? 0);
+
+  let outerPlanetCountAll = 0;
+  let touchPlanetCountAll = 0;
+
+  for (const cell of logicalMap.cellsByKey.values()) {
+    if (!isNormalPlanet(cell)) continue;
+
+    if (wOuter !== 0 && isOuterCell(sets, cell)) outerPlanetCountAll += 1;
+    if (wTouch !== 0 && isTouchCell(sets, cell)) touchPlanetCountAll += 1;
+  }
+
+  const penaltyOuter = -wOuter * outerPlanetCountAll;
+  const penaltyTouch = -wTouch * touchPlanetCountAll;
+  const penaltyTotal = penaltyOuter + penaltyTouch;
+
+  const breakdown: EvalBreakdown = {
+    outerTouchPenalty: {
+      outerPlanetCountAll,
+      touchPlanetCountAll,
+      penaltyOuter,
+      penaltyTouch,
+      penaltyTotal,
+    },
+  };
+
+  // ここでは “Outer/Touch 減点” だけを total とする（まず一本通す）
+  // 今後、分布/Scout/Favor-Disfavor を足す際も breakdown を増やして total に加算する。
+  const total = penaltyTotal;
+
+  return { total, breakdown };
+}

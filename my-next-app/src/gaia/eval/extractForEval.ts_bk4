@@ -1,0 +1,266 @@
+// src/gaia/eval/extractForEval.ts
+//
+// SSOT: 評価入力の唯一の生成点。
+// - outer/touch は templateSets.ts の (q,r) 固定集合
+// - GAIA/TRANSDIM は Hard/Soft 共通で常に除外
+// - “通常惑星”=基本色惑星のみ（H1/H2/touchPenalty対象）
+//
+// Debug拡張:
+// - tagCounts / specialサンプル / scout/sc候補サンプルを audit に載せる
+//
+import type { LogicalMap, LogicalCell } from "../logicalMap/buildLogicalMap";
+import { getTemplateOuterTouchSets } from "../templates/templateSets";
+
+export type AxialKey = `${number},${number}`;
+export type CenterMode = "CENTER_7_9" | "CENTER_8" | "NONE";
+
+export type HardParams = {
+  minSameColorDist: number;   // H1 (default 3)
+  outerSameColorMax: number;  // H2
+  centerMode: CenterMode;     // H4
+};
+
+// あなたの現行 planetType の文字列に合わせて拡張してください
+export type PlanetKind =
+  | "BLACK" | "BLUE" | "BROWN" | "ORANGE" | "RED" | "WHITE" | "YELLOW"
+  | "GAIA" | "TRANSDIM"
+  // Lost Fleet 拡張（必要に応じて追記）
+  | "ICE" | "LAVA" | "SWAMP" | "DESERT" | "TERRA" | "VOLCANIC" | "CRYSTAL" | "OCEAN" | "NEBULA";
+
+// 旧Board評価との互換：色名が legacy 名で入ってくるケースを基本色へ正規化
+const LEGACY_TO_BASIC: Record<string, PlanetKind> = {
+  TITANIUM: "ORANGE",
+  TERRA: "BLUE",
+  OXIDE: "BROWN",
+  SWAMP: "BLACK",
+  VOLCANIC: "RED",
+  ICE: "WHITE",
+  DESERT: "YELLOW",
+};
+
+export type EvalCell = {
+  key: AxialKey;
+  q: number;
+  r: number;
+
+  slotId: string;
+  sectorId: string;
+  rotSeed: number;
+  rotLogical: number;
+
+  kind: LogicalCell["kind"];
+
+  // --- Planet ---
+  planetKind?: PlanetKind;
+  rawPlanetType?: string;
+
+  // --- Tags (debug / Scout/SC識別用) ---
+  tags: string[];
+
+  isPlanet: boolean;
+  isExcludedPlanet: boolean; // GAIA/TRANSDIM
+  isNormalPlanet: boolean;   // 基本色のみ（H1/H2/touchPenalty対象）
+  colorKey?: string;         // 同色距離用（通常色のみ）
+};
+
+export type ExtractedForEval = {
+  templateId: string;
+  seed: number;
+
+  cells: EvalCell[];
+
+  // GAIA/TRANSDIM除外済み（favor/avoid等で利用）
+  planetCells: EvalCell[];
+
+  // 通常惑星（基本色）のみ
+  normalPlanetCells: EvalCell[];
+  normalPlanetsByColor: Record<string, EvalCell[]>;
+
+  // outer/touch（テンプレ固定：LogicalMap(q,r)）
+  outerCells: Set<AxialKey>;
+  touchCells: Set<AxialKey>;
+
+  // H4（slotId集合）
+  centralSlotIds: Set<string>;
+
+  // 監査用（UI/Ranking表示向け）
+  audit: {
+    outerNormalCount: number;
+    touchNormalCount: number;
+
+    // Debug: tags / samples
+    tagCountsAll: Record<string, number>;
+    tagCountsPlanet: Record<string, number>;
+    specialCellsSample: Array<Pick<EvalCell, "key" | "q" | "r" | "slotId" | "sectorId" | "kind" | "tags">>;
+    scoutOrScTagSample: Array<Pick<EvalCell, "key" | "q" | "r" | "slotId" | "sectorId" | "kind" | "tags" | "rawPlanetType" | "planetKind">>;
+  };
+};
+
+const BASIC_PLANET_TYPES = new Set<PlanetKind>([
+  "BLACK", "BLUE", "BROWN", "ORANGE", "RED", "WHITE", "YELLOW",
+]);
+
+function toAxialKey(q: number, r: number): AxialKey {
+  return `${q},${r}`;
+}
+
+function normalizePlanetKind(raw?: string | null): PlanetKind | undefined {
+  if (!raw) return undefined;
+  let s = String(raw).trim();
+  if (!s) return undefined;
+
+  s = s.toUpperCase();
+
+  // legacy -> basic
+  if (LEGACY_TO_BASIC[s]) return LEGACY_TO_BASIC[s];
+
+  // exclusions
+  if (s === "TRANS" || s === "TRANSDIM" || s === "TRANS_DIM") return "TRANSDIM";
+  if (s === "GAIA") return "GAIA";
+
+  // basics
+  if (s === "BLACK") return "BLACK";
+  if (s === "BLUE") return "BLUE";
+  if (s === "BROWN") return "BROWN";
+  if (s === "ORANGE") return "ORANGE";
+  if (s === "RED") return "RED";
+  if (s === "WHITE") return "WHITE";
+  if (s === "YELLOW") return "YELLOW";
+
+  // expansions (keep as-is if you use these strings)
+  if (s === "ICE") return "ICE";
+  if (s === "LAVA") return "LAVA";
+  if (s === "SWAMP") return "SWAMP";
+  if (s === "DESERT") return "DESERT";
+  if (s === "TERRA") return "TERRA";
+  if (s === "VOLCANIC") return "VOLCANIC";
+  if (s === "CRYSTAL") return "CRYSTAL";
+  if (s === "OCEAN") return "OCEAN";
+  if (s === "NEBULA") return "NEBULA";
+
+  return undefined;
+}
+
+function normalizeColorKey(kind?: PlanetKind): string | undefined {
+  if (!kind) return undefined;
+  return BASIC_PLANET_TYPES.has(kind) ? kind : undefined;
+}
+
+function buildCentralSlotIds(mode: CenterMode): Set<string> {
+  const s = new Set<string>();
+  if (mode === "CENTER_7_9") {
+    s.add("L7"); s.add("L8"); s.add("L9");
+  } else if (mode === "CENTER_8") {
+    s.add("L8");
+  }
+  return s;
+}
+
+function inc(map: Record<string, number>, key: string) {
+  map[key] = (map[key] ?? 0) + 1;
+}
+
+export function extractForEval(logicalMap: LogicalMap, hardParams: HardParams): ExtractedForEval {
+  const templateId = String(logicalMap.templateId);
+
+  const { outerCells, touchCells } = getTemplateOuterTouchSets(templateId);
+  const centralSlotIds = buildCentralSlotIds(hardParams.centerMode);
+
+  const tagCountsAll: Record<string, number> = {};
+  const tagCountsPlanet: Record<string, number> = {};
+  const specialCellsSample: Array<Pick<EvalCell, "key" | "q" | "r" | "slotId" | "sectorId" | "kind" | "tags">> = [];
+  const scoutOrScTagSample: Array<Pick<EvalCell, "key" | "q" | "r" | "slotId" | "sectorId" | "kind" | "tags" | "rawPlanetType" | "planetKind">> = [];
+
+  const cells: EvalCell[] = [];
+  for (const c of logicalMap.cellsByKey.values()) {
+    const q = c.pos.q;
+    const r = c.pos.r;
+    const key = toAxialKey(q, r);
+
+    const rawPlanetType = (c as any).planetType != null ? String((c as any).planetType) : undefined;
+    const planetKind = normalizePlanetKind(rawPlanetType ?? null);
+
+    // IMPORTANT: kind の揺れに強くするため、planetKind が取れたら惑星扱い
+    const isPlanet = !!planetKind;
+    const isExcludedPlanet = planetKind === "GAIA" || planetKind === "TRANSDIM";
+    const colorKey = normalizeColorKey(planetKind);
+    const isNormalPlanet = isPlanet && !isExcludedPlanet && !!colorKey;
+
+    const tags: string[] = Array.isArray((c as any).tags) ? (c as any).tags.map((t: any) => String(t)) : [];
+
+    // tag counts
+    for (const t of tags) inc(tagCountsAll, t);
+    if (isPlanet && !isExcludedPlanet) for (const t of tags) inc(tagCountsPlanet, t);
+
+    // samples
+    if (c.kind === "special" && specialCellsSample.length < 24) {
+      specialCellsSample.push({ key, q, r, slotId: c.slotId, sectorId: String(c.sectorId), kind: c.kind, tags });
+    }
+    const tagJoined = tags.join("|").toUpperCase();
+    if ((tagJoined.includes("SCOUT") || tagJoined.includes("SC")) && scoutOrScTagSample.length < 24) {
+      scoutOrScTagSample.push({
+        key, q, r,
+        slotId: c.slotId,
+        sectorId: String(c.sectorId),
+        kind: c.kind,
+        tags,
+        rawPlanetType,
+        planetKind,
+      });
+    }
+
+    cells.push({
+      key,
+      q,
+      r,
+      slotId: c.slotId,
+      sectorId: String(c.sectorId),
+      rotSeed: c.rotSeed,
+      rotLogical: c.rot,
+      kind: c.kind,
+      planetKind,
+      rawPlanetType,
+      tags,
+      isPlanet,
+      isExcludedPlanet,
+      isNormalPlanet,
+      colorKey,
+    });
+  }
+
+  const planetCells = cells.filter((x) => x.isPlanet && !x.isExcludedPlanet);
+  const normalPlanetCells = cells.filter((x) => x.isNormalPlanet);
+
+  const normalPlanetsByColor: Record<string, EvalCell[]> = {};
+  for (const cell of normalPlanetCells) {
+    const ck = cell.colorKey!;
+    (normalPlanetsByColor[ck] ||= []).push(cell);
+  }
+
+  let outerNormalCount = 0;
+  let touchNormalCount = 0;
+  for (const cell of normalPlanetCells) {
+    if (outerCells.has(cell.key)) outerNormalCount += 1;
+    if (touchCells.has(cell.key)) touchNormalCount += 1;
+  }
+
+  return {
+    templateId,
+    seed: logicalMap.seed,
+    cells,
+    planetCells,
+    normalPlanetCells,
+    normalPlanetsByColor,
+    outerCells,
+    touchCells,
+    centralSlotIds,
+    audit: {
+      outerNormalCount,
+      touchNormalCount,
+      tagCountsAll,
+      tagCountsPlanet,
+      specialCellsSample,
+      scoutOrScTagSample,
+    },
+  };
+}

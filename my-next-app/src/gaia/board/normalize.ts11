@@ -1,0 +1,193 @@
+import { AXIAL_DIRS, add, keyOf } from "./axial";
+import type { NormalizedBoard, NormalizedCell, SectorDef, SlotPlacement, TemplateDef } from "./types";
+
+/**
+ * Rotate axial coordinates by 60-degree steps CW.
+ * This matches previewBoard.axialRotate / prior normalize implementation.
+ */
+function rotate60(ax: { q: number; r: number }, stepsCW: number): { q: number; r: number } {
+  let { q, r } = ax;
+  const s = ((stepsCW % 6) + 6) % 6;
+
+  for (let i = 0; i < s; i++) {
+    const x = q;
+    const z = r;
+    const y = -x -z;
+
+    // (x,y,z) -> (-z, -x, -y)
+    const nx = -z;
+    const ny = -x;
+    const nz = -y;
+
+    q = nx;
+    r = nz;
+  }
+  return { q, r };
+}
+
+function parseKey(k: string): { q: number; r: number } {
+  const [qs, rs] = k.split(",").map((s) => s.trim());
+  const q = Number(qs);
+  const r = Number(rs);
+  if (!Number.isFinite(q) || !Number.isFinite(r)) {
+    throw new Error(`Invalid axial key: "${k}"`);
+  }
+  return { q, r };
+}
+
+/**
+ * Convert template slot center to cell-axial center.
+ *
+ * Working hypothesis (mirrors previewBoard.ts): template slot.pos is a "tile-grid"
+ * coordinate for radius=2 layout. Adjacent large-tile centers are separated by 4
+ * in axial space.
+ */
+function slotPosToCellCenter(pos: { q: number; r: number }): { q: number; r: number } {
+  return { q: pos.q * 4, r: pos.r * 4 };
+}
+
+function isBaseSectorId(sectorId: string): boolean {
+  return /^(0[1-9]|10)$/.test(sectorId);
+}
+
+/**
+ * Base large sectors (01-10) use a row-shifted local coordinate encoding.
+ * Apply the same correction as previewBoard.fixBaseLocalCoord BEFORE rotation.
+ *
+ * shift = floor((r + R)/2), q' = q - shift
+ */
+function fixBaseLocalCoord(sector: SectorDef, local: { q: number; r: number }): { q: number; r: number } {
+  const sid = String((sector as any).sectorId ?? (sector as any).id ?? "");
+  if (!isBaseSectorId(sid)) return local;
+
+  const R = typeof (sector as any).radius === "number" ? (sector as any).radius : null;
+  if (R === null) return local;
+
+  const shift = Math.floor((local.r + R) / 2);
+  return { q: local.q - shift, r: local.r };
+}
+
+function normalizeRawCell(raw: any): { kind: "planet" | "empty" | "other"; planetType?: string; tags: string[] } {
+  const k = raw?.kind;
+  const tags = Array.isArray(raw?.tags) ? raw.tags : [];
+
+  if (k === "planet") {
+    const pt = (raw?.planetType ?? raw?.planet) as string | undefined;
+    return { kind: "planet", planetType: pt, tags };
+  }
+  if (k === "empty") return { kind: "empty", tags };
+  return { kind: "other", tags };
+}
+
+/**
+ * Build a normalized board used by evaluation & hard constraints.
+ *
+ * CRITICAL: This MUST be mathematically consistent with previewBoard.expandPlacementToBoardCells:
+ * - local base correction (01-10 only) before rotation
+ * - rotate by 60deg steps (rot)
+ * - translate by slot.pos (as-authored; no implicit conversion)
+ *
+ * If a cell collision happens, throw with both sides (new/existing) for diagnosis.
+ */
+export function buildNormalizedBoard(args: {
+  template: TemplateDef;
+  placements: SlotPlacement[];
+  sectorById: Map<string, SectorDef>;
+}): NormalizedBoard {
+  const { template, placements, sectorById } = args;
+
+  const slotById = new Map(template.slots.map((s) => [s.slotId, s]));
+
+  const cellByCoord = new Map<string, NormalizedCell>();
+  const cells: NormalizedCell[] = [];
+
+  for (const placement of placements) {
+    const slot = slotById.get(placement.slotId);
+    const sector = sectorById.get(placement.sectorId);
+
+    if (!slot) {
+      throw new Error(`Slot not found: ${placement.slotId}`);
+    }
+
+    const slotPos = slotPosToCellCenter(slot.pos);
+    if (!sector) {
+      throw new Error(`Sector not found: ${placement.sectorId}`);
+    }
+
+    const sectorIdForLog = (sector as any).sectorId ?? placement.sectorId;
+
+    const cellsRec = (sector as any).cells ?? {};
+    for (const [k, rawCell] of Object.entries(cellsRec)) {
+      const localKey = String(k).trim();
+      const local0 = parseKey(k);
+      const local = fixBaseLocalCoord(sector, local0);
+      const rotated = rotate60(local, placement.rot);
+
+      const abs = add(slotPos, rotated);
+      const coordKey = keyOf(abs);
+
+      // Template-local offset from slot center (template-invariant)
+      // Template-local offset from slot center (template-invariant)
+      const tplLocalKey = `${abs.q - slotPos.q},${abs.r - slotPos.r}`;
+
+      if (cellByCoord.has(coordKey)) {
+        const existing = cellByCoord.get(coordKey)!;
+        throw new Error(
+          `Cell collision at ${abs.q},${abs.r}: new(slot=${slot.slotId}, sector=${sectorIdForLog}) overlaps existing(slot=${existing.slotId}, sector=${existing.sectorId}).`
+        );
+      }
+
+      const norm = normalizeRawCell(rawCell);
+
+      const nc: NormalizedCell = {
+        q: abs.q,
+        r: abs.r,
+        coordKey,
+
+        slotId: slot.slotId,
+        accepts: slot.accepts,
+        sectorId: String(sectorIdForLog),
+        tplLocalKey,
+        localKey,
+
+        kind: norm.kind,
+        planetType: norm.planetType as any,
+        tags: norm.tags,
+
+        neighbors: [],
+      };
+
+      cellByCoord.set(coordKey, nc);
+      cells.push(nc);
+    }
+  }
+
+  // neighbors
+  for (const c of cells) {
+    const here = { q: c.q, r: c.r };
+    c.neighbors = AXIAL_DIRS.map((d) => keyOf(add(here, d)));
+  }
+
+  // indices
+  const cellsBySlotId = new Map<string, NormalizedCell[]>();
+  const cellsByPlanetType = new Map<string, NormalizedCell[]>();
+
+  for (const c of cells) {
+    const a1 = cellsBySlotId.get(c.slotId) ?? [];
+    a1.push(c);
+    cellsBySlotId.set(c.slotId, a1);
+
+    const pt = c.planetType ?? "EMPTY";
+    const a2 = cellsByPlanetType.get(String(pt)) ?? [];
+    a2.push(c);
+    cellsByPlanetType.set(String(pt), a2);
+  }
+
+  return {
+    templateId: template.templateId,
+    cells,
+    cellByCoord,
+    cellsBySlotId,
+    cellsByPlanetType,
+  };
+}

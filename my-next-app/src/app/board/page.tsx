@@ -1,0 +1,1081 @@
+"use client";
+
+import * as React from "react";
+import { MapBoardViewer, type PlacementItem as ViewerPlacementItem } from "@/components/MapBoardViewer";
+
+import { TEMPLATE_3P_LOSTFLEET } from "@/gaia/data/templates/3p_lostFleet";
+import { TEMPLATE_4P_LOSTFLEET } from "@/gaia/data/templates/4p_lostFleet";
+
+import { BASE_SECTORS } from "@/gaia/sectorTiles_base";
+import { EXPANSION_MIDDLE, EXPANSION_LITTLE, EXPANSION_SCOUT } from "@/gaia/sectorTiles_lostfleet";
+
+import { buildSectorLookup } from "@/gaia/board/previewBoard";
+import { runSearch as runLogicalSearch } from "@/gaia/search";
+
+import { makeSearchPlacementFromSeed, getSearchPlacementConfig } from "@/gaia/ssot/searchPlacementConfig";
+import { computePlacementHash } from "@/gaia/ssot/placementHash";
+
+type RankedResult = {
+  seed: string;
+  score: number;
+  placement: any[];
+  placementHash?: string;
+  evaluation: any; // { total, breakdown, audit }
+};
+
+type Lang = "en" | "ja";
+
+const UI_TEXT = {
+  en: {
+    title: "Board Export",
+    language: "Language",
+    en: "EN",
+    ja: "日本語",
+
+    template: "Template",
+    seed: "Seed",
+    randomSeed: "Random Seed",
+    runSearch: "Run Search (LogicalMap)",
+    searching: "Searching...",
+
+    progress: "progress",
+    best: "best",
+    selectedSeed: "selected seed",
+
+    searchSsot: "Search SSOT",
+    noSearchConfig: `No search config for templateId. Add it in src/gaia/ssot/searchPlacementConfig.ts`,
+
+    currentPlacementHash: "current placementHash",
+    fixedLarge: "fixedLarge",
+    littlePool: "littlePool",
+    scoutCount: "scoutCount",
+
+    logicalResults: "LogicalMap Results (SSOT)",
+    currentLogicalSummary: "Current Logical Summary",
+    noCurrentResult: "No current result (run search or select a Top-K item).",
+
+    placementHashResult: "placementHash(result)",
+    placementHashView: "placementHash(view)",
+    score: "score",
+    imbalance: "imbalance",
+    outerCnt: "outerCnt",
+    touchCnt: "touchCnt",
+
+    trials: "Trials",
+    topK: "Top-K",
+
+    hard: "Hard",
+    outerSameColorMax: "Outer same-color max",
+    centerMode: "Center mode",
+
+    soft: "Soft",
+    metric: "Metric",
+    radius: "Radius",
+
+    breakdown: "breakdown (Logical)",
+
+    topKLogical: "Top-K (Logical)",
+    hash: "hash",
+
+    hardFailCounts: "Hard fail counts",
+
+    glossary: "Glossary",
+    show: "show",
+    hide: "hide",
+  },
+  ja: {
+    title: "ボード表示（確認用）",
+    language: "言語",
+    en: "EN",
+    ja: "日本語",
+
+    template: "テンプレート",
+    seed: "シード",
+    randomSeed: "ランダムシード",
+    runSearch: "検索実行（LogicalMap）",
+    searching: "検索中...",
+
+    progress: "進捗",
+    best: "ベスト",
+    selectedSeed: "選択中seed",
+
+    searchSsot: "検索SSOT",
+    noSearchConfig: `templateIdに対応する検索設定がありません。src/gaia/ssot/searchPlacementConfig.ts に追加してください。`,
+
+    currentPlacementHash: "現在のplacementHash",
+    fixedLarge: "固定Large",
+    littlePool: "Little候補",
+    scoutCount: "Scout個数",
+
+    logicalResults: "検索結果（LogicalMap / SSOT）",
+    currentLogicalSummary: "現在表示中（Logical評価サマリ）",
+    noCurrentResult: "現在の結果がありません（検索実行またはTop-K選択）。",
+
+    placementHashResult: "placementHash（評価）",
+    placementHashView: "placementHash（表示）",
+    score: "スコア",
+    imbalance: "偏り",
+    outerCnt: "外周数",
+    touchCnt: "隣接数",
+
+    trials: "試行回数",
+    topK: "上位K件",
+
+    hard: "ハード制約",
+    outerSameColorMax: "外周同色上限",
+    centerMode: "中央Large制約",
+
+    soft: "ソフト評価",
+    metric: "指標",
+    radius: "半径",
+
+    breakdown: "内訳（Logical）",
+
+    topKLogical: "上位K（Logical）",
+    hash: "ハッシュ",
+
+    hardFailCounts: "ハード失敗回数",
+
+    glossary: "用語集",
+    show: "表示",
+    hide: "非表示",
+  },
+} as const;
+
+type UiKey = keyof typeof UI_TEXT.en;
+
+function randomSeedString() {
+  const a = Math.floor(Math.random() * 1e9);
+  return `${a}_0`;
+}
+
+function nextFrame() {
+  return new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+}
+
+function useIsNarrow(px: number) {
+  const [narrow, setNarrow] = React.useState(false);
+  React.useEffect(() => {
+    const on = () => setNarrow(window.innerWidth < px);
+    on();
+    window.addEventListener("resize", on);
+    return () => window.removeEventListener("resize", on);
+  }, [px]);
+  return narrow;
+}
+
+/** ---------- sector image helper (UI only) ---------- */
+
+function normalizeSectorId(id: string) {
+  const s = String(id ?? "").trim();
+  const t = s.replace(/^0+/, "");
+  return t === "" ? "0" : t;
+}
+
+function getSectorIdFromAny(obj: any): string | null {
+  if (!obj || typeof obj !== "object") return null;
+
+  const cands = [
+    (obj as any).sectorId,
+    (obj as any).id,
+    (obj as any).tileId,
+    (obj as any).sector_id,
+    (obj as any).tile_id,
+    (obj as any).code,
+    (obj as any).name,
+  ];
+
+  for (const v of cands) {
+    const s = String(v ?? "").trim();
+    if (s && s !== "undefined" && s !== "null") return s;
+  }
+  return null;
+}
+
+function buildSectorImgById() {
+  const map: Record<string, string> = {};
+
+  const put = (arr: any[]) => {
+    for (const s of arr) {
+      const id = getSectorIdFromAny(s);
+      if (!id) continue;
+      const img = String((s as any).img ?? (s as any).image ?? (s as any).src ?? "");
+      if (img) map[id] = img;
+    }
+  };
+
+  put(Array.isArray(BASE_SECTORS) ? (BASE_SECTORS as any[]) : []);
+  put(Array.isArray(EXPANSION_MIDDLE) ? (EXPANSION_MIDDLE as any[]) : []);
+  put(Array.isArray(EXPANSION_LITTLE) ? (EXPANSION_LITTLE as any[]) : []);
+  put(Array.isArray(EXPANSION_SCOUT) ? (EXPANSION_SCOUT as any[]) : []);
+
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(map)) out[normalizeSectorId(k)] = v;
+  return out;
+}
+
+/** ---------- main ---------- */
+
+export default function BoardPage() {
+  // language toggle (persist)
+  const [lang, setLang] = React.useState<Lang>(() => {
+    try {
+      const v = localStorage.getItem("gaia_ui_lang");
+      return v === "ja" || v === "en" ? (v as Lang) : "en";
+    } catch {
+      return "en";
+    }
+  });
+
+  React.useEffect(() => {
+    try {
+      localStorage.setItem("gaia_ui_lang", lang);
+    } catch {}
+  }, [lang]);
+
+  const t = React.useCallback((k: UiKey) => UI_TEXT[lang][k], [lang]);
+
+  const [which, setWhich] = React.useState<"3p" | "4p">("3p");
+  const template = React.useMemo(() => (which === "3p" ? TEMPLATE_3P_LOSTFLEET : TEMPLATE_4P_LOSTFLEET), [which]);
+
+  const [seed, setSeed] = React.useState("0");
+
+  // Ranking selection: show EXACT evaluated placement
+  const [selectedPlacement, setSelectedPlacement] = React.useState<any[] | null>(null);
+  const [selectedSeedLabel, setSelectedSeedLabel] = React.useState<string | null>(null);
+
+  // Hard params
+  const [outerSameColorMax, setOuterSameColorMax] = React.useState(2);
+  const [centerMode, setCenterMode] = React.useState<"NONE" | "CENTER_7_9" | "CENTER_8">("NONE");
+
+  // Soft params
+  const [wOuter, setWOuter] = React.useState(1);
+  const [wTouch, setWTouch] = React.useState(1);
+  const [wScout, setWScout] = React.useState(4); // ★初期値: 4
+  const [scoutRadius, setScoutRadius] = React.useState(3); // ★現状維持: 3
+  const [wImbalance, setWImbalance] = React.useState(1);
+  const [imbalanceMetric, setImbalanceMetric] = React.useState<"std" | "range">("std");
+
+  const [trials, setTrials] = React.useState(500);
+  const [keepTop, setKeepTop] = React.useState(20);
+
+  const [busy, setBusy] = React.useState(false);
+  const [errorMsg, setErrorMsg] = React.useState<string | null>(null);
+
+  const [results, setResults] = React.useState<RankedResult[]>([]);
+  const [progressCurrent, setProgressCurrent] = React.useState(0);
+  const [progressBest, setProgressBest] = React.useState<number | null>(null);
+  const [hardFailBy, setHardFailBy] = React.useState<Record<string, number>>({});
+
+  const [showGlossary, setShowGlossary] = React.useState(true);
+
+  const templateId = React.useMemo(() => {
+    return String((template as any).templateId ?? (template as any).id ?? (which === "3p" ? "3p_lostFleet" : "4p_lostFleet"));
+  }, [template, which]);
+
+  const searchConfig = React.useMemo(() => {
+    try {
+      return getSearchPlacementConfig(templateId);
+    } catch {
+      return null;
+    }
+  }, [templateId]);
+
+  // build sector lookup (MapBoardViewer / previewBoard use)
+  const allSectors = React.useMemo<any[]>(() => {
+    const base = Array.isArray(BASE_SECTORS) ? (BASE_SECTORS as any[]) : [];
+    const mid = Array.isArray(EXPANSION_MIDDLE) ? (EXPANSION_MIDDLE as any[]) : [];
+    const lit = Array.isArray(EXPANSION_LITTLE) ? (EXPANSION_LITTLE as any[]) : [];
+    const sc = Array.isArray(EXPANSION_SCOUT) ? (EXPANSION_SCOUT as any[]) : [];
+    return [...base, ...mid, ...lit, ...sc];
+  }, []);
+
+  const sectorById = React.useMemo(() => buildSectorLookup(allSectors as any), [allSectors]);
+  const sectorImgById = React.useMemo(() => buildSectorImgById(), []);
+
+  /**
+   * placementBase: SSOT（表示用は必ずこれ）
+   * - Ranking selection => selectedPlacement (evaluated placement)
+   * - Otherwise (manual seed preview) => makeSearchPlacementFromSeed(templateId, seed)
+   */
+  const placementBaseResult = React.useMemo(() => {
+    try {
+      if (selectedPlacement && Array.isArray(selectedPlacement) && selectedPlacement.length > 0) {
+        return { ok: true as const, placement: selectedPlacement as any[] };
+      }
+      const made = makeSearchPlacementFromSeed({ templateId, seed });
+      return { ok: true as const, placement: made.placement as any[] };
+    } catch (e: any) {
+      return { ok: false as const, message: e?.message ? String(e.message) : String(e) };
+    }
+  }, [selectedPlacement, templateId, seed]);
+
+  React.useEffect(() => {
+    if (!placementBaseResult.ok) setErrorMsg(placementBaseResult.message);
+    else setErrorMsg(null);
+  }, [placementBaseResult]);
+
+  const placementBase = React.useMemo(() => (placementBaseResult.ok ? placementBaseResult.placement : []), [placementBaseResult]);
+
+  const currentHash = React.useMemo(() => {
+    try {
+      return computePlacementHash(placementBase as any);
+    } catch {
+      return "-";
+    }
+  }, [placementBase]);
+
+  const placementForViewer = React.useMemo(() => placementBase.map((p) => ({ ...p })) as any as ViewerPlacementItem[], [placementBase]);
+
+  // UI: offsets (確定済み)
+  const imgOffsetBySlotId = React.useMemo(() => {
+    return {
+      M1: { dx: 14, dy: -118 },
+      M2: { dx: 14, dy: -118 },
+      M3: { dx: 14, dy: -118 },
+      M4: { dx: 14, dy: -118 },
+      M5: { dx: 44, dy: -74 },
+      M6: { dx: 44, dy: -74 },
+      M7: { dx: 44, dy: -74 },
+      M8: { dx: 46, dy: -72 },
+      S1: { dx: 18, dy: -60 },
+      S2: { dx: 18, dy: -60 },
+      S3: { dx: 18, dy: -60 },
+      S4: { dx: 18, dy: -60 },
+      S5: { dx: 18, dy: -60 },
+      S6: { dx: 18, dy: -60 },
+      S7: { dx: 18, dy: -60 },
+      S8: { dx: 18, dy: -60 },
+    } as const;
+  }, []);
+
+  const rotOffsetsBySlotId = React.useMemo(() => {
+    return {
+      M1: { 0: { dx: 0, dy: 0 }, 2: { dx: 74, dy: 176 }, 4: { dx: -114, dy: 150 } },
+      M2: { 0: { dx: 0, dy: 0 }, 2: { dx: 74, dy: 176 }, 4: { dx: -114, dy: 150 } },
+      M3: { 0: { dx: 0, dy: 0 }, 2: { dx: 74, dy: 176 }, 4: { dx: -114, dy: 150 } },
+      M4: { 0: { dx: 0, dy: 0 }, 2: { dx: 74, dy: 176 }, 4: { dx: -114, dy: 150 } },
+      M5: { 1: { dx: 0, dy: 0 }, 3: { dx: -26, dy: 70 }, 5: { dx: 48, dy: 58 } },
+      M6: { 1: { dx: 0, dy: 0 }, 3: { dx: -26, dy: 70 }, 5: { dx: 48, dy: 58 } },
+      M7: { 1: { dx: 0, dy: 0 }, 3: { dx: -26, dy: 70 }, 5: { dx: 48, dy: 58 } },
+      M8: { 1: { dx: 0, dy: 0 }, 3: { dx: -26, dy: 70 }, 5: { dx: 48, dy: 58 } },
+    } as const;
+  }, []);
+
+  // current result (Logical SSOT) for shown seed
+  const currentResult = React.useMemo(() => {
+    const target = String(selectedSeedLabel ?? seed ?? "");
+    if (!target) return null;
+    return results.find((r) => String(r.seed) === target) ?? null;
+  }, [results, seed, selectedSeedLabel]);
+
+  function sumCounts(obj: any): number {
+    if (!obj || typeof obj !== "object") return 0;
+    return Object.values(obj).reduce((a: number, x: any) => a + (Number(x) || 0), 0);
+  }
+
+  function getBreakdown(r: RankedResult | null) {
+    return (r?.evaluation?.breakdown ?? r?.evaluation ?? null) as any;
+  }
+
+  function getPlacementHashForResult(r: RankedResult | null) {
+    const b = getBreakdown(r);
+    return String(r?.placementHash ?? b?.placementHash ?? b?.audit?.placementHash ?? "-");
+  }
+
+  function getImbalanceSummary(r: RankedResult | null) {
+    const b = getBreakdown(r);
+    const metric = b?.imbalance?.metric ?? "-";
+    const value = Number(b?.imbalance?.value ?? 0);
+    return { metric, value };
+  }
+
+  function getOuterTouchCounts(r: RankedResult | null) {
+    const b = getBreakdown(r);
+    const outerBy = b?.audit?.outerCountByType ?? null;
+    const touchBy = b?.audit?.touchCountByType ?? null;
+    return {
+      outerBy,
+      touchBy,
+      outerSum: sumCounts(outerBy),
+      touchSum: sumCounts(touchBy),
+    };
+  }
+
+  function getScoutSummary(r: RankedResult | null) {
+    const b = getBreakdown(r);
+    const scoutAudit = b?.audit?.scout ?? null;
+
+    const radius = Number(scoutAudit?.radius ?? NaN);
+    const distanceHistogram = scoutAudit?.distanceHistogram ?? null;
+
+    const scoutAxis = b?.axesByType?.scout ?? scoutAudit?.byType ?? null;
+    const scoutTotal = sumCounts(scoutAxis);
+
+    const extraByKind = scoutAudit?.extraByKind ?? null;
+
+    return { radius: Number.isFinite(radius) ? radius : null, scoutTotal, distanceHistogram, extraByKind };
+  }
+
+  function stableJson(obj: any) {
+    try {
+      return JSON.stringify(obj, null, 2);
+    } catch {
+      return String(obj);
+    }
+  }
+
+  const PLANET_ORDER = ["BLACK", "BLUE", "BROWN", "ORANGE", "RED", "WHITE", "YELLOW"] as const;
+  type PlanetTypeKey = (typeof PLANET_ORDER)[number];
+
+  const PLANET_LABEL_JA: Record<PlanetTypeKey, string> = {
+    BLACK: "黒",
+    BLUE: "青",
+    BROWN: "茶",
+    ORANGE: "橙",
+    RED: "赤",
+    WHITE: "白",
+    YELLOW: "黄",
+  };
+
+  const EXTRA_LABEL_JA: Record<"PROTO" | "ASTEROID", string> = {
+    PROTO: "プロト",
+    ASTEROID: "小惑星",
+  };
+
+  function axisGet(axis: any, k: PlanetTypeKey): number {
+    const v = axis?.[k];
+    const n = typeof v === "number" ? v : Number(v);
+    return Number.isFinite(n) ? n : 0;
+  }
+
+  function fmt3(n: number): string {
+    return (Math.round(n * 1000) / 1000).toFixed(3);
+  }
+
+  function renderColorBreakdownTable(breakdown: any) {
+    if (!breakdown) return null;
+
+    const outer = breakdown?.axesByType?.outer ?? null;
+    const touch = breakdown?.axesByType?.touch ?? null;
+    const scout = breakdown?.axesByType?.scout ?? null;
+    const scoutCore = breakdown?.axesByType?.scoutCore ?? null;
+    const totals = breakdown?.planetTypeTotals ?? null;
+
+    const outerCnt = breakdown?.audit?.outerCountByType ?? null;
+    const touchCnt = breakdown?.audit?.touchCountByType ?? null;
+
+    const hasCounts = !!outerCnt || !!touchCnt;
+
+    // ★EXTRA: PROTO / ASTEROID (Scout寄与のみ)
+    const extraByKind = breakdown?.audit?.scout?.extraByKind ?? null;
+    const extraProto = Number(extraByKind?.PROTO?.total ?? 0);
+    const extraAst = Number(extraByKind?.ASTEROID?.total ?? 0);
+    const hasExtra = !!extraByKind && (Number.isFinite(extraProto) || Number.isFinite(extraAst));
+
+    const thStyle: React.CSSProperties = {
+      borderBottom: "1px solid #ddd",
+      padding: "6px 8px",
+      textAlign: "right",
+      fontSize: 12,
+      background: "#fafafa",
+      position: "sticky",
+      top: 0,
+      zIndex: 1,
+    };
+
+    const tdStyle: React.CSSProperties = {
+      borderBottom: "1px solid #eee",
+      padding: "6px 8px",
+      textAlign: "right",
+      fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+      fontSize: 12,
+      whiteSpace: "nowrap",
+    };
+
+    const tdLeftStyle: React.CSSProperties = {
+      ...tdStyle,
+      textAlign: "left",
+      fontFamily: "inherit",
+    };
+
+    const sepStyle: React.CSSProperties = {
+      borderTop: "2px solid #ddd",
+      background: "#fcfcfc",
+    };
+
+    const extraRow = (kind: "PROTO" | "ASTEROID", val: number) => {
+      const label = lang === "ja" ? `${EXTRA_LABEL_JA[kind]} (${kind})` : kind;
+      const v = Number.isFinite(val) ? val : 0;
+
+      // EXTRAは現仕様では planetTypeTotals/imbalance の母集団に入れないため、表示は別枠
+      return (
+        <tr key={`EXTRA_${kind}`}>
+          <td style={tdLeftStyle}>{label}</td>
+          {hasCounts ? <td style={tdStyle}>-</td> : null}
+          {hasCounts ? <td style={tdStyle}>-</td> : null}
+          <td style={tdStyle}>-</td>
+          <td style={tdStyle}>-</td>
+          <td style={tdStyle}>{fmt3(v)}</td>
+          <td style={tdStyle}>-</td>
+          <td style={{ ...tdStyle, fontWeight: 700 }}>{fmt3(v)}</td>
+        </tr>
+      );
+    };
+
+    return (
+      <div style={{ overflowX: "auto", border: "1px solid #eee", borderRadius: 8 }}>
+        <table style={{ borderCollapse: "collapse", width: "100%", minWidth: hasCounts ? 760 : 620 }}>
+          <thead>
+            <tr>
+              <th style={{ ...thStyle, textAlign: "left" }}>{lang === "ja" ? "色" : "Color"}</th>
+              {hasCounts ? <th style={{ ...thStyle }}>{lang === "ja" ? "外周数" : "outerCnt"}</th> : null}
+              {hasCounts ? <th style={{ ...thStyle }}>{lang === "ja" ? "隣接数" : "touchCnt"}</th> : null}
+              <th style={thStyle}>{lang === "ja" ? "Outer軸" : "outer"}</th>
+              <th style={thStyle}>{lang === "ja" ? "Touch軸" : "touch"}</th>
+              <th style={thStyle}>{lang === "ja" ? "Scout軸" : "scout"}</th>
+              <th style={thStyle}>{lang === "ja" ? "ScoutCore軸" : "scoutCore"}</th>
+              <th style={thStyle}>{lang === "ja" ? "合計" : "total"}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {PLANET_ORDER.map((k) => {
+              const colorLabel = lang === "ja" ? `${PLANET_LABEL_JA[k]} (${k})` : k;
+
+              const rowOuter = axisGet(outer, k);
+              const rowTouch = axisGet(touch, k);
+              const rowScout = axisGet(scout, k);
+              const rowScoutCore = axisGet(scoutCore, k);
+              const rowTotal = axisGet(totals, k);
+
+              const rowOuterCnt = outerCnt ? axisGet(outerCnt, k) : 0;
+              const rowTouchCnt = touchCnt ? axisGet(touchCnt, k) : 0;
+
+              return (
+                <tr key={k}>
+                  <td style={tdLeftStyle}>{colorLabel}</td>
+                  {hasCounts ? <td style={tdStyle}>{outerCnt ? String(rowOuterCnt) : "-"}</td> : null}
+                  {hasCounts ? <td style={tdStyle}>{touchCnt ? String(rowTouchCnt) : "-"}</td> : null}
+                  <td style={tdStyle}>{fmt3(rowOuter)}</td>
+                  <td style={tdStyle}>{fmt3(rowTouch)}</td>
+                  <td style={tdStyle}>{fmt3(rowScout)}</td>
+                  <td style={tdStyle}>{fmt3(rowScoutCore)}</td>
+                  <td style={{ ...tdStyle, fontWeight: 700 }}>{fmt3(rowTotal)}</td>
+                </tr>
+              );
+            })}
+
+            {/* ★EXTRA: PROTO / ASTEROID（Scout寄与のみ、BASIC7色とは別枠） */}
+            {hasExtra ? (
+              <>
+                <tr style={sepStyle}>
+                  <td colSpan={hasCounts ? 8 : 6} style={{ padding: "6px 8px", fontSize: 12, opacity: 0.85 }}>
+                    {lang === "ja" ? "追加種別（BASIC色の偏り計算には未含有）" : "Extras (not included in imbalance set yet)"}
+                  </td>
+                </tr>
+                {extraRow("PROTO", extraProto)}
+                {extraRow("ASTEROID", extraAst)}
+              </>
+            ) : null}
+          </tbody>
+        </table>
+      </div>
+    );
+  }
+
+  async function handleGenerateRank() {
+    if (busy) return;
+
+    setErrorMsg(null);
+    setBusy(true);
+
+    setResults([]);
+    setProgressCurrent(0);
+    setProgressBest(null);
+    setHardFailBy({});
+
+    await nextFrame();
+
+    try {
+      const { results: best, diagnostics } = await runLogicalSearch(
+        templateId,
+        {
+          trials,
+          keepTop,
+          seedStart: 1,
+          yieldEvery: 50,
+          hard: { minSameColorDist: 3, outerSameColorMax, centerMode },
+          soft: { wOuter, wTouch, wScout, scoutRadius, wImbalance, imbalanceMetric },
+        },
+        (done, bestNow) => {
+          setProgressCurrent(done);
+
+          const mapped: RankedResult[] = (bestNow as any[]).map((x: any) => ({
+            seed: String(x.seed),
+            score: Number(x.score ?? 0),
+            placement: (x as any).placement ?? [],
+            placementHash: (x as any).placementHash,
+            evaluation: { total: Number(x.score ?? 0), breakdown: x.breakdown, audit: x.audit },
+          }));
+
+          setResults(mapped);
+          setProgressBest(mapped.length > 0 ? mapped[0].score : null);
+        }
+      );
+
+      const mappedFinal: RankedResult[] = (best as any[]).map((x: any) => ({
+        seed: String(x.seed),
+        score: Number(x.score ?? 0),
+        placement: (x as any).placement ?? [],
+        placementHash: (x as any).placementHash,
+        evaluation: { total: Number(x.score ?? 0), breakdown: x.breakdown, audit: x.audit },
+      }));
+
+      setResults(mappedFinal);
+
+      if ((diagnostics as any)?.hardFailBy) setHardFailBy((diagnostics as any).hardFailBy);
+
+      setProgressCurrent(trials);
+      setProgressBest(mappedFinal.length > 0 ? mappedFinal[0].score : null);
+
+      if (mappedFinal.length > 0) {
+        setSelectedPlacement(mappedFinal[0].placement ?? null);
+        setSelectedSeedLabel(String(mappedFinal[0].seed));
+        setSeed(String(mappedFinal[0].seed));
+      }
+    } catch (e: any) {
+      console.error(e);
+      setErrorMsg(e?.message ? String(e.message) : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const progressPct = trials > 0 ? Math.max(0, Math.min(1, progressCurrent / trials)) : 0;
+  const isNarrow = useIsNarrow(1180);
+
+  const curHashFromResult = getPlacementHashForResult(currentResult);
+  const curImb = getImbalanceSummary(currentResult);
+  const curOT = getOuterTouchCounts(currentResult);
+  const curScout = getScoutSummary(currentResult);
+
+  // 用語集（英→日＋意味）
+  const glossary = React.useMemo(
+    () => [
+      { term: "seed", ja: "シード", desc: "マップ生成の入力値。同一seedなら同一生成結果になります。" },
+      { term: "placement", ja: "配置", desc: "slotId→sectorId/rot 等の配置情報（生成・評価の基本データ）。" },
+      { term: "placementHash", ja: "配置ハッシュ", desc: "配置が同一かを高速に判定する指紋（SSOT追跡用）。" },
+      { term: "score", ja: "スコア", desc: "最終評価値。現仕様では“惑星種別別合算値の乖離のみ”で決まります。" },
+      { term: "breakdown", ja: "内訳", desc: "軸別・惑星種別別の集計、auditなどの評価詳細。" },
+      { term: "audit", ja: "監査情報", desc: "デバッグ・検証用の補助情報（counts / hits / histograms 等）。" },
+      { term: "outer", ja: "外周", desc: "templateSets由来の外周セル集合（SSOT）。" },
+      { term: "touch", ja: "隣接", desc: "templateSets由来の隣接セル集合（SSOT）。" },
+      { term: "scout", ja: "偵察", desc: "Scoutセルと惑星セルの距離に基づく線形減衰評価。" },
+      { term: "radius", ja: "半径", desc: "Scout評価対象とする最大距離。" },
+      { term: "std", ja: "標準偏差", desc: "惑星種別別 totals の分散（ばらつき）指標。" },
+      { term: "range", ja: "範囲", desc: "惑星種別別 totals の最大−最小（ばらつき）指標。" },
+      { term: "Top-K", ja: "上位K件", desc: "スコア上位からK件保持するランキング結果。" },
+      { term: "Hard", ja: "ハード制約", desc: "満たさない候補は即棄却する制約（LogicalMap基準）。" },
+      { term: "Soft", ja: "ソフト評価", desc: "満たした候補を順位付けする評価（惑星種別集計→乖離のみ）。" },
+      { term: "distanceHistogram", ja: "距離ヒストグラム", desc: "距離dごとのヒット件数（Scout検証用）。" },
+      { term: "extraByKind", ja: "種別別（追加）", desc: "PROTO/ASTEROIDなど、BASIC色以外のScout合算（監査用）。" },
+    ],
+    []
+  );
+
+  return (
+    <div style={{ width: "100%", height: "100vh", display: "flex", flexDirection: "column" }}>
+      {/* --- header --- */}
+      <div style={{ padding: 12, display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+        <div style={{ fontWeight: 700 }}>{t("title")}</div>
+
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <div style={{ fontSize: 12, opacity: 0.8 }}>{t("language")}</div>
+          <label style={{ display: "flex", gap: 6, alignItems: "center", fontSize: 12 }}>
+            <input type="radio" name="lang" checked={lang === "en"} onChange={() => setLang("en")} />
+            <span>{t("en")}</span>
+          </label>
+          <label style={{ display: "flex", gap: 6, alignItems: "center", fontSize: 12 }}>
+            <input type="radio" name="lang" checked={lang === "ja"} onChange={() => setLang("ja")} />
+            <span>{t("ja")}</span>
+          </label>
+        </div>
+
+        <label style={{ display: "flex", gap: 6, alignItems: "center" }}>
+          <span>{t("template")}</span>
+          <select
+            value={which}
+            onChange={(e) => {
+              setSelectedPlacement(null);
+              setSelectedSeedLabel(null);
+              setResults([]);
+              setProgressCurrent(0);
+              setProgressBest(null);
+              setHardFailBy({});
+              setWhich(e.target.value as any);
+            }}
+          >
+            <option value="3p">3p Lost Fleet</option>
+            <option value="4p">4p Lost Fleet</option>
+          </select>
+        </label>
+
+        <label style={{ display: "flex", gap: 6, alignItems: "center" }}>
+          <span>{t("seed")}</span>
+          <input
+            value={seed}
+            onChange={(e) => {
+              setSelectedPlacement(null);
+              setSelectedSeedLabel(null);
+              setSeed(e.target.value);
+            }}
+            style={{ width: 160 }}
+          />
+        </label>
+
+        <button
+          onClick={() => {
+            setSelectedPlacement(null);
+            setSelectedSeedLabel(null);
+            setSeed(randomSeedString());
+          }}
+          style={{ padding: "6px 10px" }}
+        >
+          {t("randomSeed")}
+        </button>
+
+        <button onClick={handleGenerateRank} disabled={busy} style={{ padding: "6px 10px", fontWeight: 700 }}>
+          {busy ? t("searching") : t("runSearch")}
+        </button>
+
+        <div style={{ fontSize: 12, opacity: 0.8 }}>
+          templateId=<span style={{ fontFamily: "monospace" }}>{templateId}</span> / {t("progress")}: {progressCurrent}/{trials} (
+          {Math.round(progressPct * 100)}%) / {t("best")}={progressBest ?? "-"}
+          {selectedSeedLabel ? <span style={{ marginLeft: 10 }}>({t("selectedSeed")}={selectedSeedLabel})</span> : null}
+        </div>
+      </div>
+
+      {/* --- ssot line --- */}
+      <div style={{ padding: "0 12px 10px", fontSize: 12, opacity: 0.9, display: "flex", gap: 14, flexWrap: "wrap" }}>
+        <div>
+          {t("currentPlacementHash")}=<span style={{ fontFamily: "monospace", marginLeft: 6 }}>{currentHash}</span>
+        </div>
+        <div>
+          {t("searchSsot")}:
+          {searchConfig ? (
+            <span style={{ marginLeft: 8, fontFamily: "monospace" }}>
+              {t("fixedLarge")}=[{searchConfig.fixedLargeIds.join(", ")}] / {t("littlePool")}=[{searchConfig.littleIds.join(", ")}] /{" "}
+              {t("scoutCount")}={searchConfig.scoutCount}
+            </span>
+          ) : (
+            <span style={{ marginLeft: 8, color: "crimson" }}>
+              ({t("noSearchConfig")}) templateId=&quot;{templateId}&quot;
+            </span>
+          )}
+        </div>
+      </div>
+
+      <div style={{ display: "flex", flex: 1, minHeight: 0, overflow: "hidden" }}>
+        {/* Left: Map */}
+        <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+          <div style={{ flex: 1, minHeight: 0, overflow: "hidden" }}>
+            <MapBoardViewer
+              template={template as any}
+              placement={placementForViewer}
+              sectorById={sectorById as any}
+              sectorImgById={sectorImgById}
+              imgOffsetBySlotId={imgOffsetBySlotId as any}
+              rotOffsetsBySlotId={rotOffsetsBySlotId as any}
+              scaleByAccepts={{ LARGE: 1.0, MIDDLE: 0.9, SMALL: 1.0 }}
+              boundsPad={220}
+              zoom={0.8}
+            />
+          </div>
+
+          {errorMsg ? <div style={{ padding: 10, color: "crimson", fontSize: 13, whiteSpace: "pre-wrap" }}>{errorMsg}</div> : null}
+        </div>
+
+        {/* Right: Results */}
+        <div style={{ width: isNarrow ? 340 : 520, borderLeft: "1px solid #ddd", overflow: "hidden" }}>
+          <div style={{ padding: 12, display: "flex", flexDirection: "column", gap: 10, height: "100%" }}>
+            <div style={{ fontWeight: 700 }}>{t("logicalResults")}</div>
+
+            {/* Current logical summary */}
+            <div style={{ padding: 10, border: "1px solid #ddd", borderRadius: 8 }}>
+              <div style={{ fontWeight: 700, marginBottom: 6 }}>{t("currentLogicalSummary")}</div>
+
+              <div style={{ fontFamily: "monospace", fontSize: 12 }}>
+                {t("seed")}={String(selectedSeedLabel ?? seed ?? "-")}
+              </div>
+
+              <div style={{ fontFamily: "monospace", fontSize: 11, opacity: 0.85, marginTop: 6 }}>
+                {t("placementHashResult")}={curHashFromResult}
+              </div>
+              <div style={{ fontFamily: "monospace", fontSize: 11, opacity: 0.85, marginTop: 4 }}>
+                {t("placementHashView")}={currentHash}
+              </div>
+
+              <div style={{ marginTop: 8, fontSize: 12 }}>
+                {t("score")}={currentResult ? Number(currentResult.score ?? 0).toFixed(3) : "-"}
+              </div>
+
+              <div style={{ marginTop: 4, fontSize: 12 }}>
+                {t("imbalance")} ({curImb.metric})={currentResult ? (Math.round(curImb.value * 1000) / 1000).toFixed(3) : "-"}
+              </div>
+
+              <div style={{ marginTop: 4, fontSize: 12, opacity: 0.9 }}>
+                {t("outerCnt")}={currentResult ? curOT.outerSum : "-"} / {t("touchCnt")}={currentResult ? curOT.touchSum : "-"}
+              </div>
+
+              <div style={{ marginTop: 4, fontSize: 12, opacity: 0.9 }}>
+                scoutRadius={curScout.radius ?? "-"} / scoutTotal={currentResult ? curScout.scoutTotal.toFixed(3) : "-"}
+              </div>
+
+              {currentResult ? (
+                <details style={{ marginTop: 10 }}>
+                  <summary style={{ cursor: "pointer", fontSize: 12, opacity: 0.85 }}>
+                    {lang === "ja" ? "色別の内訳（outer/touch/scout/total）" : "By color (outer/touch/scout/total)"}
+                  </summary>
+                  <div style={{ marginTop: 8 }}>{renderColorBreakdownTable(getBreakdown(currentResult))}</div>
+                </details>
+              ) : null}
+
+              {currentResult ? (
+                <details style={{ marginTop: 8 }}>
+                  <summary style={{ cursor: "pointer", fontSize: 12, opacity: 0.85 }}>scout hist</summary>
+                  <div style={{ fontFamily: "monospace", fontSize: 11, opacity: 0.9, marginTop: 6 }}>
+                    distanceHistogram:
+                    <pre style={{ margin: 0, whiteSpace: "pre-wrap" }}>{stableJson(curScout.distanceHistogram ?? {})}</pre>
+                    extraByKind:
+                    <pre style={{ margin: 0, whiteSpace: "pre-wrap" }}>{stableJson(curScout.extraByKind ?? {})}</pre>
+                  </div>
+                </details>
+              ) : null}
+
+              {currentResult ? (
+                <details style={{ marginTop: 8 }}>
+                  <summary style={{ cursor: "pointer", fontSize: 12, opacity: 0.85 }}>{t("breakdown")}</summary>
+                  <pre style={{ margin: 0, fontSize: 11, whiteSpace: "pre-wrap", overflowX: "auto" }}>
+                    {JSON.stringify(getBreakdown(currentResult), null, 2)}
+                  </pre>
+                </details>
+              ) : (
+                <div style={{ marginTop: 6, fontSize: 12, opacity: 0.7 }}>{t("noCurrentResult")}</div>
+              )}
+            </div>
+
+            {/* Glossary */}
+            <div style={{ padding: 10, border: "1px solid #ddd", borderRadius: 8 }}>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+                <div style={{ fontWeight: 700 }}>{t("glossary")}</div>
+                <button onClick={() => setShowGlossary((v) => !v)} style={{ padding: "2px 8px", fontSize: 12 }}>
+                  {showGlossary ? t("hide") : t("show")}
+                </button>
+              </div>
+
+              {showGlossary ? (
+                <div style={{ marginTop: 8, fontSize: 12 }}>
+                  {glossary.map((g) => (
+                    <div key={g.term} style={{ padding: "6px 0", borderTop: "1px dashed #eee" }}>
+                      <div style={{ fontFamily: "monospace" }}>
+                        {g.term} <span style={{ opacity: 0.75 }}> / {g.ja}</span>
+                      </div>
+                      <div style={{ marginTop: 2, opacity: 0.85 }}>{g.desc}</div>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+            </div>
+
+            {/* Controls */}
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+              <label style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                <span>{t("trials")}</span>
+                <input
+                  type="number"
+                  value={trials}
+                  min={1}
+                  max={200000}
+                  onChange={(e) => setTrials(Math.max(1, Math.min(200000, Number(e.target.value) || 1)))}
+                  style={{ width: 100 }}
+                />
+              </label>
+
+              <label style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                <span>{t("topK")}</span>
+                <input
+                  type="number"
+                  value={keepTop}
+                  min={1}
+                  max={200}
+                  onChange={(e) => setKeepTop(Math.max(1, Math.min(200, Number(e.target.value) || 1)))}
+                  style={{ width: 80 }}
+                />
+              </label>
+            </div>
+
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+              <div style={{ fontWeight: 700, fontSize: 12 }}>{t("hard")}</div>
+
+              <label style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                <span>{t("outerSameColorMax")}</span>
+                <input
+                  type="number"
+                  value={outerSameColorMax}
+                  min={0}
+                  max={9}
+                  onChange={(e) => setOuterSameColorMax(Math.max(0, Math.min(9, Number(e.target.value) || 0)))}
+                  style={{ width: 60 }}
+                />
+              </label>
+
+              <label style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                <span>{t("centerMode")}</span>
+                <select value={centerMode} onChange={(e) => setCenterMode(e.target.value as any)}>
+                  <option value="NONE">NONE</option>
+                  <option value="CENTER_7_9">CENTER_7_9</option>
+                  <option value="CENTER_8">CENTER_8</option>
+                </select>
+              </label>
+            </div>
+
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+              <div style={{ fontWeight: 700, fontSize: 12 }}>{t("soft")}</div>
+
+              <label style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                <span>wOuter</span>
+                <input type="number" value={wOuter} min={0} max={10} onChange={(e) => setWOuter(Number(e.target.value) || 0)} style={{ width: 60 }} />
+              </label>
+
+              <label style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                <span>wTouch</span>
+                <input type="number" value={wTouch} min={0} max={10} onChange={(e) => setWTouch(Number(e.target.value) || 0)} style={{ width: 60 }} />
+              </label>
+
+              <label style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                <span>wScout</span>
+                <input type="number" value={wScout} min={0} max={10} onChange={(e) => setWScout(Number(e.target.value) || 0)} style={{ width: 60 }} />
+              </label>
+
+              <label style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                <span>{t("radius")}</span>
+                <input
+                  type="number"
+                  value={scoutRadius}
+                  min={1}
+                  max={12}
+                  onChange={(e) => setScoutRadius(Math.max(1, Math.min(12, Number(e.target.value) || 1)))}
+                  style={{ width: 60 }}
+                />
+              </label>
+
+              <label style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                <span>wImbalance</span>
+                <input type="number" value={wImbalance} min={0} max={50} onChange={(e) => setWImbalance(Number(e.target.value) || 0)} style={{ width: 80 }} />
+              </label>
+
+              <label style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                <span>{t("metric")}</span>
+                <select value={imbalanceMetric} onChange={(e) => setImbalanceMetric(e.target.value as any)}>
+                  <option value="std">{lang === "ja" ? "std（標準偏差）" : "std"}</option>
+                  <option value="range">{lang === "ja" ? "range（最大−最小）" : "range"}</option>
+                </select>
+              </label>
+            </div>
+
+            {/* Top-K List */}
+            <div style={{ padding: 10, border: "1px solid #ddd", borderRadius: 8, overflow: "auto", flex: 1, minHeight: 0 }}>
+              <div style={{ fontWeight: 700, marginBottom: 8 }}>{t("topKLogical")}</div>
+
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                {results.map((r, idx) => {
+                  const b = getBreakdown(r);
+                  const hash = getPlacementHashForResult(r);
+
+                  const imbMetric = b?.imbalance?.metric ?? "-";
+                  const imbValue = Number(b?.imbalance?.value ?? 0);
+
+                  const outerBy = b?.audit?.outerCountByType ?? null;
+                  const touchBy = b?.audit?.touchCountByType ?? null;
+
+                  const outerSum = sumCounts(outerBy);
+                  const touchSum = sumCounts(touchBy);
+
+                  const sc = getScoutSummary(r);
+
+                  return (
+                    <button
+                      key={`${r.seed}-${idx}`}
+                      onClick={() => {
+                        setSelectedPlacement(r.placement ?? null);
+                        setSelectedSeedLabel(r.seed);
+                        setSeed(r.seed);
+                      }}
+                      style={{
+                        textAlign: "left",
+                        padding: 8,
+                        borderRadius: 8,
+                        border: "1px solid #ddd",
+                        background: selectedSeedLabel === r.seed ? "#f3f7ff" : "white",
+                        cursor: "pointer",
+                      }}
+                    >
+                      <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
+                        <div style={{ fontWeight: 700 }}>#{idx + 1}</div>
+                        <div style={{ fontFamily: "monospace" }}>
+                          {t("seed")}={r.seed}
+                        </div>
+                        <div style={{ fontFamily: "monospace" }}>
+                          {t("score")}={Number(r.score).toFixed(3)}
+                        </div>
+                      </div>
+
+                      <div style={{ fontFamily: "monospace", fontSize: 11, opacity: 0.78, marginTop: 6 }}>
+                        {t("hash")}={hash}
+                      </div>
+
+                      <div style={{ fontFamily: "monospace", fontSize: 11, opacity: 0.78, marginTop: 4 }}>
+                        {t("imbalance")}({imbMetric})={(Math.round(imbValue * 1000) / 1000).toFixed(3)}
+                      </div>
+
+                      <div style={{ fontFamily: "monospace", fontSize: 11, opacity: 0.78, marginTop: 2 }}>
+                        {t("outerCnt")}={outerSum} / {t("touchCnt")}={touchSum}
+                      </div>
+
+                      <div style={{ fontFamily: "monospace", fontSize: 11, opacity: 0.78, marginTop: 2 }}>
+                        scoutR={sc.radius ?? "-"} / scoutTotal={sc.scoutTotal.toFixed(3)}
+                      </div>
+
+                      {(sc.distanceHistogram || sc.extraByKind) ? (
+                        <details style={{ marginTop: 6 }}>
+                          <summary style={{ cursor: "pointer", fontSize: 11, opacity: 0.8 }}>
+                            {lang === "ja" ? "scoutヒストグラム" : "scout hist"}
+                          </summary>
+                          <pre style={{ margin: 0, fontSize: 11, whiteSpace: "pre-wrap", overflowX: "auto" }}>
+                            {stableJson({
+                              distanceHistogram: sc.distanceHistogram ?? {},
+                              extraByKind: sc.extraByKind ?? {},
+                            })}
+                          </pre>
+                        </details>
+                      ) : null}
+                    </button>
+                  );
+                })}
+
+                {results.length === 0 ? <div style={{ fontSize: 12, opacity: 0.7 }}>No results yet.</div> : null}
+              </div>
+            </div>
+
+            {Object.keys(hardFailBy).length > 0 ? (
+              <div style={{ padding: 10, border: "1px solid #ddd", borderRadius: 8 }}>
+                <div style={{ fontWeight: 700, marginBottom: 8 }}>{t("hardFailCounts")}</div>
+                <pre style={{ margin: 0, fontSize: 12, whiteSpace: "pre-wrap" }}>{stableJson(hardFailBy)}</pre>
+              </div>
+            ) : null}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}

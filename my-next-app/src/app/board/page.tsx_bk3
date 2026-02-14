@@ -1,0 +1,1464 @@
+"use client";
+
+import * as React from "react";
+import { MapBoardViewer, type PlacementItem as ViewerPlacementItem } from "@/components/MapBoardViewer";
+
+import { TEMPLATE_3P_LOSTFLEET } from "@/gaia/data/templates/3p_lostFleet";
+import { TEMPLATE_4P_LOSTFLEET } from "@/gaia/data/templates/4p_lostFleet";
+
+import { BASE_SECTORS } from "@/gaia/sectorTiles_base";
+import { EXPANSION_MIDDLE, EXPANSION_LITTLE, EXPANSION_SCOUT } from "@/gaia/sectorTiles_lostfleet";
+
+import { buildSectorLookup, expandPlacementToBoardCells, type BoardCell } from "@/gaia/board/previewBoard";
+import { placementFromSeed } from "@/gaia/board/placementFromSeed";
+import { evaluateBoard } from "@/gaia/board/evaluate";
+import { computeConstraintReport, type ConstraintReport } from "@/gaia/board/constraints";
+
+/**
+ * ======= ここを編集：固定 Large セット =======
+ *
+ * 目的：seed を変えても「使用する Large タイル集合」を 3p/4p で固定する。
+ *
+ * 使い方：
+ * - BASE_SECTORS の sectorId（=LargeタイルID）をここに列挙してください。
+ * - 3p / 4p それぞれ「Largeスロット数」と同数以上を指定してください。
+ * - 長い場合は、必要数より多く指定してもOK（先頭から必要数だけ使用）
+ *
+ * 暫定：初期状態は ["__AUTO__"] になっています。
+ * - このままだと従来同様に BASE_SECTORS の先頭から必要数を採用（動作確認用）
+ * - 明示固定したい場合は "__AUTO__" を消してIDを列挙
+ */
+const FIXED_LARGE_3P: string[] = ["01","02","03","04","05b","06b","07b","09","10"];
+const FIXED_LARGE_4P: string[] = ["01","02","03","04","05","06","07","08","09","10"];
+
+/**
+ * ======= ここを編集：固定 Little プール =======
+ *
+ * 目的：Little の候補集合（19/20/21 以外も含む）を 3p/4p で固定し、
+ *       その中から「固定枚数(19/20/21) + 残りを非固定から置換なし」で選ぶ。
+ *
+ * 前提（SSOT）:
+ * - placementFromSeed の Little は deck 方式（置換なし）
+ * - littleFixedCounts は 19/20/21 の“固定枚数”
+ *
+ * 使い方：
+ * - EXPANSION_LITTLE の sectorId（=LittleタイルID）をここに列挙してください。
+ * - 19/20/21 以外の Little を追加したうえで、ここで候補プールを固定します。
+ *
+ * 暫定：初期状態は ["__AUTO__"]（=EXPANSION_LITTLE 全体を候補プールにする）
+ */
+const FIXED_LITTLE_POOL_3P: string[] = ["19","20","21","22"];
+const FIXED_LITTLE_POOL_4P: string[] = ["19","20","21","22","23","24"];
+
+const BASIC_PLANET_TYPES = ["BLACK","BLUE","BROWN","ORANGE","RED","WHITE","YELLOW"] as const;
+type BasicPlanetType = (typeof BASIC_PLANET_TYPES)[number];
+
+type RankedResult = {
+  seed: string;
+  score: number;
+  placement: any[];
+  evalResult: any;
+};
+
+// ===== Debug: ASCII board dump =====
+type AsciiDumpMode = "planet" | "slot";
+
+function planetChar(planetType: string | undefined, kind: string | undefined): string {
+  const u = String(planetType ?? "").trim().toUpperCase();
+  // 1文字で判別しやすいよう、頭文字が被る色を避けた割当
+  // BLACK=K, BLUE=U, BROWN=N, ORANGE=O, RED=R, WHITE=W, YELLOW=Y
+  if (u === "BLACK") return "K";
+  if (u === "BLUE") return "U";
+  if (u === "BROWN") return "N";
+  if (u === "ORANGE") return "O";
+  if (u === "RED") return "R";
+  if (u === "WHITE") return "W";
+  if (u === "YELLOW") return "Y";
+  if (u === "GAIA") return "G";
+  if (u === "TRANSDIM" || u === "TRANS" || u === "TRANSDIMENSIONAL") return "T";
+  if (kind === "empty" || u === "EMPTY") return ".";
+  if (kind === "planet") return "P"; // planetType不明
+  if (kind === "other") return "#";
+  return ".";
+}
+
+function renderBoardAscii(boardCells: BoardCell[], mode: AsciiDumpMode = "planet"): string {
+  if (!boardCells.length) return "(no cells)";
+
+  const byCoord = new Map<string, BoardCell>();
+  let minQ = Infinity,
+    maxQ = -Infinity,
+    minR = Infinity,
+    maxR = -Infinity;
+
+  for (const c of boardCells) {
+    const q = c.pos.q;
+    const r = c.pos.r;
+    const k = `${q},${r}`;
+    byCoord.set(k, c);
+    if (q < minQ) minQ = q;
+    if (q > maxQ) maxQ = q;
+    if (r < minR) minR = r;
+    if (r > maxR) maxR = r;
+  }
+
+  // 表示余白
+  const pad = 1;
+  minQ -= pad;
+  maxQ += pad;
+  minR -= pad;
+  maxR += pad;
+
+  const lines: string[] = [];
+  lines.push(
+    mode === "planet"
+      ? "Legend: K=BLACK U=BLUE N=BROWN O=ORANGE R=RED W=WHITE Y=YELLOW G=GAIA T=TRANSDIM .=EMPTY"
+      : "Legend: shows slotId initial (L/M/S), '.'=no cell"
+  );
+  lines.push(`range q:[${minQ},${maxQ}] r:[${minR},${maxR}] cells=${boardCells.length}`);
+  lines.push("");
+
+  for (let r = minR; r <= maxR; r++) {
+    // axial の見た目調整：rのパリティでインデント
+    const indent = " ".repeat(((r - minR) & 1) * 2);
+    const row: string[] = [];
+    for (let q = minQ; q <= maxQ; q++) {
+      const c = byCoord.get(`${q},${r}`);
+      if (!c) {
+        row.push("  ");
+        continue;
+      }
+      if (mode === "slot") {
+        const s = String((c as any).slotId ?? "?");
+        row.push((s[0] ?? "?") + " ");
+      } else {
+        row.push(planetChar((c as any).planetType, (c as any).kind) + " ");
+      }
+    }
+    lines.push(`${String(r).padStart(3, " ")} | ${indent}${row.join("")}`);
+  }
+
+  return lines.join("\n");
+}
+
+function buildSectorImgById(): Map<string, string> {
+  const m = new Map<string, string>();
+  const all = [
+    ...(BASE_SECTORS as any[]),
+    ...(EXPANSION_MIDDLE as any[]),
+    ...(EXPANSION_LITTLE as any[]),
+    ...(EXPANSION_SCOUT as any[]),
+  ];
+  for (const s of all) {
+    const id = (s?.sectorId ?? s?.id) as string | undefined;
+    if (!id) continue;
+
+    const img =
+      (s?.img as string | undefined) ??
+      (s?.image as string | undefined) ??
+      (s?.path as string | undefined) ??
+      `/sectors/${id}.png`;
+
+    m.set(id, img);
+  }
+  return m;
+}
+
+function getSectorIdList(sectors: any[]): string[] {
+  const ids: string[] = [];
+  for (const s of sectors) {
+    const id = (s?.sectorId ?? s?.id) as string | undefined;
+    if (id) ids.push(id);
+  }
+  return ids;
+}
+
+function nextFrame(): Promise<void> {
+  return new Promise((resolve) => requestAnimationFrame(() => resolve()));
+}
+
+function countSmallSlots(slots: any[]): number {
+  let large = 0;
+  let middle = 0;
+  for (const s of slots) {
+    const a = Array.isArray((s as any).accepts) ? (s as any).accepts[0] : (s as any).accepts;
+    if (a === "LARGE") large++;
+    else if (a === "MIDDLE") middle++;
+  }
+  return Math.max(0, slots.length - large - middle);
+}
+
+function sumFixedCounts(fixed: Record<string, number> | undefined): number {
+  if (!fixed) return 0;
+  let s = 0;
+  for (const k of Object.keys(fixed)) s += Math.max(0, Number(fixed[k] ?? 0));
+  return s;
+}
+
+function hexDist(a: { q: number; r: number }, b: { q: number; r: number }): number {
+  const dq = a.q - b.q;
+  const dr = a.r - b.r;
+  const ds = a.q + a.r - (b.q + b.r);
+  return Math.max(Math.abs(dq), Math.abs(dr), Math.abs(ds));
+}
+
+function chooseK<T>(arr: T[], k: number): T[][] {
+  if (k <= 0) return [[]];
+  if (arr.length < k) return [];
+  const res: T[][] = [];
+  const rec = (start: number, picked: T[]) => {
+    if (picked.length === k) {
+      res.push(picked.slice());
+      return;
+    }
+    for (let i = start; i <= arr.length - (k - picked.length); i++) {
+      picked.push(arr[i]);
+      rec(i + 1, picked);
+      picked.pop();
+    }
+  };
+  rec(0, []);
+  return res;
+}
+
+type ScoutFeasibility = {
+  scoutSlotCount: number;
+  scoutCount: number;
+  combosChecked: number;
+  maxMinDist: number | null;
+  exampleSlotIds: string[];
+};
+
+function computeScoutFeasibility(template: any, scoutCount: number): ScoutFeasibility {
+  const scoutSlots = (template?.slots as any[])
+    .filter((s: any) => typeof s?.slotId === "string" && s.slotId.startsWith("S") && s?.pos)
+    .map((s: any) => ({ slotId: String(s.slotId), pos: s.pos as { q: number; r: number } }));
+
+  if (!scoutSlots.length || scoutCount <= 0) {
+    return { scoutSlotCount: scoutSlots.length, scoutCount, combosChecked: 0, maxMinDist: null, exampleSlotIds: [] };
+  }
+  if (scoutSlots.length < scoutCount) {
+    return { scoutSlotCount: scoutSlots.length, scoutCount, combosChecked: 0, maxMinDist: null, exampleSlotIds: [] };
+  }
+
+  const combos = chooseK(scoutSlots, scoutCount);
+  let bestMin = -Infinity;
+  let bestExample: string[] = [];
+
+  for (const c of combos) {
+    let minPair = Infinity;
+    for (let i = 0; i < c.length; i++) {
+      for (let j = i + 1; j < c.length; j++) {
+        const d = hexDist(c[i].pos, c[j].pos);
+        if (d < minPair) minPair = d;
+        if (minPair <= bestMin) break;
+      }
+      if (minPair <= bestMin) break;
+    }
+    if (minPair > bestMin) {
+      bestMin = minPair;
+      bestExample = c.map((x) => x.slotId);
+    }
+  }
+
+  return {
+    scoutSlotCount: scoutSlots.length,
+    scoutCount,
+    combosChecked: combos.length,
+    maxMinDist: Number.isFinite(bestMin) ? bestMin : null,
+    exampleSlotIds: bestExample,
+  };
+}
+
+function useIsNarrow(breakpointPx: number): boolean {
+  const [isNarrow, setIsNarrow] = React.useState(false);
+  React.useEffect(() => {
+    const update = () => setIsNarrow(window.innerWidth < breakpointPx);
+    update();
+    window.addEventListener("resize", update);
+    return () => window.removeEventListener("resize", update);
+  }, [breakpointPx]);
+  return isNarrow;
+}
+
+function randomSeedString(): string {
+  const n = Math.floor(Math.random() * 0x7fffffff);
+  return String(n);
+}
+
+function makeRandomSeedStringStrong(): string {
+  const a = new Uint32Array(1);
+  crypto.getRandomValues(a);
+  return String(a[0] >>> 0);
+}
+
+function countLargeSlots(slots: any[]): number {
+  let n = 0;
+  for (const s of slots) {
+    const a = Array.isArray(s?.accepts) ? s.accepts[0] : s?.accepts;
+    if (a === "LARGE") n++;
+  }
+  return n;
+}
+
+function resolveFixedLargeIds(args: {
+  allLargeIds: string[];
+  templateSlots: any[];
+  fixedIds: string[];
+}): { ok: true; ids: string[] } | { ok: false; message: string; ids: string[] } {
+  const need = countLargeSlots(args.templateSlots);
+
+  // LARGE exclusivity units: (5 vs 5b), (06 vs 06b), (07 vs 07b) ...
+  // placementFromSeed はこの「ユニット」単位で1枠を埋めるため、
+  // 固定集合は「ユニット数 >= Large枠数」を満たす必要がある。
+  const normalizeLargeExclusive = (ids: string[]) => {
+    const set = new Set(ids);
+    const kept: string[] = [];
+    const dropped: string[] = [];
+    const used = new Set<string>();
+
+    const sorted = [...new Set(ids)].sort((a, b) => a.localeCompare(b, "en", { numeric: true }));
+
+    for (const id of sorted) {
+      if (used.has(id)) continue;
+
+      const m = /^(.*?)(0?)([567])b?$/.exec(id);
+      if (m) {
+        const prefix = m[1] ?? "";
+        const z = m[2] ?? "";
+        const n = m[3] ?? "";
+        const base = `${prefix}${z}${n}`;
+        const alt = `${base}b`;
+
+        if (set.has(base) && set.has(alt)) {
+          // 両方指定されている場合、固定集合としては「片方だけ」に正規化する
+          kept.push(base);
+          dropped.push(alt);
+          used.add(base);
+          used.add(alt);
+          continue;
+        }
+      }
+
+      kept.push(id);
+      used.add(id);
+    }
+    return { kept, dropped };
+  };
+
+  const countLargeUnits = (ids: string[]) => {
+    // ids が排他ペア両方を含むと unit が 1 つに減る
+    const set = new Set(ids);
+    const used = new Set<string>();
+    let units = 0;
+    for (const id of ids) {
+      if (used.has(id)) continue;
+      const m = /^(.*?)(0?)([567])b?$/.exec(id);
+      if (m) {
+        const prefix = m[1] ?? "";
+        const z = m[2] ?? "";
+        const n = m[3] ?? "";
+        const base = `${prefix}${z}${n}`;
+        const alt = `${base}b`;
+        if (set.has(base) && set.has(alt)) {
+          used.add(base);
+          used.add(alt);
+          units++;
+          continue;
+        }
+      }
+      used.add(id);
+      units++;
+    }
+    return units;
+  };
+
+  // AUTO: 動作確認用（明示固定に切り替えるまでの暫定）
+  if (args.fixedIds.length === 1 && args.fixedIds[0] === "__AUTO__") {
+    if (args.allLargeIds.length < need) {
+      return {
+        ok: false,
+        message: `AUTO fixed large: not enough candidates. need=${need}, have=${args.allLargeIds.length}`,
+        ids: args.allLargeIds,
+      };
+    }
+    return { ok: true, ids: args.allLargeIds.slice(0, need) };
+  }
+
+  // 明示固定：存在チェック
+  const pool = new Set(args.allLargeIds);
+  const missing = args.fixedIds.filter((x) => !pool.has(x));
+
+  if (missing.length) {
+    return {
+      ok: false,
+      message: `Fixed Large ids not found in BASE_SECTORS: ${missing.join(", ")}`,
+      ids: args.fixedIds,
+    };
+  }
+
+  if (args.fixedIds.length < need) {
+    return {
+      ok: false,
+      message: `Fixed Large ids are not enough. need=${need}, provided=${args.fixedIds.length}`,
+      ids: args.fixedIds,
+    };
+  }
+
+  // 排他ペアを含む場合、placementFromSeed 内のユニット数が減ってエラーになるため、ここで正規化＆検証する
+  const normalized = normalizeLargeExclusive(args.fixedIds);
+  const unitCount = countLargeUnits(args.fixedIds);
+
+  if (unitCount < need) {
+    const hint = normalized.dropped.length
+      ? ` (dropped due to exclusivity: ${normalized.dropped.join(", ")})`
+      : "";
+    return {
+      ok: false,
+      message: `Not enough LARGE tiles under exclusivity constraints: need ${need}, have ${unitCount} units.${hint} Please specify only ONE of each pair like 5/5b, 06/06b, 07/07b.`,
+      ids: args.fixedIds,
+    };
+  }
+
+  // placementFromSeed がユニット化しないよう、両方指定されているペアは片方だけにして渡す
+  const finalIds = normalized.kept;
+  if (finalIds.length < need) {
+    // 正規化の結果が足りない場合は fail fast
+    return {
+      ok: false,
+      message: `Fixed Large ids after exclusivity normalization are not enough. need=${need}, kept=${finalIds.length}.`,
+      ids: finalIds,
+    };
+  }
+
+  return { ok: true, ids: finalIds.slice(0, need) };
+}
+
+function resolveFixedLittlePool(args: {
+  allLittleIds: string[];
+  fixedPoolIds: string[];
+  fixedCounts: Record<string, number>;
+  littleSlotCount: number;
+}):
+  | { ok: true; ids: string[]; warning: string | null; requiredNonFixed: number; availableNonFixed: number }
+  | { ok: false; ids: string[]; message: string; warning: string | null; requiredNonFixed: number; availableNonFixed: number } {
+  const fixedIds = Object.keys(args.fixedCounts ?? {});
+  const fixedSet = new Set(fixedIds.map(String));
+  const fixedSum = sumFixedCounts(args.fixedCounts);
+  const requiredNonFixed = Math.max(0, args.littleSlotCount - fixedSum);
+
+  // AUTO: EXPANSION_LITTLE 全体
+  if (args.fixedPoolIds.length === 1 && args.fixedPoolIds[0] === "__AUTO__") {
+    const ids = [...new Set(args.allLittleIds.map(String))];
+    const availableNonFixed = ids.filter((x) => !fixedSet.has(String(x))).length;
+    if (fixedSum > args.littleSlotCount) {
+      return {
+        ok: false,
+        ids,
+        message: `littleFixedCounts total (${fixedSum}) exceeds little slots (${args.littleSlotCount}).`,
+        warning: null,
+        requiredNonFixed,
+        availableNonFixed,
+      };
+    }
+    if (requiredNonFixed > availableNonFixed) {
+      return {
+        ok: false,
+        ids,
+        message:
+          `Not enough non-fixed littleIds in AUTO pool: need ${requiredNonFixed}, have ${availableNonFixed}. ` +
+          `Add Little IDs beyond {19,20,21} to EXPANSION_LITTLE.`,
+        warning: null,
+        requiredNonFixed,
+        availableNonFixed,
+      };
+    }
+    return { ok: true, ids, warning: null, requiredNonFixed, availableNonFixed };
+  }
+
+  // 明示固定プール
+  const universe = new Set(args.allLittleIds.map(String));
+  const missing = args.fixedPoolIds.filter((x) => !universe.has(String(x)));
+  if (missing.length) {
+    return {
+      ok: false,
+      ids: args.fixedPoolIds,
+      message: `Fixed Little pool contains IDs not found in EXPANSION_LITTLE: ${missing.join(", ")}`,
+      warning: null,
+      requiredNonFixed,
+      availableNonFixed: 0,
+    };
+  }
+
+  let warning: string | null = null;
+
+  // fixedCounts のキー(=19/20/21)がプールに含まれていない場合は自動補完（ただし存在は保証済み）
+  const poolSet = new Set(args.fixedPoolIds.map(String));
+  const supplemented: string[] = [...args.fixedPoolIds.map(String)];
+  const missingFixed = fixedIds.filter((x) => !poolSet.has(String(x)));
+  if (missingFixed.length) {
+    warning = `Fixed Little pool did not include fixed-count IDs (${missingFixed.join(", ")}); auto-appended them to the pool.`;
+    for (const id of missingFixed) supplemented.push(String(id));
+  }
+
+  const ids = [...new Set(supplemented)];
+  const availableNonFixed = ids.filter((x) => !fixedSet.has(String(x))).length;
+
+  if (fixedSum > args.littleSlotCount) {
+    return {
+      ok: false,
+      ids,
+      message: `littleFixedCounts total (${fixedSum}) exceeds little slots (${args.littleSlotCount}).`,
+      warning,
+      requiredNonFixed,
+      availableNonFixed,
+    };
+  }
+
+  if (requiredNonFixed > availableNonFixed) {
+    return {
+      ok: false,
+      ids,
+      message: `Not enough non-fixed littleIds in fixed pool: need ${requiredNonFixed}, have ${availableNonFixed}.`,
+      warning,
+      requiredNonFixed,
+      availableNonFixed,
+    };
+  }
+
+  return { ok: true, ids, warning, requiredNonFixed, availableNonFixed };
+}
+
+// evaluateBoard が期待する “NormalizedBoard” を page.tsx 内で組み立てる（構造互換寄せ）
+type NormalizedCellLike = {
+  q: number;
+  r: number;
+  coordKey: string;
+
+  slotId: string;
+  accepts: any;
+  sectorId: string;
+
+  /** Template-local offset from slot center: "dq,dr" */
+  tplLocalKey: string;
+
+  /** (legacy) sector-local key */
+  localKey?: string;
+
+  kind: string;
+  planetType?: string;
+  tags: string[];
+  neighbors: string[];
+};
+
+type NormalizedBoardLike = {
+  templateId: string;
+  cells: NormalizedCellLike[];
+  cellByCoord: Map<string, NormalizedCellLike>;
+};
+
+function keyOf(q: number, r: number) {
+  return `${q},${r}`;
+}
+
+const AXIAL_DIRS = [
+  { q: 1, r: 0 },
+  { q: 1, r: -1 },
+  { q: 0, r: -1 },
+  { q: -1, r: 0 },
+  { q: -1, r: 1 },
+  { q: 0, r: 1 },
+];
+
+function normalizeBoardFromCells(template: any, boardCells: BoardCell[]): NormalizedBoardLike {
+  const templateId = String(template?.templateId ?? "");
+  const slotById = new Map<string, any>(
+    Array.isArray(template?.slots) ? template.slots.map((s: any) => [String(s.slotId), s]) : []
+  );
+
+  const cellByCoord = new Map<string, NormalizedCellLike>();
+
+  for (const bc of boardCells) {
+    const q = bc.pos.q;
+    const r = bc.pos.r;
+    const coordKey = keyOf(q, r);
+
+    const slotId = String((bc as any).slotId ?? "");
+    const sectorId = String((bc as any).sectorId ?? "");
+    const localKey = typeof (bc as any).localKey === "string" ? (bc as any).localKey : undefined;
+
+    const slot = slotById.get(slotId);
+    const slotPos = slot?.pos;
+    const tplLocalKey =
+      slotPos && Number.isFinite(slotPos.q) && Number.isFinite(slotPos.r)
+        ? `${q - slotPos.q},${r - slotPos.r}`
+        : "0,0";
+
+    cellByCoord.set(coordKey, {
+      q,
+      r,
+      coordKey,
+
+      slotId,
+      accepts: (slot?.accepts ?? (bc as any).accepts ?? "UNKNOWN") as any,
+      sectorId,
+      tplLocalKey,
+      localKey,
+
+      kind: (bc as any).kind,
+      planetType: (bc as any).planetType ?? "UNKNOWN",
+      tags: Array.isArray((bc as any).tags) ? (bc as any).tags : [],
+      neighbors: [],
+    });
+  }
+
+  const cells = Array.from(cellByCoord.values());
+  for (const c of cells) {
+    c.neighbors = AXIAL_DIRS.map((d) => keyOf(c.q + d.q, c.r + d.r));
+  }
+
+  return { templateId, cells, cellByCoord };
+}
+
+function computeScoreFromEval(ev: any): number {
+  const edgesSameType = Number(ev?.summary?.edgesSameType ?? 0);
+  const planetCellCount = Number(ev?.summary?.planetCellCount ?? 0);
+  const within2 = Array.isArray(ev?.distanceByPlanetType)
+    ? ev.distanceByPlanetType.reduce((s: number, x: any) => s + Number(x?.withinThresholdPairs ?? 0), 0)
+    : 0;
+
+  let score = 0;
+  score -= edgesSameType * 3;
+  score -= within2 * 2;
+  if (planetCellCount <= 0) score -= 9999;
+
+  const disp = Array.isArray(ev?.dispersionByPlanetType)
+    ? ev.dispersionByPlanetType.reduce((s: number, x: any) => s + Number(x?.avgDistToCentroid ?? 0), 0)
+    : 0;
+  score += disp * 0.5;
+
+  return score;
+}
+
+export default function Page() {
+  const [which, setWhich] = React.useState<"3p" | "4p">("3p");
+  const [seed, setSeed] = React.useState("0");
+
+  const [mapZoom, setMapZoom] = React.useState<number>(1.15);
+  const [boundsPad, setBoundsPad] = React.useState<number>(60);
+
+  const template = which === "3p" ? TEMPLATE_3P_LOSTFLEET : TEMPLATE_4P_LOSTFLEET;
+
+  const largeIdsAll = React.useMemo(() => getSectorIdList(BASE_SECTORS as any[]), []);
+  const middleIds = React.useMemo(() => getSectorIdList(EXPANSION_MIDDLE as any[]), []);
+  const scoutIds = React.useMemo(() => getSectorIdList(EXPANSION_SCOUT as any[]), []);
+  const littleIdsAll = React.useMemo(() => getSectorIdList(EXPANSION_LITTLE as any[]), []);
+
+  const fixedLarge = React.useMemo(() => {
+    const fixed = which === "3p" ? FIXED_LARGE_3P : FIXED_LARGE_4P;
+    return resolveFixedLargeIds({ allLargeIds: largeIdsAll, templateSlots: template.slots as any[], fixedIds: fixed });
+  }, [which, largeIdsAll, template]);
+
+  const largeIds = React.useMemo(() => (fixedLarge.ok ? fixedLarge.ids : largeIdsAll.slice(0, countLargeSlots(template.slots as any[]))), [fixedLarge, largeIdsAll, template]);
+
+  const fixedScoutCount = 4;
+
+  const defaultLittleCaps = React.useMemo(() => {
+    return which === "3p" ? ({ "19": 2, "20": 1, "21": 1 } as const) : ({ "19": 4, "20": 1, "21": 1 } as const);
+  }, [which]);
+
+  const [littleCap19, setLittleCap19] = React.useState<number>(which === "3p" ? 2 : 4);
+  const [littleCap20, setLittleCap20] = React.useState<number>(1);
+  const [littleCap21, setLittleCap21] = React.useState<number>(1);
+
+  React.useEffect(() => {
+    setLittleCap19(defaultLittleCaps["19"]);
+    setLittleCap20(defaultLittleCaps["20"]);
+    setLittleCap21(defaultLittleCaps["21"]);
+  }, [defaultLittleCaps]);
+
+  const littleFixedCounts = React.useMemo(
+    () => ({ "19": littleCap19, "20": littleCap20, "21": littleCap21 } as Record<string, number>),
+    [littleCap19, littleCap20, littleCap21]
+  );
+
+  const littleSlotCount = React.useMemo(
+    () => Math.max(0, countSmallSlots(template.slots as any[]) - fixedScoutCount),
+    [template, fixedScoutCount]
+  );
+
+  const littlePool = React.useMemo(() => {
+    const fixedPoolIds = which === "3p" ? FIXED_LITTLE_POOL_3P : FIXED_LITTLE_POOL_4P;
+    return resolveFixedLittlePool({
+      allLittleIds: littleIdsAll,
+      fixedPoolIds,
+      fixedCounts: littleFixedCounts,
+      littleSlotCount,
+    });
+  }, [which, littleIdsAll, littleFixedCounts, littleSlotCount]);
+
+  const littleIds = React.useMemo(() => (littlePool.ok ? littlePool.ids : littleIdsAll), [littlePool, littleIdsAll]);
+
+  const [showConstraints, setShowConstraints] = React.useState(false);
+
+  // Debug: ASCII dump for verifying placement/neighbors
+  const [asciiMode, setAsciiMode] = React.useState<AsciiDumpMode>("planet");
+  const [asciiDump, setAsciiDump] = React.useState<string>("");
+
+  const [trials, setTrials] = React.useState(500);
+  const [keepTop, setKeepTop] = React.useState(20);
+
+  // HARD: borderPlanetCount (ALL + 7 types)
+  const [borderMaxAll, setBorderMaxAll] = React.useState<string>("");
+  const [borderMaxByType, setBorderMaxByType] = React.useState<Record<string, string>>(() => {
+    const init: Record<string, string> = {};
+    for (const pt of BASIC_PLANET_TYPES) init[pt] = "";
+    return init;
+  });
+
+  const [busy, setBusy] = React.useState(false);
+  const [results, setResults] = React.useState<RankedResult[]>([]);
+  const [errorMsg, setErrorMsg] = React.useState<string | null>(null);
+
+  const [progressCurrent, setProgressCurrent] = React.useState(0);
+  const [progressBest, setProgressBest] = React.useState<number | null>(null);
+
+  const [stats, setStats] = React.useState({
+    tried: 0,
+    placementOk: 0,
+    placementFail: 0,
+    expandedOk: 0,
+    expandFail: 0,
+    hardOk: 0,
+    hardFail: 0,
+    scoredOk: 0,
+    scoreFail: 0,
+    kept: 0,
+  });
+
+  const [hardFailBy, setHardFailBy] = React.useState<Record<string, number>>({});
+  const [hardFailSample, setHardFailSample] = React.useState<Record<string, string>>({});
+
+
+  const scoutFeas = React.useMemo(() => computeScoutFeasibility(template as any, fixedScoutCount), [template]);
+
+  const allSectors = React.useMemo(
+    () => [
+      ...(BASE_SECTORS as any[]),
+      ...(EXPANSION_MIDDLE as any[]),
+      ...(EXPANSION_LITTLE as any[]),
+      ...(EXPANSION_SCOUT as any[]),
+    ],
+    []
+  );
+
+  const sectorById = React.useMemo(() => buildSectorLookup(allSectors), [allSectors]);
+  const sectorImgById = React.useMemo(() => buildSectorImgById(), []);
+
+  const placementBaseResult = React.useMemo(() => {
+    try {
+      const pl = placementFromSeed({
+        slots: template.slots as any,
+        largeIds,
+        middleIds,
+        scoutIds,
+        littleIds,
+        seed: seed || "0",
+        scoutCount: fixedScoutCount,
+        littleFixedCounts,
+      }) as any[];
+      return { ok: true as const, placement: pl };
+    } catch (e: any) {
+      return { ok: false as const, message: e?.message ? String(e.message) : String(e) };
+    }
+  }, [template, seed, largeIds, middleIds, scoutIds, littleIds, fixedScoutCount, littleFixedCounts]);
+
+  React.useEffect(() => {
+    if (!placementBaseResult.ok) {
+      setErrorMsg(placementBaseResult.message);
+    }
+  }, [placementBaseResult]);
+
+  const placementBase = React.useMemo(() => (placementBaseResult.ok ? placementBaseResult.placement : []), [placementBaseResult]);
+
+  const placementForViewer = React.useMemo(() => {
+    return placementBase.map((p) => ({ ...p })) as any as ViewerPlacementItem[];
+  }, [placementBase]);
+
+  const imgOffsetBySlotId = React.useMemo(() => {
+    return {
+      M1: { dx: 0, dy: -60 },
+      M2: { dx: 0, dy: -60 },
+      M3: { dx: 0, dy: -60 },
+      M4: { dx: 0, dy: -60 },
+      M5: { dx: 0, dy: -60 },
+      M6: { dx: 0, dy: -60 },
+      M7: { dx: 0, dy: -60 },
+      M8: { dx: 0, dy: -60 },
+    } as const;
+  }, []);
+
+  const rotOffsetsBySlotId = React.useMemo(() => {
+    return {
+      M1: { 0: { dx: 0, dy: 0 }, 2: { dx: 47, dy: 77 }, 4: { dx: -43, dy: 75 } },
+      M2: { 0: { dx: 0, dy: 0 }, 2: { dx: 47, dy: 77 }, 4: { dx: -40, dy: 79 } },
+      M3: { 0: { dx: 0, dy: 0 }, 2: { dx: 47, dy: 77 }, 4: { dx: -45, dy: 79 } },
+      M4: { 0: { dx: 0, dy: 0 }, 2: { dx: 47, dy: 77 }, 4: { dx: -45, dy: 77 } },
+      M5: { 1: { dx: 22, dy: 42 }, 3: { dx: -5, dy: 117 }, 5: { dx: 76, dy: 104 } },
+      M6: { 1: { dx: 23, dy: 47 }, 3: { dx: -2, dy: 120 }, 5: { dx: 74, dy: 107 } },
+      M7: { 1: { dx: 22, dy: 45 }, 3: { dx: -2, dy: 120 }, 5: { dx: 74, dy: 107 } },
+      M8: { 1: { dx: 28, dy: 42 }, 3: { dx: 0, dy: 117 }, 5: { dx: 76, dy: 104 } },
+    } as const;
+  }, []);
+
+  function handleAsciiDump(mode: AsciiDumpMode) {
+    try {
+      const placementForExpand = (placementForViewer as any[]).map((x: any) => ({
+        slotId: String(x.slotId),
+        sectorId: String(x.sectorId),
+        rot: Number(x.rot ?? 0),
+      }));
+
+      const boardCells = expandPlacementToBoardCells({
+        slots: (template as any).slots,
+        placement: placementForExpand,
+        sectorById,
+      });
+
+      setAsciiMode(mode);
+      setAsciiDump(renderBoardAscii(boardCells as any, mode));
+    } catch (e: any) {
+      setAsciiDump(`[ASCII dump failed]\n${e?.message ? String(e.message) : String(e)}`);
+    }
+  }
+
+  async function handleGenerateRank() {
+    if (busy) return;
+
+    if (!fixedLarge.ok) {
+      setErrorMsg(fixedLarge.message);
+      return;
+    }
+
+    setErrorMsg(null);
+    setBusy(true);
+
+    setResults([]);
+    setProgressCurrent(0);
+    setProgressBest(null);
+    setStats({ tried: 0, placementOk: 0, placementFail: 0, expandedOk: 0, expandFail: 0, scoredOk: 0, scoreFail: 0, kept: 0 });
+
+    await nextFrame();
+
+    const top: RankedResult[] = [];
+    let best: number | null = null;
+
+    const hardFailByLocal: Record<string, number> = {};
+    const hardFailSampleLocal: Record<string, string> = {};
+    setHardFailBy({});
+    setHardFailSample({});
+
+    let st = { tried: 0, placementOk: 0, placementFail: 0, expandedOk: 0, expandFail: 0, scoredOk: 0, scoreFail: 0, kept: 0 };
+    let firstScoreError: any = null;
+    const yieldEvery = 50;
+
+    try {
+      for (let i = 0; i < trials; i++) {
+        st.tried++;
+        const s = makeRandomSeedStringStrong();
+
+        // placement
+        let pl: any[];
+        try {
+          pl = placementFromSeed({
+            slots: template.slots as any,
+            largeIds,
+            middleIds,
+            scoutIds,
+            littleIds,
+            seed: s,
+            scoutCount: fixedScoutCount,
+            littleFixedCounts,
+          }) as any[];
+          st.placementOk++;
+        } catch (e: any) {
+          st.placementFail++;
+          if (i % yieldEvery === 0) {
+            setStats({ ...st });
+            setProgressCurrent(i + 1);
+          }
+          continue;
+        }
+
+        // expand
+        let boardCells: BoardCell[];
+        try {
+          const placementForExpand = pl.map((x: any) => ({
+            slotId: String(x.slotId),
+            sectorId: String(x.sectorId),
+            rot: Number(x.rot ?? 0),
+          }));
+          boardCells = expandPlacementToBoardCells({
+            slots: template.slots as any,
+            placement: placementForExpand,
+            sectorById,
+          });
+          st.expandedOk++;
+        } catch {
+          st.expandFail++;
+          if (i % yieldEvery === 0) {
+            setStats({ ...st });
+            setProgressCurrent(i + 1);
+          }
+          continue;
+        }
+
+        // score
+        try {
+          const nb = normalizeBoardFromCells(template, boardCells);
+
+          // HARD input parsing (empty => undefined)
+          const hard: any = {};
+          const nAll = borderMaxAll.trim() === "" ? undefined : Number(borderMaxAll);
+          if (typeof nAll === "number" && Number.isFinite(nAll)) hard.borderPlanetCountMaxAll = nAll;
+          const byType: Record<string, number> = {};
+          for (const pt of BASIC_PLANET_TYPES) {
+            const v = String(borderMaxByType[pt] ?? "").trim();
+            if (v === "") continue;
+            const n = Number(v);
+            if (Number.isFinite(n)) byType[pt] = n;
+          }
+          if (Object.keys(byType).length > 0) hard.borderPlanetCountMaxByPlanetType = byType;
+
+          const ev = evaluateBoard(nb as any, {
+            excludePlanetTypes: new Set(["GAIA", "TRANSDIM", "EMPTY"]),
+            includeKinds: new Set(["planet"]),
+            nearThreshold: 2,
+            hard,
+          } as any);
+
+          // HARD (AND)
+          if (ev && ev.hardOk === false) {
+            st.hardFail++;
+            const viols: any[] = Array.isArray((ev as any).hardViolations) ? (ev as any).hardViolations : [];
+            for (const v of viols) {
+              const id = String(v?.id ?? "hardViolation");
+              hardFailByLocal[id] = (hardFailByLocal[id] ?? 0) + 1;
+              if (!hardFailSampleLocal[id]) {
+                const pt = v?.planetType ? ` planetType=${v.planetType}` : "";
+                hardFailSampleLocal[id] = `actual=${v?.actual} limit=${v?.limit}${pt}`;
+              }
+            }
+            if (viols.length === 0) {
+              hardFailByLocal["hardViolation"] = (hardFailByLocal["hardViolation"] ?? 0) + 1;
+            }
+            if ((st.tried % yieldEvery) === 0) {
+              setHardFailBy({ ...hardFailByLocal });
+              setHardFailSample({ ...hardFailSampleLocal });
+            }
+            continue;
+          }
+          st.hardOk++;
+
+          const score = computeScoreFromEval(ev);
+
+          const r: RankedResult = { seed: s, score, placement: pl, evalResult: ev };
+          st.scoredOk++;
+
+          if (best === null || score > best) best = score;
+
+          top.push(r);
+          top.sort((a, b) => b.score - a.score);
+          if (top.length > keepTop) top.length = keepTop;
+          st.kept = top.length;
+        } catch (e) {
+          st.scoreFail++;
+          if (!firstScoreError) {
+            firstScoreError = e;
+            console.error("[ScoreFail first error]", e);
+          }
+          if (i % yieldEvery === 0) {
+            setStats({ ...st });
+            setProgressCurrent(i + 1);
+          }
+          continue;
+        }
+
+        if (i % yieldEvery === 0) {
+          setStats({ ...st });
+          setProgressCurrent(i + 1);
+          setProgressBest(best);
+          setHardFailBy({ ...hardFailByLocal });
+          setHardFailSample({ ...hardFailSampleLocal });
+          await nextFrame();
+        }
+      }
+
+      if (firstScoreError) {
+        const m = firstScoreError?.message ? String(firstScoreError.message) : String(firstScoreError);
+        setErrorMsg(`scoreFail first error: ${m}`);
+      }
+
+      setResults(top);
+      setProgressCurrent(trials);
+      setProgressBest(best);
+      setStats({ ...st });
+      setHardFailBy({ ...hardFailByLocal });
+      setHardFailSample({ ...hardFailSampleLocal });
+
+      if (top.length > 0) setSeed(String(top[0].seed));
+    } catch (e: any) {
+      console.error(e);
+      setErrorMsg(e?.message ? String(e.message) : String(e));
+      setStats({ ...st });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const progressPct = trials > 0 ? Math.max(0, Math.min(1, progressCurrent / trials)) : 0;
+
+  const scoutFeasMsg = React.useMemo(() => {
+    const mm = scoutFeas.maxMinDist;
+    if (mm === null) return "Scout feasibility: N/A";
+    const ok = mm >= 4;
+    return `Scout feasibility: maxMinDist=${mm} (${ok ? "minScoutDist=4 is POSSIBLE" : "minScoutDist=4 is IMPOSSIBLE"})`;
+  }, [scoutFeas]);
+
+  const isNarrow = useIsNarrow(1180);
+
+  return (
+    <div style={{ width: "100%", height: "100vh", display: "flex", flexDirection: "column" }}>
+      <div style={{ padding: 12, display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+        <div style={{ fontWeight: 700 }}>Board Export</div>
+
+        <label style={{ display: "flex", gap: 6, alignItems: "center" }}>
+          <span>Template</span>
+          <select value={which} onChange={(e) => setWhich(e.target.value as any)}>
+            <option value="3p">3p Lost Fleet</option>
+            <option value="4p">4p Lost Fleet</option>
+          </select>
+        </label>
+
+        <label style={{ display: "flex", gap: 6, alignItems: "center" }}>
+          <span>Seed</span>
+          <input value={seed} onChange={(e) => setSeed(e.target.value)} style={{ width: 160 }} />
+        </label>
+
+        <button onClick={() => setSeed(randomSeedString())} style={{ padding: "6px 10px" }}>
+          Random Seed
+        </button>
+
+        <div style={{ opacity: 0.7, minWidth: 360 }}>
+          Large集合は固定（3p/4p別） / 表示基準: viewRot=4 / viewAngle=-30°
+        </div>
+      </div>
+
+      <div
+        style={{
+          flex: 1,
+          display: "flex",
+          flexDirection: isNarrow ? "column" : "row",
+          gap: 12,
+          padding: 12,
+          minHeight: 0,
+          overflow: "auto",
+        }}
+      >
+        <div
+          style={{
+            flex: 1,
+            minWidth: 0,
+            overflow: "hidden",
+            borderRadius: 8,
+            position: "relative",
+            zIndex: 1,
+            minHeight: isNarrow ? 520 : 0,
+          }}
+        >
+          <MapBoardViewer
+            template={template}
+            placement={placementForViewer as any}
+            sectorById={sectorById}
+            sectorImgById={sectorImgById}
+            viewRot={4}
+            viewAngleDeg={-30}
+            hexSize={40}
+            boundsPad={boundsPad}
+            zoom={mapZoom}
+            showLabels={true}
+            inflateByAccepts={{ LARGE: 1.07, MIDDLE: 0.92, SMALL: 1.09 }}
+            rotateOffsetDegByAccepts={{ LARGE: -30, MIDDLE: 0, SMALL: 0 }}
+            imgOffsetByAccepts={{ LARGE: { dx: -70, dy: 70 }, MIDDLE: { dx: -33, dy: 11 }, SMALL: { dx: -25, dy: 25 } }}
+            imgOffsetBySlotId={imgOffsetBySlotId}
+            rotOffsetsBySlotId={rotOffsetsBySlotId}
+          />
+        </div>
+
+        <div
+          style={{
+            width: isNarrow ? "100%" : 520,
+            flexShrink: 0,
+            overflowY: "auto",
+            display: "flex",
+            flexDirection: "column",
+            gap: 10,
+            background: "#fff",
+            padding: 0,
+            borderRadius: 8,
+            zIndex: 2,
+            pointerEvents: "auto",
+          }}
+        >
+          <div style={{ padding: 12, border: "1px solid #ddd", borderRadius: 8 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <div style={{ fontWeight: 700 }}>Batch Generate / Rank</div>
+              <button onClick={() => setShowConstraints((v) => !v)} style={{ padding: "4px 8px" }}>
+                {showConstraints ? "Hide Constraints" : "Show Constraints"}
+              </button>
+            </div>
+
+            {!fixedLarge.ok && (
+              <div style={{ marginTop: 10, fontSize: 12, color: "#b91c1c", whiteSpace: "pre-wrap" }}>
+                {fixedLarge.message}
+              </div>
+            )}
+
+            <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap", alignItems: "center" }}>
+              <label style={{ fontSize: 12 }}>
+                Trials
+                <input type="number" value={trials} onChange={(e) => setTrials(Number(e.target.value))} style={{ width: 90, marginLeft: 6 }} />
+              </label>
+              <label style={{ fontSize: 12 }}>
+                Keep
+                <input type="number" value={keepTop} onChange={(e) => setKeepTop(Number(e.target.value))} style={{ width: 90, marginLeft: 6 }} />
+              </label>
+
+              <div style={{ display: "flex", flexDirection: "column", gap: 6, padding: 8, border: "1px solid #ddd", borderRadius: 8, width: "100%" }}>
+                <div style={{ fontSize: 12, fontWeight: 700 }}>HARD: borderPlanetCount</div>
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                  <label style={{ fontSize: 12 }}>
+                    ALL（デフォルト上限）
+                    <input
+                      type="number"
+                      value={borderMaxAll}
+                      onChange={(e) => setBorderMaxAll(e.target.value)}
+                      placeholder="(none)"
+                      style={{ width: 90, marginLeft: 6 }}
+                    />
+                  </label>
+                  {BASIC_PLANET_TYPES.map((pt) => (
+                    <label key={pt} style={{ fontSize: 12 }}>
+                      {pt}
+                      <input
+                        type="number"
+                        value={borderMaxByType[pt] ?? ""}
+                        onChange={(e) => setBorderMaxByType((prev) => ({ ...prev, [pt]: e.target.value }))}
+                        placeholder="(none)"
+                        style={{ width: 90, marginLeft: 6 }}
+                      />
+                    </label>
+                  ))}
+                </div>
+                <div style={{ fontSize: 11, opacity: 0.75 }}>
+                  仕様：ALL は「各惑星種別のデフォルト上限」です。各種別に値を入れた場合、その種別は ALL を無視して個別値が適用されます（AND条件）。
+                </div>
+              </div>
+
+
+              <button onClick={handleGenerateRank} disabled={busy} style={{ padding: "6px 10px", marginLeft: "auto" }}>
+                {busy ? "Running..." : "Generate & Rank"}
+              </button>
+            </div>
+
+            <div style={{ marginTop: 10, fontSize: 12, lineHeight: 1.4 }}>
+              <div style={{ fontWeight: 700 }}>Scout feasibility (template-only)</div>
+              <div style={{ opacity: 0.9 }}>{scoutFeasMsg}</div>
+              {scoutFeas.maxMinDist !== null && (
+                <div style={{ opacity: 0.85 }}>
+                  slots(S*)={scoutFeas.scoutSlotCount}, choose={scoutFeas.scoutCount}, combos={scoutFeas.combosChecked}
+                  {scoutFeas.exampleSlotIds.length ? <> ・ example={scoutFeas.exampleSlotIds.join(",")}</> : null}
+                </div>
+              )}
+            </div>
+
+            <div style={{ marginTop: 10 }}>
+              <div style={{ display: "flex", gap: 8, alignItems: "center", fontSize: 12 }}>
+                <div style={{ fontWeight: 700 }}>Progress</div>
+                <div style={{ opacity: 0.8 }}>
+                  {busy ? (
+                    <>
+                      {progressCurrent}/{trials}
+                      {progressBest !== null ? <> ・ best={Math.round(progressBest * 100) / 100}</> : null}
+                    </>
+                  ) : results.length > 0 ? (
+                    <>Done ・ {trials}/{trials}</>
+                  ) : (
+                    <>—</>
+                  )}
+                </div>
+              </div>
+              <div style={{ marginTop: 6, height: 8, background: "#eee", borderRadius: 999 }}>
+                <div
+                  style={{
+                    height: 8,
+                    width: `${Math.round(progressPct * 100)}%`,
+                    background: "#111",
+                    borderRadius: 999,
+                    transition: "width 120ms linear",
+                  }}
+                />
+              </div>
+            </div>
+
+            <div style={{ marginTop: 10, fontSize: 12 }}>
+              <div style={{ fontWeight: 700 }}>Hard Fail By Constraint</div>
+              {Object.keys(hardFailBy).length === 0 ? (
+                <div style={{ marginTop: 6, opacity: 0.7 }}>—</div>
+              ) : (
+                <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 6 }}>
+                  {Object.entries(hardFailBy).map(([k, v]) => (
+                    <div key={k}>
+                      <div>
+                        {k}: {v}
+                      </div>
+                      {hardFailSample[k] ? <div style={{ fontSize: 11, opacity: 0.8 }}>e.g. {hardFailSample[k]}</div> : null}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <div style={{ marginTop: 10, fontSize: 12 }}>
+              <div style={{ fontWeight: 700 }}>Stats</div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, marginTop: 6 }}>
+                <div>tried: {stats.tried}</div>
+                <div>kept: {stats.kept}</div>
+                <div>placementOk: {stats.placementOk}</div>
+                <div>placementFail: {stats.placementFail}</div>
+                <div>expandedOk: {stats.expandedOk}</div>
+                <div>expandFail: {stats.expandFail}</div>
+                <div>hardOk: {stats.hardOk}</div>
+                <div>hardFail: {stats.hardFail}</div>
+                <div>scoredOk: {stats.scoredOk}</div>
+                <div>scoreFail: {stats.scoreFail}</div>
+              </div>
+            </div>
+
+            <div style={{ marginTop: 10, fontSize: 12 }}>
+              <div style={{ fontWeight: 700, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                <div>Debug: ASCII Board Dump</div>
+                <div style={{ fontSize: 11, opacity: 0.75 }}>console可</div>
+              </div>
+              <div style={{ marginTop: 6, display: "flex", gap: 8, flexWrap: "wrap" }}>
+                <button onClick={() => handleAsciiDump("planet")} style={{ padding: "6px 10px" }}>
+                  Dump (planet)
+                </button>
+                <button onClick={() => handleAsciiDump("slot")} style={{ padding: "6px 10px" }}>
+                  Dump (slot)
+                </button>
+                <button
+                  onClick={async () => {
+                    if (!asciiDump) return;
+                    const ok = await (async () => {
+                      try {
+                        await navigator.clipboard.writeText(asciiDump);
+                        return true;
+                      } catch {
+                        return false;
+                      }
+                    })();
+                    if (!ok) alert("Copy failed (clipboard not available).\nYou can still select the text manually.");
+                  }}
+                  style={{ padding: "6px 10px" }}
+                >
+                  Copy
+                </button>
+              </div>
+              {asciiDump ? (
+                <textarea
+                  value={asciiDump}
+                  readOnly
+                  rows={14}
+                  style={{ width: "100%", marginTop: 8, fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", fontSize: 11 }}
+                />
+              ) : (
+                <div style={{ marginTop: 6, opacity: 0.7 }}>
+                  「Dump」を押すと、現在の seed/placement で盤面セルを文字で表示します（隣接/欠損の目視確認用）。
+                </div>
+              )}
+            </div>
+
+            {errorMsg && (
+              <div style={{ marginTop: 10, fontSize: 12, color: "#b91c1c", whiteSpace: "pre-wrap" }}>{errorMsg}</div>
+            )}
+
+            <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
+              <div style={{ fontWeight: 700, fontSize: 12, width: "100%" }}>View</div>
+              <label style={{ fontSize: 12 }}>
+                Map Zoom
+                <input type="number" step="0.05" value={mapZoom} onChange={(e) => setMapZoom(Number(e.target.value))} style={{ width: 90, marginLeft: 6 }} />
+              </label>
+              <label style={{ fontSize: 12 }}>
+                Bounds Pad
+                <input type="number" step="20" value={boundsPad} onChange={(e) => setBoundsPad(Number(e.target.value))} style={{ width: 90, marginLeft: 6 }} />
+              </label>
+            </div>
+
+            <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
+              <div style={{ fontWeight: 700, fontSize: 12, width: "100%" }}>Little fixed counts</div>
+              <label style={{ fontSize: 12 }}>
+                19
+                <input type="number" min="0" value={littleCap19} onChange={(e) => setLittleCap19(Number(e.target.value))} style={{ width: 70, marginLeft: 6 }} />
+              </label>
+              <label style={{ fontSize: 12 }}>
+                20
+                <input type="number" min="0" value={littleCap20} onChange={(e) => setLittleCap20(Number(e.target.value))} style={{ width: 70, marginLeft: 6 }} />
+              </label>
+              <label style={{ fontSize: 12 }}>
+                21
+                <input type="number" min="0" value={littleCap21} onChange={(e) => setLittleCap21(Number(e.target.value))} style={{ width: 70, marginLeft: 6 }} />
+              </label>
+
+              {littlePool.warning && (
+                <div style={{ width: "100%", marginTop: 6, fontSize: 11, color: "#b45309", whiteSpace: "pre-wrap" }}>
+                  {littlePool.warning}
+                </div>
+              )}
+              {!littlePool.ok && (
+                <div style={{ width: "100%", marginTop: 6, fontSize: 11, color: "#b91c1c", whiteSpace: "pre-wrap" }}>
+                  {littlePool.message}
+                </div>
+              )}
+            </div>
+
+            <div style={{ marginTop: 10, fontSize: 12 }}>
+              <div style={{ fontWeight: 700 }}>Fixed Large (effective)</div>
+              <div style={{ opacity: 0.85, whiteSpace: "pre-wrap" }}>
+                {fixedLarge.ok ? largeIds.join(", ") : "(invalid)"}
+              </div>
+            </div>
+
+            <div style={{ marginTop: 10, fontSize: 12 }}>
+              <div style={{ fontWeight: 700 }}>Fixed Little pool (effective)</div>
+              <div style={{ opacity: 0.85, whiteSpace: "pre-wrap" }}>{littleIds.join(", ")}</div>
+              <div style={{ marginTop: 4, fontSize: 11, opacity: 0.8 }}>
+                littleSlots={littleSlotCount} ・ fixedSum={sumFixedCounts(littleFixedCounts)} ・ nonFixedRequired={littlePool.requiredNonFixed} ・ nonFixedAvailable={littlePool.availableNonFixed}
+              </div>
+            </div>
+          </div>
+
+          <div style={{ padding: 12, border: "1px solid #ddd", borderRadius: 8 }}>
+            <div style={{ fontWeight: 700 }}>Results</div>
+            {results.length === 0 ? (
+              <div style={{ marginTop: 6, fontSize: 12, opacity: 0.7 }}>No results yet</div>
+            ) : (
+              <div style={{ marginTop: 6 }}>
+                {results.map((r, i) => (
+                  <div
+                    key={`${r.seed}-${i}`}
+                    style={{
+                      display: "flex",
+                      gap: 8,
+                      alignItems: "center",
+                      fontSize: 12,
+                      padding: "4px 0",
+                      borderBottom: "1px dashed #eee",
+                    }}
+                  >
+                    <div style={{ width: 24, textAlign: "right" }}>{i + 1}</div>
+                    <button onClick={() => setSeed(String(r.seed))} style={{ padding: "2px 6px" }}>
+                      Use
+                    </button>
+                    <div>seed={String(r.seed)}</div>
+                    <div style={{ marginLeft: "auto", textAlign: "right" }}>
+                      <div>score={Math.round((r.score ?? 0) * 100) / 100}</div>
+                      <div style={{ fontSize: 11, opacity: 0.8 }}>planetCells={r.evalResult?.summary?.planetCellCount ?? "-"}</div>
+                    </div>
+                    <details style={{ marginLeft: 8 }}>
+                      <summary style={{ cursor: "pointer", fontSize: 11, opacity: 0.8 }}>eval</summary>
+                      <pre style={{ margin: 0, fontSize: 11, maxWidth: 520, whiteSpace: "pre-wrap" }}>
+                        {JSON.stringify(r.evalResult?.summary ?? r.evalResult ?? null, null, 2)}
+                      </pre>
+                    </details>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {showConstraints && (
+            <ConstraintInspector
+              template={template as any}
+              placement={placementForViewer as any}
+              sectorById={sectorById as any}
+              largeIds={largeIds}
+              middleIds={middleIds}
+              scoutIds={scoutIds}
+              littleIds={littleIds}
+            />
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ConstraintInspector(props: any) {
+  const report: ConstraintReport = React.useMemo(() => {
+    return computeConstraintReport({
+      slots: props.template.slots as any,
+      placements: props.placement as any,
+      largeIds: props.largeIds,
+      middleIds: props.middleIds,
+      scoutIds: props.scoutIds,
+      littleIds: props.littleIds,
+    } as any);
+  }, [props.template, props.placement, props.largeIds, props.middleIds, props.scoutIds, props.littleIds]);
+
+  return (
+    <div style={{ padding: 12, border: "1px solid #ddd", borderRadius: 8 }}>
+      <div style={{ fontWeight: 700 }}>Constraint Inspector</div>
+
+      <div style={{ marginTop: 10 }}>
+        <div style={{ fontWeight: 700, fontSize: 12 }}>Pool Summary</div>
+        <table style={{ width: "100%", fontSize: 12, marginTop: 6 }}>
+          <thead>
+            <tr>
+              <th style={{ textAlign: "left" }}>Kind</th>
+              <th style={{ textAlign: "right" }}>Need</th>
+              <th style={{ textAlign: "right" }}>Candidates</th>
+              <th style={{ textAlign: "right" }}>Units</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>LARGE</td>
+              <td style={{ textAlign: "right" }}>{report.pool.need.LARGE}</td>
+              <td style={{ textAlign: "right" }}>{report.pool.candidates.LARGE}</td>
+              <td style={{ textAlign: "right" }}>{report.pool.units.LARGE}</td>
+            </tr>
+            <tr>
+              <td>MIDDLE</td>
+              <td style={{ textAlign: "right" }}>{report.pool.need.MIDDLE}</td>
+              <td style={{ textAlign: "right" }}>{report.pool.candidates.MIDDLE}</td>
+              <td style={{ textAlign: "right" }}>{report.pool.units.MIDDLE}</td>
+            </tr>
+            <tr>
+              <td>SCOUT</td>
+              <td style={{ textAlign: "right" }}>—</td>
+              <td style={{ textAlign: "right" }}>{report.pool.candidates.SCOUT}</td>
+              <td style={{ textAlign: "right" }}>—</td>
+            </tr>
+            <tr>
+              <td>LITTLE</td>
+              <td style={{ textAlign: "right" }}>fill</td>
+              <td style={{ textAlign: "right" }}>{report.pool.candidates.LITTLE}</td>
+              <td style={{ textAlign: "right" }}>—</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}

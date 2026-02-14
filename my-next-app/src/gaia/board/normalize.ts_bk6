@@ -1,0 +1,110 @@
+/* src/gaia/board/normalize.ts
+ * Normalization for evaluation/search
+ * - Keep coordinate conventions IDENTICAL to previewBoard.ts:
+ *   - slot.pos is axial
+ *   - sector.cells keys are axial
+ */
+
+import type { Slot, Axial } from "./previewBoard";
+
+type AnySector = any;
+
+export type NormalizedCell = {
+  pos: Axial;
+  kind: "planet" | "space" | "special";
+  planetType?: string;
+  tags: string[];
+  slotId: string;
+  sectorId: string;
+  localKey?: string;
+  tplLocalKey?: string; // tile-local (post-rotation) relative to slot center
+};
+
+function parseKey(key: string): Axial {
+  const [q, r] = key.split(",").map((v) => Number(v));
+  return { q, r };
+}
+
+function keyOf(p: Axial) {
+  return `${p.q},${p.r}`;
+}
+
+function axialAdd(a: Axial, b: Axial): Axial {
+  return { q: a.q + b.q, r: a.r + b.r };
+}
+
+function rotate60(ax: Axial, stepsCW: number): Axial {
+  let q = ax.q;
+  let r = ax.r;
+
+  const s = ((stepsCW % 6) + 6) % 6;
+  for (let i = 0; i < s; i++) {
+    const x = q;
+    const z = r;
+    const y = -x - z;
+
+    const nx = -z;
+    const ny = -x;
+    const nz = -y;
+
+    q = nx;
+    r = nz;
+  }
+  return { q, r };
+}
+
+function normalizeCell(raw: any): { kind: "planet" | "space" | "special"; planetType?: string; tags: string[] } {
+  const k = raw?.kind;
+  const tags = Array.isArray(raw?.tags) ? raw.tags : [];
+
+  if (k === "planet") {
+    const pt = (raw?.planetType ?? raw?.planet) as string | undefined;
+    return { kind: "planet", planetType: pt, tags };
+  }
+  if (k === "special") return { kind: "special", tags };
+  return { kind: "space", tags };
+}
+
+export function normalizePlacementToCells(args: {
+  slots: Slot[];
+  placement: { slotId: string; sectorId: string; rot: number }[];
+  sectorById: Map<string, AnySector>;
+}): NormalizedCell[] {
+  const { slots, placement, sectorById } = args;
+  const slotById = new Map(slots.map((s) => [s.slotId, s]));
+
+  const out: NormalizedCell[] = [];
+
+  for (const p of placement) {
+    const slot = slotById.get(p.slotId);
+    const sector = sectorById.get(p.sectorId);
+    if (!slot || !sector) continue;
+
+    const slotPos = slot.pos; // IMPORTANT: no conversion
+    const rot = Number((p as any).rot ?? 0);
+
+    const cells: Record<string, any> = sector.cells ?? {};
+    for (const [k, raw] of Object.entries(cells)) {
+      const local = parseKey(k); // IMPORTANT: axial
+      const rotated = rotate60(local, rot);
+      const abs = axialAdd(slotPos, rotated);
+      const norm = normalizeCell(raw);
+
+      out.push({
+        pos: abs,
+        kind: norm.kind,
+        planetType: norm.planetType,
+        tags: norm.tags,
+        slotId: p.slotId,
+        sectorId: p.sectorId,
+        localKey: k,
+        tplLocalKey: `${rotated.q},${rotated.r}`,
+      });
+    }
+  }
+
+  // last-write-wins
+  const uniq = new Map<string, NormalizedCell>();
+  for (const c of out) uniq.set(keyOf(c.pos), c);
+  return [...uniq.values()];
+}

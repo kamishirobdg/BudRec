@@ -1,0 +1,197 @@
+// src/gaia/board/previewBoard.ts
+//
+// Preview expansion: (slotId, sectorId, rot) placements -> absolute board cells.
+//
+// This file is used for UI/Debug rendering, so it must be stable and deterministic.
+//
+// NOTE (current working hypothesis)
+// - template.slots[].pos is a "tile-grid" coordinate, not a cell-axial coordinate.
+// - For radius=2 hex tiles, adjacent tile centers are separated by 4 in axial space.
+//   Therefore: slotCenterCell = slot.pos * 4
+
+export type Axial = { q: number; r: number };
+
+export type SlotAccept = "LARGE" | "MIDDLE" | "SMALL";
+export type Slot = { slotId: string; pos: Axial; accepts: SlotAccept[] };
+
+type AnySector = any;
+
+export type PlacementItem = {
+  slotId: string;
+  sectorId: string;
+  rot: number; // 0..5
+};
+
+export type BoardCell = {
+  pos: Axial; // board absolute
+  kind: "planet" | "space" | "special";
+  planetType?: string;
+  tags: string[];
+  slotId: string;
+  sectorId: string;
+  /** Raw key from sector.cells (template-invariant tile-local key) */
+  localKey?: string;
+};
+
+function parseKey(key: string): Axial {
+  const [q, r] = key.split(",").map((v) => Number(v));
+  return { q, r };
+}
+
+function keyOf(p: Axial) {
+  return `${p.q},${p.r}`;
+}
+
+export function axialAdd(a: Axial, b: Axial): Axial {
+  return { q: a.q + b.q, r: a.r + b.r };
+}
+
+/** Rotate axial(q,r) by 60-degree steps CW using cube rotation. */
+function rotate60(ax: Axial, stepsCW: number): Axial {
+  let { q, r } = ax;
+  const s = ((stepsCW % 6) + 6) % 6;
+
+  for (let i = 0; i < s; i++) {
+    const x = q;
+    const z = r;
+    const y = -x - z;
+
+    // cube CW: (x,y,z) -> (-z, -x, -y)
+    const nx = -z;
+    const ny = -x;
+    const nz = -y;
+
+    q = nx;
+    r = nz;
+  }
+  return { q, r };
+}
+
+function normalizeCell(raw: any): { kind: "planet" | "space" | "special"; planetType?: string; tags: string[] } {
+  const k = raw?.kind;
+  const tags = Array.isArray(raw?.tags) ? raw.tags : [];
+
+  if (k === "planet") {
+    const pt = (raw?.planetType ?? raw?.planet) as string | undefined;
+    return { kind: "planet", planetType: pt, tags };
+  }
+  if (k === "special") return { kind: "special", tags };
+  return { kind: "space", tags };
+}
+
+function isBaseSectorId(sectorId: string): boolean {
+  return /^(0[1-9]|10)$/.test(sectorId);
+}
+
+/**
+ * Base large sectors (01-10) use a row-shifted local coordinate encoding.
+ * Apply the same correction as normalize.ts BEFORE rotation.
+ *
+ * shift = floor((r + R)/2), q' = q - shift
+ */
+function fixBaseLocalCoord(sector: AnySector, local: Axial): Axial {
+  const sid = String((sector as any).sectorId ?? (sector as any).id ?? "");
+  if (!isBaseSectorId(sid)) return local;
+
+  const R = typeof (sector as any).radius === "number" ? (sector as any).radius : null;
+  if (R === null) return local;
+
+  const shift = Math.floor((local.r + R) / 2);
+  return { q: local.q - shift, r: local.r };
+}
+
+/**
+ * Convert template slot center to cell-axial center.
+ *
+ * Working hypothesis: template slot.pos is "tile-grid" coordinate for radius=2 layout.
+ */
+function slotPosToCellCenter(pos: Axial): Axial {
+  return { q: pos.q * 4, r: pos.r * 4 };
+}
+
+export function buildSectorLookup(sectors: AnySector[]): Map<string, AnySector> {
+  const m = new Map<string, AnySector>();
+  for (const s of sectors) {
+    const id = (s?.sectorId ?? s?.id) as string | undefined;
+    if (!id) continue;
+    m.set(id, { ...s, sectorId: id });
+  }
+  return m;
+}
+
+export function expandPlacementToBoardCells(args: {
+  slots: Slot[];
+  placement: PlacementItem[];
+  sectorById: Map<string, AnySector>;
+}): BoardCell[] {
+  const { slots, placement, sectorById } = args;
+  const slotById = new Map(slots.map((s) => [s.slotId, s]));
+
+  const out: BoardCell[] = [];
+
+  for (const p of placement) {
+    const slot = slotById.get(p.slotId);
+    const sector = sectorById.get(p.sectorId);
+    if (!slot || !sector) continue;
+
+    const slotPos = slotPosToCellCenter(slot.pos);
+    const rot = Number((p as any).rot ?? 0);
+
+    const cells: Record<string, any> = (sector as any).cells ?? {};
+    for (const [k, rawCell] of Object.entries(cells)) {
+      const localKey = String(k).trim();
+      const local0 = parseKey(localKey);
+      const local = fixBaseLocalCoord(sector, local0);
+      const rotated = rotate60(local, rot);
+      const abs = axialAdd(slotPos, rotated);
+      const norm = normalizeCell(rawCell);
+
+      out.push({
+        pos: abs,
+        kind: norm.kind,
+        planetType: norm.planetType,
+        tags: norm.tags,
+        slotId: p.slotId,
+        sectorId: p.sectorId,
+        localKey,
+      });
+    }
+  }
+
+  // Preview: last write wins on duplicate coords.
+  const uniq = new Map<string, BoardCell>();
+  for (const c of out) uniq.set(keyOf(c.pos), c);
+  return [...uniq.values()];
+}
+
+/**
+ * Template adjustment helper: assign sector IDs cyclically by slot.accepts (rot=0).
+ */
+export function makeCycledPlacement(args: {
+  slots: Slot[];
+  largeIds: string[];
+  middleIds: string[];
+  smallIds: string[];
+}): PlacementItem[] {
+  const { slots, largeIds, middleIds, smallIds } = args;
+
+  let iL = 0,
+    iM = 0,
+    iS = 0;
+
+  return slots.map((s) => {
+    const a0 = s.accepts[0];
+    let sectorId = "";
+    if (a0 === "LARGE") {
+      sectorId = largeIds[iL % Math.max(1, largeIds.length)] ?? "";
+      iL++;
+    } else if (a0 === "MIDDLE") {
+      sectorId = middleIds[iM % Math.max(1, middleIds.length)] ?? "";
+      iM++;
+    } else {
+      sectorId = smallIds[iS % Math.max(1, smallIds.length)] ?? "";
+      iS++;
+    }
+    return { slotId: s.slotId, sectorId, rot: 0 };
+  });
+}

@@ -1,0 +1,1391 @@
+// src/components/MapViewer.tsx
+"use client";
+
+import React, { useEffect, useMemo, useState } from "react";
+import type { Cell } from "../GAIA/sectorTypes";
+import { BASE_SECTORS } from "../GAIA/sectorTiles_base";
+import { findForbiddenProximityPairs } from "../GAIA/fineConstraints";
+import { axialToPixel, hexPoints, parseKey, type HexOrientation } from "../GAIA/hexLayout";
+import { buildLogicBoardWithLocalColumnShift, type SectorPlacement } from "../GAIA/boardTransforms";
+
+import type { ExpansionKind, MapLayoutTemplate, SlotAssignment, TemplateTags } from "../GAIA/mapTemplates";
+import { makeTemplateId, placementsFromTemplate } from "../GAIA/mapTemplates";
+import { deleteTemplate, loadTemplates, saveTemplates, upsertTemplate } from "../GAIA/templateStore";
+
+import { scoreBoard } from "../GAIA/mapScoring";
+import { SCORE_MAPS_BY_TEMPLATE } from "../GAIA/scoreMaps";
+
+const ORIENTATION: HexOrientation = "flat";
+const VIEW_ROT60 = 4; // 240°
+const VIEW_MIRROR = false;
+
+// 3rd:+1, 4th:+1, 5th:+2
+const RULE = { shiftsByIndex1: { 3: 1, 4: 1, 5: 2 } } as const;
+
+const SECTOR_IDS = ["01", "02", "03", "04", "05", "06", "07", "08", "09", "10"] as const;
+type SectorId = (typeof SECTOR_IDS)[number];
+
+function planetLabel(cell: Cell): string {
+  return cell.kind === "planet" ? cell.planet : "";
+}
+
+function defaultPlacement(): SectorPlacement {
+  return { sectorId: "01", pos: { q: 0, r: 0 }, rot: 0 };
+}
+
+function defaultAssign(i: number): SlotAssignment {
+  return { sectorId: SECTOR_IDS[i % SECTOR_IDS.length], rot: 0 };
+}
+
+function randInt(minIncl: number, maxIncl: number): number {
+  const r = Math.random();
+  return Math.floor(r * (maxIncl - minIncl + 1)) + minIncl;
+}
+
+function shuffle<T>(arr: readonly T[]): T[] {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = randInt(0, i);
+    const tmp = a[i];
+    a[i] = a[j];
+    a[j] = tmp;
+  }
+  return a;
+}
+
+type TryResult =
+  | { ok: true; assigns: SlotAssignment[]; attemptsUsed: number; scoreTotal: number; balanceL1?: number }
+  | { ok: false; reason: string; attemptsUsed: number; scoreTotal?: number; balanceL1?: number };
+
+type HistoryItem = {
+  id: string;
+  atIso: string;
+  attemptsUsed: number;
+  scoreTotal: number;
+  balanceL1?: number;
+  assigns: SlotAssignment[];
+};
+
+function isoNow(): string {
+  return new Date().toISOString();
+}
+
+function shortIso(iso: string): string {
+  // YYYY-MM-DD HH:mm:ss
+  return iso.replace("T", " ").replace("Z", "").slWHITE(0, 19);
+}
+
+type DraftScoreMap = Record<string, number>;
+
+// ---------------------------
+// Template-scoped settings (localStorage)
+// ---------------------------
+type TemplateSettings = {
+  balanceMaxL1?: number;
+  scoreThreshold?: number;
+};
+
+const SETTINGS_KEY_PREFIX = "TRANSDIM:templateSettings:v1:";
+
+function loadTemplateSettings(templateId: string): TemplateSettings | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = window.localStorage.getItem(SETTINGS_KEY_PREFIX + templateId);
+    if (!raw) return null;
+    const obj = JSON.parse(raw) as TemplateSettings;
+    if (!obj || typeof obj !== "object") return null;
+    return obj;
+  } catch {
+    return null;
+  }
+}
+
+function saveTemplateSettings(templateId: string, next: TemplateSettings) {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(SETTINGS_KEY_PREFIX + templateId, JSON.stringify(next));
+  } catch {
+    // ignore (storage blocked / quota)
+  }
+}
+
+export default function MapViewer() {
+  // Edit: placements を直接編集（Freeze元）
+  const [placements, setPlacements] = useState<SectorPlacement[]>([defaultPlacement()]);
+
+  // Templates
+  const [templates, setTemplates] = useState<MapLayoutTemplate[]>([]);
+  const [activeTemplateId, setActiveTemplateId] = useState<string>("");
+
+  // Filters (optional)
+  const [filterPlayers, setFilterPlayers] = useState<3 | 4 | "all">("all");
+  const [filterExp, setFilterExp] = useState<ExpansionKind | "all">("all");
+
+  // Assigns (template mode)
+  const [assigns, setAssigns] = useState<SlotAssignment[]>([]);
+
+  // Freeze form
+  const [freezeLabel, setFreezeLabel] = useState<string>("My Layout");
+  const [freezePlayers, setFreezePlayers] = useState<3 | 4>(4);
+  const [freezeExp, setFreezeExp] = useState<ExpansionKind>("base");
+
+  // Randomize status
+  const [randomizeStatus, setRandomizeStatus] = useState<string>("");
+  const [lastAttempts, setLastAttempts] = useState<number>(0);
+
+  // Max attempts (configurable)
+  const [maxAttempts, setMaxAttempts] = useState<number>(15000);
+
+  type RenderMode = "cells" | "tiles";
+  const [renderMode, setRenderMode] = useState<RenderMode>("cells");
+
+  
+
+  // Tile image size factor (relative to hex size). Tune so tiles just touch.
+  const [tileImgFactor, setTileImgFactor] = useState<number>(8.0);
+// --- Thresholds ---
+  // Total score threshold: reject if total > threshold (existing behavior)
+  const [scoreThreshold, setScoreThreshold] = useState<number>(999999);
+
+  // Balance threshold: reject if L1 > balanceMaxL1
+  // Default requested: 0.75
+  const [balanceMaxL1, setBalanceMaxL1] = useState<number>(0.75);
+
+  // History
+  const [history, setHistory] = useState<HistoryItem[]>([]);
+  const HISTORY_MAX = 20;
+
+  // --- Picking UI（座標採点のクリック取得） ---
+  const [draftScoreByTemplate, setDraftScoreByTemplate] = useState<Record<string, DraftScoreMap>>({});
+  const [pickedKeys, setPickedKeys] = useState<Set<string>>(new Set());
+  const [pickValue, setPickValue] = useState<number>(1);
+  const [pickStatus, setPickStatus] = useState<string>("");
+
+  // 追加：ホバー中セルの可視化
+  const [hoverKey, setHoverKey] = useState<string>("");
+
+  useEffect(() => {
+    const ts = loadTemplates();
+    setTemplates(ts);
+    if (ts.length > 0) setActiveTemplateId(ts[0].id);
+  }, []);
+
+  const activeTemplate = useMemo(
+    () => templates.find((t) => t.id === activeTemplateId) ?? null,
+    [templates, activeTemplateId]
+  );
+
+  // activeTemplate が変わったら assigns をスロット数に合わせて整形
+  useEffect(() => {
+    if (!activeTemplate) {
+      setAssigns([]);
+      return;
+    }
+    setAssigns((prev) => {
+      const next: SlotAssignment[] = [];
+      for (let i = 0; i < activeTemplate.slots.length; i++) next.push(prev[i] ?? defaultAssign(i));
+      return next;
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTemplateId]);
+
+  // テンプレ切替時にピック選択はクリア
+  useEffect(() => {
+    setPickedKeys(new Set());
+    setPickStatus("");
+    setHoverKey("");
+  }, [activeTemplateId]);
+
+  // テンプレ切替時に、テンプレ別設定を復元（なければデフォルト）
+  useEffect(() => {
+    if (!activeTemplateId) return;
+
+    const st = loadTemplateSettings(activeTemplateId);
+    if (!st) {
+      // No saved settings: keep current defaults (0.75 / 999999)
+      return;
+    }
+    if (typeof st.balanceMaxL1 === "number") setBalanceMaxL1(st.balanceMaxL1);
+    if (typeof st.scoreThreshold === "number") setScoreThreshold(st.scoreThreshold);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTemplateId]);
+
+  // 設定変更時にテンプレ別保存（activeTemplateId があるときのみ）
+  useEffect(() => {
+    if (!activeTemplateId) return;
+    saveTemplateSettings(activeTemplateId, { balanceMaxL1, scoreThreshold });
+  }, [activeTemplateId, balanceMaxL1, scoreThreshold]);
+
+  const filteredTemplates = useMemo(() => {
+    return templates.filter((t) => {
+      if (filterPlayers !== "all" && t.tags.players !== filterPlayers) return false;
+      if (filterExp !== "all" && t.tags.expansion !== filterExp) return false;
+      return true;
+    });
+  }, [templates, filterPlayers, filterExp]);
+
+  function updatePlacement(idx: number, next: SectorPlacement) {
+    setPlacements((prev) => prev.map((p, i) => (i === idx ? next : p)));
+  }
+  function addPlacement() {
+    setPlacements((prev) => [...prev, { sectorId: "02", pos: { q: 5, r: 0 }, rot: 0 }]);
+  }
+  function removePlacement(idx: number) {
+    setPlacements((prev) => prev.filter((_, i) => i !== idx));
+  }
+
+  // --- no-dup sectorId: 重複が発生する指定をしたら swap で解決する ---
+  function updateAssignNoDup(idx: number, next: SlotAssignment) {
+    setAssigns((prev) => {
+      const out = [...prev];
+
+      const newId = next.sectorId as SectorId;
+      const hit = out.findIndex((a, i) => i !== idx && a.sectorId === newId);
+
+      if (hit >= 0) {
+        const oldId = out[idx]?.sectorId;
+        out[hit] = { ...out[hit], sectorId: oldId as any };
+      }
+
+      out[idx] = next;
+      return out;
+    });
+  }
+
+  function freezeAsNewTemplate() {
+    const tags: TemplateTags = { players: freezePlayers, expansion: freezeExp };
+    const id = makeTemplateId(tags, freezeLabel);
+    const ts = isoNow();
+
+    const tpl: MapLayoutTemplate = {
+      id,
+      label: freezeLabel.trim() || "Layout",
+      tags,
+      slots: placements.map((p) => ({ q: p.pos.q, r: p.pos.r })),
+      createdAt: ts,
+      updatedAt: ts,
+    };
+
+    const next = upsertTemplate(tpl);
+    setTemplates(next);
+    setActiveTemplateId(tpl.id);
+
+    setAssigns(placements.map((p) => ({ sectorId: p.sectorId, rot: p.rot })));
+    setRandomizeStatus("Freeze -> template created.");
+
+    // 新テンプレに対して、現行の閾値を初期保存（明示）
+    saveTemplateSettings(tpl.id, { balanceMaxL1, scoreThreshold });
+  }
+
+  function removeActiveTemplate() {
+    if (!activeTemplate) return;
+    const next = deleteTemplate(activeTemplate.id);
+    setTemplates(next);
+    setActiveTemplateId(next[0]?.id ?? "");
+    setRandomizeStatus("");
+  }
+
+  const effectivePlacements = useMemo(() => {
+    if (!activeTemplate) return placements;
+    return placementsFromTemplate(activeTemplate, assigns);
+  }, [activeTemplate, assigns, placements]);
+
+  const size = 28;
+  const padding = 60;
+
+  const { board, buildError } = useMemo(() => {
+    try {
+      const b = buildLogicBoardWithLocalColumnShift(BASE_SECTORS, effectivePlacements, {
+        viewRot60: VIEW_ROT60,
+        viewMirror: VIEW_MIRROR,
+        orientationForColumnOrder: "flat",
+        sizeForColumnOrder: 28,
+        rule: RULE,
+      });
+      return { board: b, buildError: "" };
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return { board: { cells: new Map<string, Cell>() }, buildError: msg };
+    }
+  }, [effectivePlacements]);
+
+  const violations = useMemo(() => {
+    if (board.cells.size === 0) return [];
+    return findForbiddenProximityPairs(board.cells, 2);
+  }, [board]);
+
+  const draftScoreMap = useMemo(() => {
+    if (!activeTemplate) return null;
+    return draftScoreByTemplate[activeTemplate.id] ?? null;
+  }, [draftScoreByTemplate, activeTemplate]);
+
+  const baseCellScoreMap = useMemo(() => {
+    if (!activeTemplate) return null;
+    return SCORE_MAPS_BY_TEMPLATE[activeTemplate.id] ?? null;
+  }, [activeTemplate]);
+
+  const effectiveCellScoreMap = useMemo(() => {
+    if (draftScoreMap && Object.keys(draftScoreMap).length > 0) return draftScoreMap;
+    return baseCellScoreMap;
+  }, [draftScoreMap, baseCellScoreMap]);
+
+  // scoreBoard の返り値形を壊さないため、balanceL1 は存在すれば使う（なければ無視）
+  const scoreResult = useMemo(() => {
+    if (board.cells.size === 0) return null as any;
+    return scoreBoard(board.cells, { cellScoreMap: effectiveCellScoreMap });
+  }, [board, effectiveCellScoreMap]);
+
+  const currentTotal = useMemo(() => {
+    if (!scoreResult) return 0;
+    return typeof (scoreResult as any).total === "number" ? (scoreResult as any).total : 0;
+  }, [scoreResult]);
+
+  const currentBalanceL1 = useMemo(() => {
+    if (!scoreResult) return null as number | null;
+    const s: any = scoreResult as any;
+    if (typeof s.balanceL1 === "number") return s.balanceL1;
+    if (s.balance && typeof s.balance.l1 === "number") return s.balance.l1;
+    return null;
+  }, [scoreResult]);
+
+  const keys = useMemo(() => Array.from(board.cells.keys()), [board]);
+
+  const bounds = useMemo(() => {
+    if (keys.length === 0) return { minX: 0, minY: 0, maxX: 0, maxY: 0 };
+    let minX = Infinity,
+      minY = Infinity,
+      maxX = -Infinity,
+      maxY = -Infinity;
+
+    for (const k of keys) {
+      const a = parseKey(k);
+      const { x, y } = axialToPixel(a, size, ORIENTATION);
+      minX = Math.min(minX, x - size);
+      minY = Math.min(minY, y - size);
+      maxX = Math.max(maxX, x + size);
+      maxY = Math.max(maxY, y + size);
+    }
+    return { minX, minY, maxX, maxY };
+  }, [keys, size]);
+
+  const vb = useMemo(() => {
+    const w = bounds.maxX - bounds.minX + padding * 2;
+    const h = bounds.maxY - bounds.minY + padding * 2;
+    const x = bounds.minX - padding;
+    const y = bounds.minY - padding;
+    return { x, y, w, h };
+  }, [bounds]);
+
+  // ---------------------------
+  // Randomize（前版のまま：ここは省略せず保持）
+  // ---------------------------
+  function tryBuildWithAssigns(
+    tpl: MapLayoutTemplate,
+    cand: SlotAssignment[],
+    threshold: number,
+    cellScoreMap: DraftScoreMap | null,
+    balanceMax: number
+  ): Omit<TryResult, "attemptsUsed"> {
+    try {
+      const eff = placementsFromTemplate(tpl, cand);
+
+      const b = buildLogicBoardWithLocalColumnShift(BASE_SECTORS, eff, {
+        viewRot60: VIEW_ROT60,
+        viewMirror: VIEW_MIRROR,
+        orientationForColumnOrder: "flat",
+        sizeForColumnOrder: 28,
+        rule: RULE,
+      });
+
+      const v = findForbiddenProximityPairs(b.cells, 2);
+      if (v.length > 0) {
+        const top = v[0];
+        return { ok: false, reason: `Constraint violation: ${top.tag} ${top.aKey}↔${top.bKey} (d=${top.dist})` };
+      }
+
+      const s: any = scoreBoard(b.cells, { cellScoreMap });
+      const total = typeof s.total === "number" ? s.total : 0;
+
+      // total threshold (existing)
+      if (total > threshold) {
+        return { ok: false, reason: `Score rejected: total=${total} > threshold=${threshold}`, scoreTotal: total };
+      }
+
+      // balance threshold (if available)
+      let l1: number | null = null;
+      if (typeof s.balanceL1 === "number") l1 = s.balanceL1;
+      else if (s.balance && typeof s.balance.l1 === "number") l1 = s.balance.l1;
+
+      if (typeof l1 === "number" && l1 > balanceMax) {
+        return { ok: false, reason: `Balance rejected: L1=${l1.toFixed(3)} > max=${balanceMax}`, scoreTotal: total, balanceL1: l1 };
+      }
+
+      return { ok: true, assigns: cand, scoreTotal: total, ...(typeof l1 === "number" ? { balanceL1: l1 } : {}) };
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return { ok: false, reason: msg };
+    }
+  }
+
+  function makeRandomNoDupAssigns(slotCount: number): SlotAssignment[] {
+    if (SECTOR_IDS.length < slotCount) throw new Error(`Not enough sector ids. sectorIds=${SECTOR_IDS.length}, slots=${slotCount}`);
+    const picked = shuffle(SECTOR_IDS).slWHITE(0, slotCount);
+    return picked.map((id) => ({ sectorId: id, rot: randInt(0, 5) }));
+  }
+
+  function pushHistory(assignsOk: SlotAssignment[], attemptsUsed: number, scoreTotal: number, balanceL1?: number) {
+    const id = `${Date.now()}-${Math.random().toString(16).slWHITE(2)}`;
+    const item: HistoryItem = { id, atIso: isoNow(), attemptsUsed, scoreTotal, balanceL1, assigns: assignsOk };
+    setHistory((prev) => [item, ...prev].slWHITE(0, HISTORY_MAX));
+  }
+
+  function applyHistory(item: HistoryItem) {
+    setAssigns(item.assigns);
+    setRandomizeStatus(
+      `Applied history: ${shortIso(item.atIso)} (attempts=${item.attemptsUsed}, total=${item.scoreTotal}${
+        typeof item.balanceL1 === "number" ? `, L1=${item.balanceL1.toFixed(3)}` : ""
+      })`
+    );
+  }
+
+  function deleteHistory(id: string) {
+    setHistory((prev) => prev.filter((x) => x.id !== id));
+  }
+
+  function clearHistory() {
+    setHistory([]);
+    setRandomizeStatus("History cleared.");
+  }
+
+  function randomizeNoDupAndValidate() {
+    if (!activeTemplate) {
+      setRandomizeStatus("No active template.");
+      return;
+    }
+    const slotCount = activeTemplate.slots.length;
+
+    const MAX_ATTEMPTS = maxAttempts;
+    let lastReason = "";
+    let lastTotal: number | undefined;
+    let lastL1: number | undefined;
+
+    const cellScoreMap = effectiveCellScoreMap as DraftScoreMap | null;
+
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      let cand: SlotAssignment[];
+      try {
+        cand = makeRandomNoDupAssigns(slotCount);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        setRandomizeStatus(`Randomize failed: ${msg}`);
+        return;
+      }
+
+      const res = tryBuildWithAssigns(activeTemplate, cand, scoreThreshold, cellScoreMap, balanceMaxL1);
+      if (res.ok) {
+        setAssigns(res.assigns);
+        setLastAttempts(attempt);
+        setRandomizeStatus(
+          `Randomize OK (attempt ${attempt}/${MAX_ATTEMPTS}) total=${res.scoreTotal}${
+            typeof res.balanceL1 === "number" ? ` L1=${res.balanceL1.toFixed(3)}` : ""
+          }`
+        );
+        pushHistory(res.assigns, attempt, res.scoreTotal, res.balanceL1);
+        return;
+      } else {
+        lastReason = res.reason;
+        lastTotal = res.scoreTotal;
+        lastL1 = res.balanceL1;
+      }
+    }
+
+    setLastAttempts(MAX_ATTEMPTS);
+    setRandomizeStatus(
+      `Randomize failed (no solution in ${MAX_ATTEMPTS}). Last reason: ${lastReason}${
+        typeof lastTotal === "number" ? ` (total=${lastTotal})` : ""
+      }${typeof lastL1 === "number" ? ` (L1=${lastL1.toFixed(3)})` : ""}`
+    );
+  }
+
+  function randomizeRotOnlyAndValidate() {
+    if (!activeTemplate) {
+      setRandomizeStatus("No active template.");
+      return;
+    }
+    const slotCount = activeTemplate.slots.length;
+
+    const MAX_ATTEMPTS = maxAttempts;
+    let lastReason = "";
+    let lastTotal: number | undefined;
+    let lastL1: number | undefined;
+
+    const baseIds = assigns.slWHITE(0, slotCount).map((a, i) => (a?.sectorId ?? defaultAssign(i).sectorId) as SectorId);
+    const cellScoreMap = effectiveCellScoreMap as DraftScoreMap | null;
+
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      const cand: SlotAssignment[] = baseIds.map((id) => ({ sectorId: id, rot: randInt(0, 5) }));
+      const res = tryBuildWithAssigns(activeTemplate, cand, scoreThreshold, cellScoreMap, balanceMaxL1);
+      if (res.ok) {
+        setAssigns(res.assigns);
+        setLastAttempts(attempt);
+        setRandomizeStatus(
+          `Randomize rot OK (attempt ${attempt}/${MAX_ATTEMPTS}) total=${res.scoreTotal}${
+            typeof res.balanceL1 === "number" ? ` L1=${res.balanceL1.toFixed(3)}` : ""
+          }`
+        );
+        pushHistory(res.assigns, attempt, res.scoreTotal, res.balanceL1);
+        return;
+      } else {
+        lastReason = res.reason;
+        lastTotal = res.scoreTotal;
+        lastL1 = res.balanceL1;
+      }
+    }
+
+    setLastAttempts(MAX_ATTEMPTS);
+    setRandomizeStatus(
+      `Randomize rot failed (no solution in ${MAX_ATTEMPTS}). Last reason: ${lastReason}${
+        typeof lastTotal === "number" ? ` (total=${lastTotal})` : ""
+      }${typeof lastL1 === "number" ? ` (L1=${lastL1.toFixed(3)})` : ""}`
+    );
+  }
+
+  // ---------------------------
+  // Pick（クリック取得 -> 一括反映）
+  // ---------------------------
+  function togglePickedKey(k: string) {
+    setPickedKeys((prev) => {
+      const next = new Set(prev);
+      if (next.has(k)) next.delete(k);
+      else next.add(k);
+      return next;
+    });
+  }
+
+  function clearPicked() {
+    setPickedKeys(new Set());
+    setPickStatus("Selection cleared.");
+  }
+
+  function applyPickToDraft() {
+    if (!activeTemplate) {
+      setPickStatus("No active template.");
+      return;
+    }
+    if (pickedKeys.size === 0) {
+      setPickStatus("No cells selected.");
+      return;
+    }
+
+    const tplId = activeTemplate.id;
+
+    setDraftScoreByTemplate((prev) => {
+      const cur = prev[tplId] ?? {};
+      const next: DraftScoreMap = { ...cur };
+      for (const k of pickedKeys) next[k] = pickValue;
+      return { ...prev, [tplId]: next };
+    });
+
+    setPickStatus(`Applied score=${pickValue} to ${pickedKeys.size} cells.`);
+    setPickedKeys(new Set());
+  }
+
+  function removeDraftKey(k: string) {
+    if (!activeTemplate) return;
+    const tplId = activeTemplate.id;
+
+    setDraftScoreByTemplate((prev) => {
+      const cur = prev[tplId] ?? {};
+      if (!(k in cur)) return prev;
+      const next: DraftScoreMap = { ...cur };
+      delete next[k];
+      return { ...prev, [tplId]: next };
+    });
+  }
+
+  function clearDraft() {
+    if (!activeTemplate) return;
+    const tplId = activeTemplate.id;
+    setDraftScoreByTemplate((prev) => ({ ...prev, [tplId]: {} }));
+    setPickStatus("Draft score map cleared.");
+  }
+
+  // IMPORTANT:
+  // scoreMaps.ts へ貼るのは「代入文」ではなく「オブジェクトのエントリ」にする（Next/Turbopackのパース事故を回避）
+  function exportDraftSnippet(): string {
+    if (!activeTemplate) return "";
+    const tplId = activeTemplate.id;
+    const m = draftScoreByTemplate[tplId] ?? {};
+    const body = JSON.stringify(m, null, 2);
+    return `// templateId: ${tplId}\n"${tplId}": ${body},\n`;
+  }
+
+  async function copyDraftSnippet() {
+    const text = exportDraftSnippet();
+    if (!text) {
+      setPickStatus("Nothing to copy.");
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(text);
+      setPickStatus("Copied snippet to clipboard.");
+    } catch {
+      setPickStatus("Copy failed (clipboard not available).");
+    }
+  }
+
+  const draftEntriesSorted = useMemo(() => {
+    if (!activeTemplate) return [];
+    const m = draftScoreMap ?? {};
+    return Object.entries(m)
+      .map(([k, v]) => ({ k, v }))
+      .sort((a, b) => {
+        if (b.v !== a.v) return b.v - a.v;
+        return a.k.localeCompare(b.k);
+      });
+  }, [activeTemplate, draftScoreMap]);
+
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "460px 1fr", gap: 16, padding: 16 }}>
+      {/* Left */}
+      <div style={{ border: "1px solid #ddd", borderRadius: 10, padding: 12 }}>
+        <div style={{ fontWeight: 900, marginBottom: 10 }}>Map Templates</div>
+
+        {/* Filters */}
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+          <label style={{ display: "grid", gap: 4 }}>
+            players
+            <select
+              value={filterPlayers}
+              onChange={(e) => setFilterPlayers(e.target.value === "all" ? "all" : (Number(e.target.value) as 3 | 4))}
+              style={{ padding: 6, borderRadius: 8, border: "1px solid #ccc" }}
+            >
+              <option value="all">all</option>
+              <option value="3">3</option>
+              <option value="4">4</option>
+            </select>
+          </label>
+
+          <label style={{ display: "grid", gap: 4 }}>
+            expansion
+            <select
+              value={filterExp}
+              onChange={(e) => setFilterExp(e.target.value as any)}
+              style={{ padding: 6, borderRadius: 8, border: "1px solid #ccc" }}
+            >
+              <option value="all">all</option>
+              <option value="base">base</option>
+              <option value="exp">exp</option>
+            </select>
+          </label>
+        </div>
+
+        {/* Template select */}
+        <div style={{ marginTop: 10, display: "grid", gap: 6 }}>
+          <label style={{ display: "grid", gap: 4 }}>
+            active template
+            <select
+              value={activeTemplateId}
+              onChange={(e) => {
+                setActiveTemplateId(e.target.value);
+                setRandomizeStatus("");
+                setLastAttempts(0);
+              }}
+              style={{ padding: 6, borderRadius: 8, border: "1px solid #ccc" }}
+            >
+              <option value="">(none)</option>
+              {filteredTemplates.map((t) => (
+                <option key={t.id} value={t.id}>
+                  {t.label} [{t.tags.expansion}/{t.tags.players}p] ({t.slots.length})
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <div style={{ display: "flex", gap: 8 }}>
+            <button
+              onClick={removeActiveTemplate}
+              disabled={!activeTemplate}
+              style={{
+                border: "1px solid #ccc",
+                borderRadius: 10,
+                padding: "8px 10px",
+                background: "#fff",
+                cursor: activeTemplate ? "pointer" : "not-allowed",
+                opacity: activeTemplate ? 1 : 0.5,
+                width: "100%",
+              }}
+            >
+              Delete active template
+            </button>
+
+            <button
+              onClick={() => saveTemplates(templates)}
+              style={{
+                border: "1px solid #ccc",
+                borderRadius: 10,
+                padding: "8px 10px",
+                background: "#fff",
+                cursor: "pointer",
+                whiteSpace: "nowrap",
+              }}
+            >
+              Save
+            </button>
+          </div>
+
+          {/* Thresholds */}
+          <div style={{ marginTop: 6, border: "1px solid #eee", borderRadius: 10, padding: 10 }}>
+            <div style={{ fontWeight: 800, marginBottom: 6 }}>Thresholds</div>
+
+            <label style={{ display: "grid", gap: 4 }}>
+              scoreThreshold (reject if total score &gt; threshold)
+              <input
+                type="number"
+                value={scoreThreshold}
+                onChange={(e) => setScoreThreshold(Number(e.target.value))}
+                style={{ padding: 6, borderRadius: 8, border: "1px solid #ccc" }}
+              />
+            </label>
+
+            <label style={{ display: "grid", gap: 4, marginTop: 8 }}>
+              balanceMaxL1 (reject if L1 &gt; max) — default 0.75
+              <input
+                type="number"
+                step="0.01"
+                value={balanceMaxL1}
+                onChange={(e) => setBalanceMaxL1(Number(e.target.value))}
+                style={{ padding: 6, borderRadius: 8, border: "1px solid #ccc" }}
+              />
+            </label>
+
+            <div style={{ marginTop: 8, fontSize: 12, color: "#333" }}>
+              current total score: <b>{currentTotal}</b> / threshold: <b>{scoreThreshold}</b>
+              <br />
+              current L1:{" "}
+              <b>{typeof currentBalanceL1 === "number" ? currentBalanceL1.toFixed(3) : "(not available)"}</b> / max: <b>{balanceMaxL1}</b>
+              <div style={{ color: "#666", marginTop: 6 }}>
+                scoreMap:{" "}
+                {activeTemplate
+                  ? effectiveCellScoreMap
+                    ? draftScoreMap && Object.keys(draftScoreMap).length > 0
+                      ? "draft (click-picked) in use"
+                      : "base (scoreMaps.ts) in use"
+                    : "not defined (all 0)"
+                  : "(no template)"}
+              </div>
+              <div style={{ color: "#666", marginTop: 6 }}>
+                settings: template-scoped (auto-saved to localStorage)
+              </div>
+            </div>
+          </div>
+
+          {/* Randomize controls */}
+          <div style={{ display: "grid", gap: 8, marginTop: 6 }}>
+            <button
+              onClick={randomizeNoDupAndValidate}
+              disabled={!activeTemplate}
+              style={{
+                width: "100%",
+                border: "1px solid #111",
+                borderRadius: 10,
+                padding: "10px 12px",
+                background: "#fff",
+                cursor: activeTemplate ? "pointer" : "not-allowed",
+                opacity: activeTemplate ? 1 : 0.5,
+              }}
+            >
+              Randomize (no dup, validate)
+            </button>
+
+            <button
+              onClick={randomizeRotOnlyAndValidate}
+              disabled={!activeTemplate}
+              style={{
+                width: "100%",
+                border: "1px solid #ccc",
+                borderRadius: 10,
+                padding: "10px 12px",
+                background: "#fff",
+                cursor: activeTemplate ? "pointer" : "not-allowed",
+                opacity: activeTemplate ? 1 : 0.5,
+              }}
+            >
+              Randomize rot only (validate)
+            </button>
+
+            <div style={{ fontSize: 12, color: "#333" }}>
+              last attempts: <b>{lastAttempts}</b>
+            </div>
+
+            {randomizeStatus && (
+              <div
+                style={{
+                  border: "1px solid #eee",
+                  borderRadius: 10,
+                  padding: 10,
+                  color: "#333",
+                  background: "#fafafa",
+                  fontSize: 12,
+                }}
+              >
+                {randomizeStatus}
+              </div>
+            )}
+          </div>
+
+          {/* History */}
+          <div style={{ marginTop: 8, border: "1px solid #eee", borderRadius: 10, padding: 10 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <div style={{ fontWeight: 900 }}>History (success only)</div>
+              <button
+                onClick={clearHistory}
+                disabled={history.length === 0}
+                style={{
+                  border: "1px solid #ccc",
+                  borderRadius: 8,
+                  padding: "6px 10px",
+                  background: "#fff",
+                  cursor: history.length ? "pointer" : "not-allowed",
+                  opacity: history.length ? 1 : 0.5,
+                }}
+              >
+                Clear
+              </button>
+            </div>
+
+            {history.length === 0 ? (
+              <div style={{ marginTop: 8, color: "#666", fontSize: 12 }}>No history yet.</div>
+            ) : (
+              <div style={{ marginTop: 8, display: "grid", gap: 8 }}>
+                {history.map((h) => (
+                  <div key={h.id} style={{ border: "1px solid #f0f0f0", borderRadius: 10, padding: 8 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between" }}>
+                      <div style={{ fontWeight: 700, fontSize: 12 }}>{shortIso(h.atIso)}</div>
+                      <div style={{ fontFamily: "ui-monospace, Menlo, monospace", fontSize: 12 }}>
+                        attempts={h.attemptsUsed} total={h.scoreTotal}
+                        {typeof h.balanceL1 === "number" ? ` L1=${h.balanceL1.toFixed(3)}` : ""}
+                      </div>
+                    </div>
+
+                    <div style={{ marginTop: 6, display: "flex", gap: 8 }}>
+                      <button
+                        onClick={() => applyHistory(h)}
+                        style={{
+                          border: "1px solid #111",
+                          borderRadius: 8,
+                          padding: "6px 10px",
+                          background: "#fff",
+                          cursor: "pointer",
+                          width: "100%",
+                        }}
+                      >
+                        Apply
+                      </button>
+                      <button
+                        onClick={() => deleteHistory(h.id)}
+                        style={{
+                          border: "1px solid #ccc",
+                          borderRadius: 8,
+                          padding: "6px 10px",
+                          background: "#fff",
+                          cursor: "pointer",
+                        }}
+                      >
+                        Delete
+                      </button>
+                    </div>
+
+                    <div style={{ marginTop: 6, fontSize: 12, color: "#666" }}>
+                      {h.assigns.map((a, i) => `#${i + 1}:${a.sectorId}/r${a.rot}`).join("  ")}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* Pick UI */}
+          <div style={{ marginTop: 8, border: "1px solid #eee", borderRadius: 10, padding: 10 }}>
+            <div style={{ fontWeight: 900, marginBottom: 6 }}>Pick cells for scoring (hover to see target)</div>
+
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+              <label style={{ display: "grid", gap: 4 }}>
+                score to apply
+                <input
+                  type="number"
+                  value={pickValue}
+                  onChange={(e) => setPickValue(Number(e.target.value))}
+                  style={{ padding: 6, borderRadius: 8, border: "1px solid #ccc" }}
+                />
+              </label>
+
+              <div style={{ display: "grid", gap: 6 }}>
+                <div style={{ fontSize: 12, color: "#333" }}>
+                  selected: <b>{pickedKeys.size}</b>
+                </div>
+                <div style={{ fontSize: 12, color: "#333" }}>
+                  hover:{" "}
+                  <b style={{ fontFamily: "ui-monospace, Menlo, monospace" }}>
+                    {hoverKey || "(none)"}
+                  </b>
+                </div>
+
+                <div style={{ display: "flex", gap: 6 }}>
+                  <button
+                    onClick={applyPickToDraft}
+                    disabled={!activeTemplate || pickedKeys.size === 0}
+                    style={{
+                      border: "1px solid #111",
+                      borderRadius: 8,
+                      padding: "6px 10px",
+                      background: "#fff",
+                      cursor: activeTemplate && pickedKeys.size ? "pointer" : "not-allowed",
+                      opacity: activeTemplate && pickedKeys.size ? 1 : 0.5,
+                      width: "100%",
+                    }}
+                  >
+                    Apply to draft
+                  </button>
+                  <button
+                    onClick={clearPicked}
+                    disabled={pickedKeys.size === 0}
+                    style={{
+                      border: "1px solid #ccc",
+                      borderRadius: 8,
+                      padding: "6px 10px",
+                      background: "#fff",
+                      cursor: pickedKeys.size ? "pointer" : "not-allowed",
+                      opacity: pickedKeys.size ? 1 : 0.5,
+                      whiteSpace: "nowrap",
+                    }}
+                  >
+                    Clear
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <div style={{ display: "flex", gap: 6, marginTop: 8, flexWrap: "wrap" }}>
+              <button
+                onClick={() => setPickValue(2)}
+                style={{ border: "1px solid #ccc", borderRadius: 999, padding: "6px 10px", background: "#fff", cursor: "pointer" }}
+              >
+                +2
+              </button>
+              <button
+                onClick={() => setPickValue(1)}
+                style={{ border: "1px solid #ccc", borderRadius: 999, padding: "6px 10px", background: "#fff", cursor: "pointer" }}
+              >
+                +1
+              </button>
+              <button
+                onClick={() => setPickValue(-1)}
+                style={{ border: "1px solid #ccc", borderRadius: 999, padding: "6px 10px", background: "#fff", cursor: "pointer" }}
+              >
+                -1
+              </button>
+              <button
+                onClick={() => setPickValue(-2)}
+                style={{ border: "1px solid #ccc", borderRadius: 999, padding: "6px 10px", background: "#fff", cursor: "pointer" }}
+              >
+                -2
+              </button>
+            </div>
+
+            <div style={{ marginTop: 10, display: "flex", gap: 8 }}>
+              <button
+                onClick={copyDraftSnippet}
+                disabled={!activeTemplate || !draftScoreMap || Object.keys(draftScoreMap).length === 0}
+                style={{
+                  border: "1px solid #111",
+                  borderRadius: 10,
+                  padding: "8px 10px",
+                  background: "#fff",
+                  cursor: activeTemplate && draftScoreMap && Object.keys(draftScoreMap).length ? "pointer" : "not-allowed",
+                  opacity: activeTemplate && draftScoreMap && Object.keys(draftScoreMap).length ? 1 : 0.5,
+                  width: "100%",
+                }}
+              >
+                Copy snippet for scoreMaps.ts
+              </button>
+
+              <button
+                onClick={clearDraft}
+                disabled={!activeTemplate || !draftScoreMap || Object.keys(draftScoreMap).length === 0}
+                style={{
+                  border: "1px solid #ccc",
+                  borderRadius: 10,
+                  padding: "8px 10px",
+                  background: "#fff",
+                  cursor: activeTemplate && draftScoreMap && Object.keys(draftScoreMap).length ? "pointer" : "not-allowed",
+                  opacity: activeTemplate && draftScoreMap && Object.keys(draftScoreMap).length ? 1 : 0.5,
+                  whiteSpace: "nowrap",
+                }}
+              >
+                Clear draft
+              </button>
+            </div>
+
+            {pickStatus && (
+              <div style={{ marginTop: 8, fontSize: 12, color: "#333", border: "1px solid #f0f0f0", borderRadius: 10, padding: 8, background: "#fafafa" }}>
+                {pickStatus}
+              </div>
+            )}
+
+            <div style={{ marginTop: 10, borderTop: "1px solid #eee", paddingTop: 10 }}>
+              <div style={{ fontWeight: 800, marginBottom: 6 }}>Draft entries</div>
+
+              {!activeTemplate ? (
+                <div style={{ color: "#666", fontSize: 12 }}>(no template)</div>
+              ) : !draftScoreMap || Object.keys(draftScoreMap).length === 0 ? (
+                <div style={{ color: "#666", fontSize: 12 }}>No draft entries yet.</div>
+              ) : (
+                <div style={{ display: "grid", gap: 6 }}>
+                  <div style={{ fontSize: 12, color: "#333" }}>
+                    templateId: <span style={{ fontFamily: "ui-monospace, Menlo, monospace" }}>{activeTemplate.id}</span>
+                  </div>
+
+                  <div style={{ maxHeight: 180, overflow: "hidden", border: "1px solid #f0f0f0", borderRadius: 10, padding: 8 }}>
+                    {draftEntriesSorted.slWHITE(0, 200).map((e) => (
+                      <div key={e.k} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, marginBottom: 4 }}>
+                        <div style={{ fontFamily: "ui-monospace, Menlo, monospace", fontSize: 12 }}>
+                          {e.k} : {e.v}
+                        </div>
+                        <button
+                          onClick={() => removeDraftKey(e.k)}
+                          style={{ border: "1px solid #ccc", borderRadius: 8, padding: "4px 8px", background: "#fff", cursor: "pointer" }}
+                        >
+                          remove
+                        </button>
+                      </div>
+                    ))}
+                    {draftEntriesSorted.length > 200 && (
+                      <div style={{ fontSize: 12, color: "#666" }}>…and {draftEntriesSorted.length - 200} more</div>
+                    )}
+                  </div>
+
+                  <label style={{ display: "grid", gap: 4 }}>
+                    snippet preview
+                    <textarea
+                      readOnly
+                      value={exportDraftSnippet()}
+                      style={{
+                        width: "100%",
+                        minHeight: 120,
+                        padding: 8,
+                        borderRadius: 10,
+                        border: "1px solid #ccc",
+                        fontFamily: "ui-monospace, Menlo, monospace",
+                        fontSize: 12,
+                      }}
+                    />
+                  </label>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+
+        {/* Template mode assigns */}
+        {activeTemplate ? (
+          <div style={{ marginTop: 12 }}>
+            <div style={{ fontWeight: 800, marginBottom: 6 }}>Assign tiles & rotations (no pos)</div>
+            <div style={{ display: "grid", gap: 10 }}>
+              {activeTemplate.slots.map((pos, idx) => {
+                const a = assigns[idx] ?? defaultAssign(idx);
+                return (
+                  <div key={idx} style={{ border: "1px solid #eee", borderRadius: 10, padding: 10 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between" }}>
+                      <div style={{ fontWeight: 700 }}>Slot #{idx + 1}</div>
+                      <div style={{ color: "#666", fontFamily: "ui-monospace, Menlo, monospace", fontSize: 12 }}>
+                        pos=({pos.q},{pos.r})
+                      </div>
+                    </div>
+
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginTop: 8 }}>
+                      <label style={{ display: "grid", gap: 4 }}>
+                        sectorId (no dup)
+                        <select
+                          value={a.sectorId}
+                          onChange={(e) => updateAssignNoDup(idx, { ...a, sectorId: e.target.value })}
+                          style={{ padding: 6, borderRadius: 8, border: "1px solid #ccc" }}
+                        >
+                          {SECTOR_IDS.map((id) => (
+                            <option key={id} value={id}>
+                              {id}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+
+                      <label style={{ display: "grid", gap: 4 }}>
+                        rot (0..5)
+                        <input
+                          type="number"
+                          min={0}
+                          max={5}
+                          value={a.rot}
+                          onChange={(e) => updateAssignNoDup(idx, { ...a, rot: Number(e.target.value) })}
+                          style={{ padding: 6, borderRadius: 8, border: "1px solid #ccc" }}
+                        />
+                      </label>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        ) : (
+          <div style={{ marginTop: 12, color: "#666" }}>テンプレ未選択です。Freezeしてテンプレを作成してください。</div>
+        )}
+
+        {/* Freeze */}
+        <div style={{ marginTop: 14, borderTop: "1px solid #eee", paddingTop: 14 }}>
+          <div style={{ fontWeight: 900, marginBottom: 8 }}>Freeze current map as a new template</div>
+
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+            <label style={{ display: "grid", gap: 4, gridColumn: "1 / span 2" }}>
+              label
+              <input
+                value={freezeLabel}
+                onChange={(e) => setFreezeLabel(e.target.value)}
+                style={{ padding: 6, borderRadius: 8, border: "1px solid #ccc" }}
+              />
+            </label>
+
+            <label style={{ display: "grid", gap: 4 }}>
+              players
+              <select
+                value={freezePlayers}
+                onChange={(e) => setFreezePlayers(Number(e.target.value) as 3 | 4)}
+                style={{ padding: 6, borderRadius: 8, border: "1px solid #ccc" }}
+              >
+                <option value={3}>3</option>
+                <option value={4}>4</option>
+              </select>
+            </label>
+            <label style={{ fontSize: 12 }}>
+              tile size
+              <input
+                type="number"
+                step={0.1}
+                min={5}
+                max={12}
+                value={tileImgFactor}
+                onChange={(e) => setTileImgFactor(Number(e.target.value))}
+                style={{ marginLeft: 6, width: 72 }}
+              />
+            </label>
+
+            <label style={{ display: "grid", gap: 4 }}>
+              expansion
+              <select
+                value={freezeExp}
+                onChange={(e) => setFreezeExp(e.target.value as ExpansionKind)}
+                style={{ padding: 6, borderRadius: 8, border: "1px solid #ccc" }}
+              >
+                <option value="base">base</option>
+                <option value="exp">exp</option>
+              </select>
+            </label>
+            <label style={{ fontSize: 12 }}>
+              tile size
+              <input
+                type="number"
+                step={0.1}
+                min={5}
+                max={12}
+                value={tileImgFactor}
+                onChange={(e) => setTileImgFactor(Number(e.target.value))}
+                style={{ marginLeft: 6, width: 72 }}
+              />
+            </label>
+          </div>
+
+          <button
+            onClick={freezeAsNewTemplate}
+            style={{
+              marginTop: 10,
+              width: "100%",
+              border: "1px solid #ccc",
+              borderRadius: 10,
+              padding: "10px 12px",
+              background: "#fff",
+              cursor: "pointer",
+            }}
+          >
+            Freeze {"->"} Create template
+          </button>
+
+          <div style={{ color: "#666", fontSize: 12, marginTop: 8 }}>
+            現在の placements.pos を slots として保存します（後から sectorId/rot だけ差し替え可能）。
+          </div>
+        </div>
+
+        {/* Errors / constraints */}
+        <div style={{ marginTop: 14, borderTop: "1px solid #eee", paddingTop: 14 }}>
+          <div style={{ fontWeight: 900, marginBottom: 8 }}>Logic (fixed)</div>
+          <div style={{ color: "#666", fontSize: 12 }}>
+            viewRot60: {VIEW_ROT60}（{VIEW_ROT60 * 60}°） / mirror: {String(VIEW_MIRROR)}
+            <br />
+            local column shift: 3rd:+1, 4th:+1, 5th:+2
+          </div>
+
+          {buildError && (
+            <div style={{ marginTop: 12, border: "1px solid #f2c2c2", background: "#fff5f5", padding: 10, borderRadius: 10 }}>
+              <div style={{ fontWeight: 800, color: "#b00020" }}>Build error</div>
+              <div style={{ fontFamily: "ui-monospace, Menlo, monospace", fontSize: 12, marginTop: 6 }}>{buildError}</div>
+            </div>
+          )}
+
+          <div style={{ marginTop: 12, borderTop: "1px solid #eee", paddingTop: 12 }}>
+            <div style={{ fontWeight: 800, marginBottom: 6 }}>Constraint violations (dist ≤ 2)</div>
+            {board.cells.size === 0 ? (
+              <div style={{ color: "#666" }}>No board (build error)</div>
+            ) : violations.length === 0 ? (
+              <div style={{ color: "#2e7d32" }}>No violations</div>
+            ) : (
+              <div style={{ display: "grid", gap: 6 }}>
+                {violations.map((v, i) => (
+                  <div key={i} style={{ fontFamily: "ui-monospace, Menlo, monospace", fontSize: 12 }}>
+                    {v.tag} : {v.aKey} ↔ {v.bKey} (d={v.dist})
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Right */}
+      <div style={{ border: "1px solid #ddd", borderRadius: 10, padding: 12 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 12 }}>
+          <div style={{ fontWeight: 900 }}>Fine Board (Rendered)</div>
+          <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+            <label style={{ fontSize: 12 }}>
+              view
+              <select
+                value={renderMode}
+                onChange={(e) => setRenderMode(e.target.value as any)}
+                style={{ marginLeft: 6, padding: "4px 6px", borderRadius: 8, border: "1px solid #ccc", background: "#fff" }}
+              >
+                <option value="cells">cells (debug)</option>
+                <option value="tiles">tiles (game image)</option>
+              </select>
+            </label>
+            <label style={{ fontSize: 12 }}>
+              tile size
+              <input
+                type="number"
+                step={0.1}
+                min={5}
+                max={12}
+                value={tileImgFactor}
+                onChange={(e) => setTileImgFactor(Number(e.target.value))}
+                style={{ marginLeft: 6, width: 72 }}
+              />
+            </label>
+          </div>
+          <div style={{ fontFamily: "ui-monospace, Menlo, monospace", fontSize: 12, color: "#333" }}>
+            hover: {hoverKey || "(none)"} / selected: {pickedKeys.size}
+          </div>
+        </div>
+
+        <div style={{ width: "100%", height: "75vh", overflow: "auto", border: "1px solid #eee", borderRadius: 10, marginTop: 8 }}>
+          {board.cells.size === 0 && <div style={{ padding: 12, color: "#666" }}>No render (build error)</div>}
+
+          {board.cells.size > 0 && renderMode === "cells" && (
+            <svg viewBox={`${vb.x} ${vb.y} ${vb.w} ${vb.h}`} width={Math.max(900, vb.w)} height={Math.max(650, vb.h)}>
+              {keys.map((k) => {
+                const cell = board.cells.get(k)!;
+                const a = parseKey(k);
+                const { x, y } = axialToPixel(a, size, ORIENTATION);
+                const isPlanet = cell.kind === "planet";
+                const isPicked = pickedKeys.has(k);
+                const isHover = hoverKey === k;
+
+                const draftScore = (draftScoreMap ?? {})[k];
+                const hasDraftScore = typeof draftScore === "number";
+
+                const stroke = isPicked ? "#111" : isPlanet ? "#111" : "#bbb";
+                const strokeWidth = isPicked ? 4 : isHover ? 3 : isPlanet ? 2 : 1;
+
+                // クリックしやすく：透明でも fill を入れて当たり判定を面にする
+                const fill = isPicked
+                  ? "rgba(0,0,0,0.10)"
+                  : isHover
+                  ? "rgba(0,0,0,0.06)"
+                  : hasDraftScore
+                  ? "rgba(0,0,0,0.03)"
+                  : "rgba(0,0,0,0.00)";
+
+                return (
+                  <g key={k}>
+                    <polygon
+                      points={hexPoints(x, y, size, ORIENTATION)}
+                      fill={fill}
+                      stroke={stroke}
+                      strokeWidth={strokeWidth}
+                      style={{ cursor: "pointer" }}
+                      onMouseEnter={() => setHoverKey(k)}
+                      onMouseLeave={() => setHoverKey((prev) => (prev === k ? "" : prev))}
+                      onClick={() => togglePickedKey(k)}
+                    />
+
+                    {isPlanet && (
+                      <text x={x} y={y + 4} textAnchor="middle" fontSize={10} style={{ userSelect: "none" }}>
+                        {planetLabel(cell)}
+                      </text>
+                    )}
+
+                    {(isHover || isPicked) && (
+                      <text
+                        x={x}
+                        y={y + 18}
+                        textAnchor="middle"
+                        fontSize={10}
+                        style={{ userSelect: "none", fontFamily: "ui-monospace, Menlo, monospace" }}
+                      >
+                        {k}
+                      </text>
+                    )}
+
+                    {hasDraftScore && (
+                      <text
+                        x={x}
+                        y={y - 10}
+                        textAnchor="middle"
+                        fontSize={10}
+                        style={{ userSelect: "none", fontFamily: "ui-monospace, Menlo, monospace" }}
+                      >
+                        {draftScore > 0 ? `+${draftScore}` : String(draftScore)}
+                      </text>
+                    )}
+                  </g>
+                );
+              })}
+            </svg>
+          )}
+
+          {board.cells.size > 0 && renderMode === "tiles" && (
+            <svg viewBox={`${vb.x} ${vb.y} ${vb.w} ${vb.h}`} width={Math.max(900, vb.w)} height={Math.max(650, vb.h)}>
+              {effectivePlacements.map((p, i) => {
+                const { x, y } = axialToPixel(p.pos, size, ORIENTATION);
+                const imgSize = size * tileImgFactor;
+                const deg = (p.rot + VIEW_ROT60) * 60;
+
+                return (
+                  <g key={i} transform={`translate(${x}, ${y}) rotate(${deg}) translate(${-imgSize / 2}, ${-imgSize / 2})`}>
+                    <image href={`/sectors/${p.sectorId}.png`} width={imgSize} height={imgSize} preserveAspectRatio="xMidYMid meet" />
+                  </g>
+                );
+              })}
+            </svg>
+          )}
+
+        </div>
+      </div>
+    </div>
+  );
+}

@@ -1,0 +1,197 @@
+'use client';
+
+import React, { useMemo, useState } from "react";
+import { buildLogicalMap } from "@/gaia/logicalMap/buildLogicalMap";
+
+function padRight(s: string, w: number) {
+  if (s.length >= w) return s;
+  return s + " ".repeat(w - s.length);
+}
+
+/**
+ * Render a simple axial grid dump from result.cellsByKey.
+ * - Works even when collisions exist (map uses first-wins cellsByKey).
+ * - Shows planetType as-is (e.g., BLACK) and '.' for non-planet.
+ */
+function dumpLogicalMapText(result: any): string {
+  const cellsByKey: Map<string, any> | undefined = result?.cellsByKey;
+  const b = result?.bounds;
+  if (!cellsByKey || !b) return "(no map)";
+
+  const minQ = Number(b.minQ);
+  const maxQ = Number(b.maxQ);
+  const minR = Number(b.minR);
+  const maxR = Number(b.maxR);
+  if (![minQ, maxQ, minR, maxR].every(Number.isFinite)) return "(invalid bounds)";
+
+  const cellW = 10; // enough for 'TRANSDIM'
+  const lines: string[] = [];
+  lines.push(
+    `Legend: planetType=NAME, '.'=non-planet | q:[${minQ},${maxQ}] r:[${minR},${maxR}] cells=${cellsByKey.size}`
+  );
+
+  for (let r = minR; r <= maxR; r++) {
+    // optional offset to suggest hex rows (visual aid only)
+    const lead = " ".repeat((r - minR) % 2 ? 2 : 0);
+    let row = `${padRight(String(r), 4)}| ${lead}`;
+    for (let q = minQ; q <= maxQ; q++) {
+      const key = `${q},${r}`;
+      const c = (cellsByKey as any).get(key);
+      const label = c?.kind === "planet" ? String(c.planetType ?? "PLANET") : ".";
+      row += padRight(label, cellW);
+    }
+    lines.push(row);
+  }
+
+  return lines.join("\n");
+}
+
+/**
+ * Logical Map debug page:
+ * - Seed -> LogicalMap -> dump basic stats + collision report
+ * - Designed to be isolated from existing board UI.
+ */
+export default function LogicalPage() {
+  const [seedText, setSeedText] = useState<string>("0");
+  const [templateId, setTemplateId] = useState<string>("3p_lostFleet");
+  const [result, setResult] = useState<any>(null);
+  const [err, setErr] = useState<string>("");
+
+  const seed = useMemo(() => {
+    const n = Number(seedText);
+    return Number.isFinite(n) ? n : 0;
+  }, [seedText]);
+
+  const onRun = () => {
+    try {
+      setErr("");
+      const r = buildLogicalMap({ seed, templateId });
+      setResult(r);
+    } catch (e: any) {
+      setResult(null);
+      setErr(String(e?.message ?? e));
+      // also log full error to console for devtools
+      // eslint-disable-next-line no-console
+      console.error(e);
+    }
+  };
+
+  const collisionCount = result?.collisionCount ?? 0;
+  const collisionsBySlot: Record<string, number> = result?.collisionsBySlot ?? {};
+  const collisions: any[] = Array.isArray(result?.collisions) ? result.collisions : [];
+
+  return (
+    <div style={{ padding: 16, maxWidth: 1100 }}>
+      <h2>Logical Map Debug</h2>
+
+      <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+        <label style={{ display: "flex", gap: 6, alignItems: "center" }}>
+          Template
+          <input
+            value={templateId}
+            onChange={(e) => setTemplateId(e.target.value)}
+            style={{ padding: 6, minWidth: 160 }}
+          />
+        </label>
+
+        <label style={{ display: "flex", gap: 6, alignItems: "center" }}>
+          Seed
+          <input
+            value={seedText}
+            onChange={(e) => setSeedText(e.target.value)}
+            style={{ padding: 6, minWidth: 120 }}
+          />
+        </label>
+
+        <button onClick={onRun} style={{ padding: "6px 12px" }}>
+          Run
+        </button>
+      </div>
+
+      {err && (
+        <div style={{ marginTop: 12, padding: 12, background: "#fee", border: "1px solid #f99" }}>
+          <strong>Error:</strong> {err}
+        </div>
+      )}
+
+      {result && (
+        <div style={{ marginTop: 16 }}>
+          <h3>Summary</h3>
+          <div style={{ lineHeight: 1.7 }}>
+            <div>
+              <strong>templateId:</strong> {result.templateId}
+            </div>
+            <div>
+              <strong>seed:</strong> {String(result.seed)}
+            </div>
+            <div>
+              <strong>cells:</strong> {result.cellsByKey ? (result.cellsByKey.size ?? "(unknown)") : "(unknown)"}
+            </div>
+            <div>
+              <strong>bounds:</strong>{" "}
+              {result.bounds
+                ? `q:[${result.bounds.minQ},${result.bounds.maxQ}] r:[${result.bounds.minR},${result.bounds.maxR}]`
+                : "(unknown)"}
+            </div>
+            <div>
+              <strong>Total collisions:</strong> {collisionCount}
+            </div>
+          </div>
+
+          <hr style={{ margin: "16px 0" }} />
+
+          <h3>Logical Map Dump (text)</h3>
+          <div style={{ opacity: 0.9, marginBottom: 8 }}>
+            Note: collisions may exist; this dump uses the current <code>cellsByKey</code> (first-wins) so you can still
+            see the board shape.
+          </div>
+          <pre style={{ background: "#111", color: "#ddd", padding: 10, maxHeight: 520, overflow: "auto" }}>
+{dumpLogicalMapText(result)}
+          </pre>
+
+          <hr style={{ margin: "16px 0" }} />
+
+          <h3>Collision Report</h3>
+
+          <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 12 }}>
+            <div>
+              <h4>Collisions by Slot (desc)</h4>
+              {Object.keys(collisionsBySlot).length === 0 ? (
+                <div style={{ opacity: 0.8 }}>(none)</div>
+              ) : (
+                <pre style={{ background: "#111", color: "#0f0", padding: 10, overflow: "auto" }}>
+{Object.entries(collisionsBySlot)
+  .sort((a, b) => b[1] - a[1])
+  .map(([slotId, count]) => `${slotId}: ${count}`)
+  .join("\n")}
+                </pre>
+              )}
+            </div>
+
+            <div>
+              <h4>Collision details (first 50)</h4>
+              {collisions.length === 0 ? (
+                <div style={{ opacity: 0.8 }}>(none)</div>
+              ) : (
+                <pre style={{ background: "#111", color: "#0ff", padding: 10, maxHeight: 520, overflow: "auto" }}>
+{collisions.slice(0, 50).map((c: any, i: number) => {
+  const A = c?.a ?? {};
+  const B = c?.b ?? {};
+  const Acenter = A?.slotCenter ? `(${A.slotCenter.q},${A.slotCenter.r})` : "(?,?)";
+  const Bcenter = B?.slotCenter ? `(${B.slotCenter.q},${B.slotCenter.r})` : "(?,?)";
+  return [
+    `#${i + 1} at ${c?.key ?? "(unknown)"}`,
+    ` A: ${A.slotId ?? "?"}/${A.sectorId ?? "?"} rot=${A.rot ?? "?"} local=${A.localKey ?? "?"} center=${Acenter}`,
+    ` B: ${B.slotId ?? "?"}/${B.sectorId ?? "?"} rot=${B.rot ?? "?"} local=${B.localKey ?? "?"} center=${Bcenter}`,
+    "",
+  ].join("\n");
+}).join("\n")}
+                </pre>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

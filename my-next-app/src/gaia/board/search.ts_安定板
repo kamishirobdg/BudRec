@@ -1,0 +1,120 @@
+// src/gaia/board/search.ts
+import type { TemplateDef, SlotPlacement } from "./types";
+import type { BoardEvaluation } from "./evaluate";
+import { placementFromSeed } from "./placementFromSeed";
+import { buildNormalizedBoard } from "./normalize";
+import { evaluateBoard } from "./evaluate";
+
+export type SearchOptions = {
+  scoutCount: number;
+  littleFixedCounts?: Record<string, number>;
+  minScoutDist?: number;
+  enableCentralLargeConstraint?: boolean;
+  yieldEvery?: number;
+};
+
+export type SearchResult = {
+  seed: string;
+  placements: SlotPlacement[];
+  evaluation: BoardEvaluation;
+};
+
+export type SearchDiagnostics = {
+  trials: number;
+  rejectCounts: {
+    scoutCountMismatch: number;
+    littleCaps: number;
+    minScoutDist: number;
+    centralLarge: number;
+    normalizeFailed: number;
+  };
+  firstNormalizeError?: {
+    seed: string;
+    message: string;
+    placementsPreview: SlotPlacement[];
+  };
+  options: SearchOptions;
+};
+
+export async function runSearch(
+  template: TemplateDef,
+  sectorById: Map<string, any>,
+  options: SearchOptions,
+  trials: number,
+  keepTop: number,
+  onProgress?: (done: number, best: SearchResult[]) => void
+): Promise<{ results: SearchResult[]; diagnostics: SearchDiagnostics }> {
+  const rejectCounts = {
+    scoutCountMismatch: 0,
+    littleCaps: 0,
+    minScoutDist: 0,
+    centralLarge: 0,
+    normalizeFailed: 0,
+  };
+
+  let firstNormalizeError: SearchDiagnostics["firstNormalizeError"];
+
+  const best: SearchResult[] = [];
+
+  const yieldEvery = options.yieldEvery ?? 0;
+
+  for (let i = 0; i < trials; i++) {
+    const seed = `${i}_0`;
+
+    // 1. placements 生成
+    let placements: SlotPlacement[];
+    try {
+      placements = placementFromSeed(template, seed);
+    } catch {
+      continue;
+    }
+
+    // 2. normalize（★ここが唯一の呼び出し箇所）
+    let nb;
+    try {
+      nb = buildNormalizedBoard(template, placements, sectorById);
+    } catch (e: any) {
+      rejectCounts.normalizeFailed++;
+      if (!firstNormalizeError) {
+        firstNormalizeError = {
+          seed,
+          message: e?.message ? String(e.message) : String(e),
+          placementsPreview: placements.slice(0, 8),
+        };
+      }
+      if (onProgress && i % 25 === 0) onProgress(i + 1, best);
+      if (yieldEvery && i % yieldEvery === 0) {
+        await new Promise((r) => setTimeout(r, 0));
+      }
+      continue;
+    }
+
+    // 3. 評価
+    const evaluation = evaluateBoard(nb, options);
+
+    // 4. 結果保存
+    best.push({
+      seed,
+      placements,
+      evaluation,
+    });
+
+    best.sort((a, b) => b.evaluation.score - a.evaluation.score);
+    if (best.length > keepTop) best.length = keepTop;
+
+    if (onProgress && i % 25 === 0) onProgress(i + 1, best);
+    if (yieldEvery && i % yieldEvery === 0) {
+      await new Promise((r) => setTimeout(r, 0));
+    }
+  }
+
+  return {
+    results: best,
+    diagnostics: {
+      trials,
+      rejectCounts,
+      firstNormalizeError,
+      options,
+    },
+  };
+}

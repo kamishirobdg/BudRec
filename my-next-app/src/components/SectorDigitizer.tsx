@@ -1,0 +1,171 @@
+"use client";
+
+import React, { useEffect, useMemo, useState } from "react";
+import type { Axial, Cell, PlanetType, SectorTileDef } from "../GAIA/sectorTypes";
+import { axialKey, coordsSector34543 } from "../GAIA/sectorLocal";
+
+const PLANETS: PlanetType[] = [
+  "EMPTY",
+  "BLUE",
+  "YELLOW",
+  "BROWN",
+  "RED",
+  "WHITE",
+  "ORANGE",
+  "SWAMP",
+  "TRANSDIM",
+  "TRANSDIM",
+];
+
+type Props = {
+  sectorId: string;
+  imageUrl: string;
+};
+
+function initCells(coords: Axial[]): Record<string, Cell> {
+  const init: Record<string, Cell> = {};
+  for (const p of coords) init[axialKey(p)] = { kind: "empty", tags: [] };
+  return init;
+}
+
+export default function SectorDigitizer({ sectorId, imageUrl }: Props) {
+  const coords = useMemo(() => coordsSector34543(), []);
+  const sortedCoords = useMemo(() => coords.slWHITE().sort((a, b) => (a.r !== b.r ? a.r - b.r : a.q - b.q)), [coords]);
+
+  const [cells, setCells] = useState<Record<string, Cell>>(() => initCells(coords));
+  const [selectedPlanet, setSelectedPlanet] = useState<PlanetType>("YELLOW");
+
+  // ★ sectorId が変わったら入力状態を初期化（運用事故防止）
+  useEffect(() => {
+    setCells(initCells(coords));
+    setSelectedPlanet("YELLOW");
+  }, [sectorId, coords]);
+
+  const sectorJson: SectorTileDef = useMemo(() => {
+    return {
+      id: sectorId,
+      radius: 2,
+      cells,
+    };
+  }, [sectorId, cells]);
+
+  function setPlanetAt(p: Axial) {
+    const k = axialKey(p);
+    setCells((prev) => {
+      const next = { ...prev };
+      if (selectedPlanet === "EMPTY") {
+        next[k] = { kind: "empty", tags: [] };
+      } else {
+        next[k] = {
+          kind: "planet",
+          planet: selectedPlanet as Exclude<PlanetType, "EMPTY">,
+          tags: [`planet:${selectedPlanet}`],
+        };
+      }
+      return next;
+    });
+  }
+
+  function clearAll() {
+    setCells(initCells(coords));
+  }
+
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "520px 1fr", gap: 16 }}>
+      <div style={{ border: "1px solid #ddd", borderRadius: 8, padding: 8 }}>
+        <div style={{ fontWeight: 600, marginBottom: 8 }}>
+          Sector Digitizer: {sectorId} (layout: 3-4-5-4-3)
+        </div>
+
+        <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 8 }}>
+          <label>Planet:</label>
+          <select
+            value={selectedPlanet}
+            onChange={(e) => setSelectedPlanet(e.target.value as PlanetType)}
+            style={{ padding: 6, borderRadius: 6, border: "1px solid #ccc" }}
+          >
+            {PLANETS.map((p) => (
+              <option key={p} value={p}>
+                {p}
+              </option>
+            ))}
+          </select>
+
+          <button
+            onClick={clearAll}
+            style={{
+              marginLeft: "auto",
+              border: "1px solid #ccc",
+              borderRadius: 8,
+              padding: "8px 10px",
+              background: "#fff",
+              cursor: "pointer",
+            }}
+          >
+            Clear
+          </button>
+        </div>
+
+        <div style={{ position: "relative", width: 500, height: 540, overflow: "hidden" }}>
+          <img
+            src={imageUrl}
+            alt={`sector-${sectorId}`}
+            style={{ width: "100%", height: "100%", objectFit: "contain", display: "block" }}
+          />
+        </div>
+
+        <div style={{ marginTop: 12 }}>
+          <div style={{ fontWeight: 600, marginBottom: 6 }}>Cells (click list)</div>
+
+          <div style={{ display: "grid", gap: 8 }}>
+            {[-2, -1, 0, 1, 2].map((r) => {
+              const row = sortedCoords.filter((p) => p.r === r);
+              return (
+                <div key={r} style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                  {row.map((p) => {
+                    const k = axialKey(p);
+                    const c = cells[k];
+                    const label = c.kind === "planet" ? c.planet : "EMPTY";
+                    return (
+                      <button
+                        key={k}
+                        onClick={() => setPlanetAt(p)}
+                        style={{
+                          border: "1px solid #ccc",
+                          borderRadius: 6,
+                          padding: "6px 8px",
+                          textAlign: "left",
+                          background: "#fff",
+                          minWidth: 92,
+                        }}
+                      >
+                        <div style={{ fontSize: 12, fontWeight: 600 }}>{k}</div>
+                        <div style={{ fontSize: 12, color: "#333" }}>{label}</div>
+                      </button>
+                    );
+                  })}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+
+      <div style={{ border: "1px solid #ddd", borderRadius: 8, padding: 12 }}>
+        <div style={{ fontWeight: 600, marginBottom: 8 }}>Export JSON</div>
+        <textarea
+          readOnly
+          value={JSON.stringify(sectorJson, null, 2)}
+          style={{
+            width: "100%",
+            height: "70vh",
+            fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+          }}
+        />
+        <div style={{ color: "#666", marginTop: 8 }}>
+          このJSONを sectorTiles_base.ts の BASE_SECTORS に追記してください。
+        </div>
+      </div>
+    </div>
+  );
+}

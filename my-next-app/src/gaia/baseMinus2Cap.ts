@@ -1,0 +1,51 @@
+// src/GAIA/baseMinus2Cap.ts
+import type { PlanetType } from "./sectorTypes";
+
+export type BaseByType = Partial<Record<PlanetType, Record<string, number>>>;
+
+export type BaseMinus2CapResult = {
+  ok: boolean;
+  minus2Counts: Partial<Record<PlanetType, number>>;
+  violatedTypes: PlanetType[];
+};
+
+export function checkBaseMinus2Cap(
+  baseByType: BaseByType,
+  cap: number | null | undefined
+): BaseMinus2CapResult {
+  if (cap === null || cap === undefined) {
+    return { ok: true, minus2Counts: {}, violatedTypes: [] };
+  }
+
+  const normalizedCap = Math.max(0, Math.floor(cap));
+
+  const minus2Counts: Partial<Record<PlanetType, number>> = {};
+  const violatedTypes: PlanetType[] = [];
+
+  (Object.keys(baseByType) as PlanetType[]).forEach((pt) => {
+    const perTile = baseByType[pt];
+    if (!perTile) return;
+
+    let c = 0;
+    for (const tileId of Object.keys(perTile)) {
+      if (perTile[tileId] === -2) c += 1;
+    }
+
+    if (c > 0) minus2Counts[pt] = c;
+    if (c > normalizedCap) violatedTypes.push(pt);
+  });
+
+  return { ok: violatedTypes.length === 0, minus2Counts, violatedTypes };
+}
+
+export function formatBaseMinus2CapViolation(
+  result: BaseMinus2CapResult,
+  cap: number
+): string {
+  if (result.ok) return "";
+  const parts = result.violatedTypes.map((pt) => {
+    const c = result.minus2Counts[pt] ?? 0;
+    return `${pt}: -2 が ${c}件（cap=${cap}）`;
+  });
+  return `Base(-2)件数が上限を超過しました: ${parts.join(", ")}`;
+}

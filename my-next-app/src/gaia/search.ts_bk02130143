@@ -1,0 +1,237 @@
+// src/gaia/search.ts
+//
+// SSOT search pipeline:
+// seed -> buildLogicalMap -> extractForEval -> checkHardConstraints -> evaluateSoft -> Top-K
+//
+// IMPORTANT (SSOT):
+// - Board 表示は UI 専用
+// - 評価は LogicalMap 基準
+// - UI 側で seed から再生成しないため、ranking 結果には placement を必ず含める
+//
+import type { SlotPlacement } from "./board/types";
+import { buildLogicalMap } from "./logicalMap/buildLogicalMap";
+import { extractForEval, type HardParams } from "./eval/extractForEval";
+import { checkHardConstraints, type HardFailReason } from "./constraints";
+import { evaluateSoft, type SoftParams, type SoftEvalResult } from "./eval/evaluateSoft";
+
+// DEBUG switches (temporary)
+// ★普段は必ず false
+const DEBUG_DUMP_ALL_KEYS = false; // dump all LogicalMap cell keys for the first seed and return immediately
+const DEBUG_DUMP_OUTER_AUDIT = false; // dump outerCells existence/kind for the first seed and return immediately
+
+export type SearchOptions = {
+  trials: number;
+  keepTop: number;
+  seedStart?: number; // 連番探索（未指定なら 1）
+  hard: HardParams;
+  soft: SoftParams;
+  yieldEvery?: number;
+};
+
+export type RankedResult = {
+  /** seed used to generate this candidate (informational / UI label) */
+  seed: number;
+
+  /** templateId that was actually used (normalized upstream) */
+  templateId: string;
+
+  /**
+   * SSOT: placement that was actually evaluated (UI MUST render from this, not by re-running placementFromSeed)
+   */
+  placement: SlotPlacement[];
+
+  score: number;
+  breakdown: SoftEvalResult["breakdown"];
+  audit: {
+    outerNormalCount: number;
+    touchNormalCount: number;
+  };
+  hardSnapshot: HardParams;
+  softSnapshot: SoftParams;
+};
+
+export type SearchDiagnostics = {
+  trials: number;
+  passedHard: number;
+  hardFailBy: Record<HardFailReason, number>;
+  options: SearchOptions;
+
+  // DEBUG
+  logicalMapAllKeys?: string[];
+  outerAudit?: Array<{
+    key: string;
+    exists: boolean;
+    kind?: string;
+    tags: string[];
+    planetType: string | null;
+  }>;
+};
+
+function pushTopK(best: RankedResult[], cand: RankedResult, keepTop: number) {
+  best.push(cand);
+  best.sort((a, b) => b.score - a.score || a.seed - b.seed);
+  if (best.length > keepTop) best.length = keepTop;
+}
+
+export async function runSearch(
+  templateId: string,
+  options: SearchOptions,
+  onProgress?: (done: number, best: RankedResult[]) => void
+): Promise<{ results: RankedResult[]; diagnostics: SearchDiagnostics }> {
+  const seed0 = options.seedStart ?? 1;
+  const yieldEvery = options.yieldEvery ?? 25;
+
+  const hardFailBy: Record<HardFailReason, number> = {
+    H1_MIN_SAME_COLOR_DIST: 0,
+    H2_OUTER_COLOR_CAP: 0,
+    H4_CENTER_LARGE_1_4: 0,
+    BUILD_LOGICAL_MAP_FAILED: 0,
+    EXTRACT_FAILED: 0,
+  } as any;
+
+  const best: RankedResult[] = [];
+  let passedHard = 0;
+
+  for (let i = 0; i < options.trials; i++) {
+    const seed = seed0 + i;
+
+    // 1) LogicalMap（内部で placementFromSeed を呼ぶ）
+    //    NOTE: UI 再生成を禁止するため、返却結果には logicalMap.placement を保持する。
+    let logicalMap: any;
+    try {
+      logicalMap = buildLogicalMap({ seed, templateId });
+    } catch {
+      hardFailBy.BUILD_LOGICAL_MAP_FAILED = (hardFailBy.BUILD_LOGICAL_MAP_FAILED ?? 0) + 1;
+      if (onProgress && i % yieldEvery === 0) onProgress(i + 1, best);
+      continue;
+    }
+
+    const placement: SlotPlacement[] = (logicalMap as any).placement ?? [];
+
+    // DEBUG: dump all keys (SSOT)
+    if (DEBUG_DUMP_ALL_KEYS) {
+      // cellsByKey は Map 前提
+      const allCellKeys = (logicalMap as any).cells
+        ? (logicalMap as any).cells.map((c: any) => c.key)
+        : Array.from((logicalMap as any).cellsByKey?.keys?.() ?? []);
+
+      console.log("=== LOGICALMAP ALL CELL KEYS ===", { seed, count: allCellKeys.length });
+
+      return {
+        results: [],
+        diagnostics: {
+          trials: options.trials,
+          passedHard,
+          hardFailBy,
+          options,
+          logicalMapAllKeys: allCellKeys,
+        },
+      };
+    }
+
+    // 2) Extract（評価SSOT生成）
+    let extracted: any;
+    try {
+      extracted = extractForEval(logicalMap, options.hard);
+    } catch {
+      hardFailBy.EXTRACT_FAILED = (hardFailBy.EXTRACT_FAILED ?? 0) + 1;
+      if (onProgress && i % yieldEvery === 0) onProgress(i + 1, best);
+      continue;
+    }
+
+    // DEBUG: outer audit (existence on LogicalMap)
+    if (DEBUG_DUMP_OUTER_AUDIT) {
+      const outerAudit: any[] = [];
+      const outerKeys = extracted.outerCells instanceof Set ? Array.from(extracted.outerCells) : extracted.outerCells ?? [];
+
+      for (const key of outerKeys) {
+        const cell = (logicalMap as any).cellsByKey?.get?.(key); // ★Map前提
+        outerAudit.push({
+          key,
+          exists: !!cell,
+          kind: cell?.kind,
+          tags: cell?.tags ?? [],
+          planetType: cell?.planetKind ?? null,
+        });
+      }
+
+      console.log("=== LOGICAL OUTER AUDIT ===", { seed, count: outerAudit.length });
+
+      return {
+        results: [],
+        diagnostics: {
+          trials: options.trials,
+          passedHard,
+          hardFailBy,
+          options,
+          outerAudit,
+        },
+      };
+    }
+
+    // 3) Hard
+    const hard = checkHardConstraints(extracted, placement, options.hard);
+    if (!hard.pass) {
+      for (const r of hard.reasons) {
+        hardFailBy[r.reason] = (hardFailBy[r.reason] ?? 0) + 1;
+      }
+      if (onProgress && i % yieldEvery === 0) onProgress(i + 1, best);
+      continue;
+    }
+
+    passedHard += 1;
+
+    // 4) Soft
+    const evaluation = evaluateSoft(extracted, options.soft);
+
+    const outerNormalCount =
+      (evaluation.breakdown as any)?.audit?.outerCountByType
+        ? Object.values((evaluation.breakdown as any).audit.outerCountByType).reduce((a: any, b: any) => (a as any) + (b as any), 0)
+        : 0;
+
+    const touchNormalCount =
+      (evaluation.breakdown as any)?.audit?.touchCountByType
+        ? Object.values((evaluation.breakdown as any).audit.touchCountByType).reduce((a: any, b: any) => (a as any) + (b as any), 0)
+        : 0;
+
+    pushTopK(
+      best,
+      {
+        seed,
+        templateId,
+        placement,
+        score: evaluation.score,
+        breakdown: evaluation.breakdown,
+        audit: { outerNormalCount, touchNormalCount },
+        hardSnapshot: options.hard,
+        softSnapshot: options.soft,
+      },
+      options.keepTop
+    );
+
+    // ★ keepTop=1 のとき、最初の1件で止める（breakdown確認用）
+    if (options.keepTop === 1 && best.length >= 1) {
+      return {
+        results: best,
+        diagnostics: {
+          trials: options.trials,
+          passedHard,
+          hardFailBy,
+          options,
+        },
+      };
+    }
+
+    if (onProgress && i % yieldEvery === 0) onProgress(i + 1, best);
+  }
+
+  return {
+    results: best,
+    diagnostics: {
+      trials: options.trials,
+      passedHard,
+      hardFailBy,
+      options,
+    },
+  };
+}

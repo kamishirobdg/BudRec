@@ -1,0 +1,170 @@
+// src/gaia/eval/evaluateSoft.ts
+import type { ExtractedForEval, PlanetKind } from "./extractForEval";
+import { axialDistance } from "../hex";
+
+export type SoftParams = {
+  wOuter: number;
+  wTouch: number;
+  wFavor: number;
+  wAvoid: number;
+  wDispersion: number;
+
+  // Scout
+  wScout: number;
+  scoutRadius: number; // 例: 2
+  scoutTargets: "NORMAL_PLANETS"; // 今は固定（将来拡張）
+
+  favorTargets: PlanetKind[];
+  avoidTargets: PlanetKind[];
+};
+
+export type DispersionByColor = {
+  color: string;
+  count: number;
+  centroidQ: number | null;
+  centroidR: number | null;
+  avgDistToCentroid: number | null;
+  varDistToCentroid: number | null;
+};
+
+export type SoftBreakdown = {
+  debug?: any;
+
+  dispersion: {
+    raw: number;
+    score: number;
+    byColor: DispersionByColor[];
+  };
+
+  scout: {
+    scoutCells: number;
+    radius: number;
+    withinRadiusCounts: Array<{ scoutKey: string; count: number }>;
+    raw: number;
+    score: number;
+  };
+
+  outerTouchPenalty: {
+    outerNormalCount: number;
+    touchNormalCount: number;
+    penaltyOuter: number;
+    penaltyTouch: number;
+    penaltyTotal: number;
+  };
+
+  favor: {
+    targets: PlanetKind[];
+    sumPoints: number;
+    score: number;
+  };
+
+  avoid: {
+    targets: PlanetKind[];
+    sumPoints: number;
+    score: number;
+  };
+};
+
+export type SoftEvalResult = {
+  score: number;
+  breakdown: SoftBreakdown;
+};
+
+export function evaluateSoft(extracted: ExtractedForEval, params: SoftParams): SoftEvalResult {
+  // --- Dispersion (centroid-based) ---
+  const dispersionByColor: DispersionByColor[] = [];
+  let dispersionRaw = 0;
+
+  for (const [color, arr] of Object.entries(extracted.normalPlanetsByColor)) {
+    const n = arr.length;
+    if (n === 0) {
+      dispersionByColor.push({ color, count: 0, centroidQ: null, centroidR: null, avgDistToCentroid: null, varDistToCentroid: null });
+      continue;
+    }
+
+    const cq = arr.reduce((s, c) => s + c.q, 0) / n;
+    const cr = arr.reduce((s, c) => s + c.r, 0) / n;
+
+    const dists = arr.map((c) => axialDistance(c.q, c.r, cq, cr));
+    const avg = dists.reduce((s, x) => s + x, 0) / n;
+    const variance = dists.reduce((s, x) => s + (x - avg) * (x - avg), 0) / n;
+
+    dispersionByColor.push({ color, count: n, centroidQ: cq, centroidR: cr, avgDistToCentroid: avg, varDistToCentroid: variance });
+    dispersionRaw += avg;
+  }
+
+  const dispersionScore = params.wDispersion * dispersionRaw;
+
+  // --- Scout (SSOT candidates: tags "scout:*") ---
+  // 現時点では“Scoutが近傍に通常惑星を持ちすぎる/少なすぎる”の正規仕様が未確定なので、
+  // まずは観測用に「radius以内の通常惑星数」を集計し、raw=合計、score= -wScout * raw とする。
+  // （必要なら後続で仕様確定後に置換）
+  const radius = params.scoutRadius;
+  const withinRadiusCounts: Array<{ scoutKey: string; count: number }> = [];
+  let scoutRaw = 0;
+
+  for (const s of extracted.scoutCells) {
+    let cnt = 0;
+    for (const p of extracted.normalPlanetCells) {
+      const d = axialDistance(s.q, s.r, p.q, p.r);
+      if (d <= radius) cnt += 1;
+    }
+    withinRadiusCounts.push({ scoutKey: s.key, count: cnt });
+    scoutRaw += cnt;
+  }
+
+  const scoutScore = -params.wScout * scoutRaw;
+
+  // --- Outer / Touch ---
+  const outerNormalCount = extracted.audit.outerNormalCount;
+  const touchNormalCount = extracted.audit.touchNormalCount;
+  const penaltyOuter = -params.wOuter * outerNormalCount;
+  const penaltyTouch = -params.wTouch * touchNormalCount;
+  const penaltyTotal = penaltyOuter + penaltyTouch;
+
+  // --- Favor / Avoid (points 未配線のため 0) ---
+  const favor = evalTargets(extracted, params.favorTargets, params.wFavor, +1);
+  const avoid = evalTargets(extracted, params.avoidTargets, params.wAvoid, -1);
+
+  const score = dispersionScore + scoutScore + penaltyTotal + favor.score + avoid.score;
+
+  return {
+    score,
+    breakdown: {
+      debug: extracted.audit,
+
+      dispersion: { raw: dispersionRaw, score: dispersionScore, byColor: dispersionByColor },
+
+      scout: {
+        scoutCells: extracted.scoutCells.length,
+        radius,
+        withinRadiusCounts,
+        raw: scoutRaw,
+        score: scoutScore,
+      },
+
+      outerTouchPenalty: { outerNormalCount, touchNormalCount, penaltyOuter, penaltyTouch, penaltyTotal },
+
+      favor,
+      avoid,
+    },
+  };
+}
+
+function evalTargets(
+  extracted: ExtractedForEval,
+  targets: PlanetKind[],
+  w: number,
+  sign: 1 | -1
+): { targets: PlanetKind[]; sumPoints: number; score: number } {
+  const set = new Set(targets);
+  let sum = 0;
+
+  for (const cell of extracted.planetCells) {
+    if (!cell.planetKind) continue;
+    if (!set.has(cell.planetKind)) continue;
+    sum += 0; // points 未配線
+  }
+
+  return { targets, sumPoints: sum, score: sign * w * sum };
+}

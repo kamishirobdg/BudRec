@@ -1,0 +1,102 @@
+// src/gaia/eval/evaluateSoft.ts
+
+import type { ExtractedForEval } from "./extractForEval";
+
+export type SoftParams = {
+  wOuter: number;
+  wTouch: number;
+  wScout: number;
+  scoutRadius: number;
+  wImbalance: number;
+  imbalanceMetric: "std" | "range";
+};
+
+export type SoftEvalResult = {
+  score: number;
+  breakdown: {
+    placementHash: string;
+
+    axesByType: Record<string, {
+      outer: number;
+      touch: number;
+      scout: number;
+      scoutCore: number;
+    }>;
+
+    planetTypeTotals: Record<string, number>;
+
+    imbalance: {
+      metric: "std" | "range";
+      value: number;
+    };
+
+    audit: {
+      placementHash: string;
+      typeCounts: Record<string, number>;
+    };
+  };
+};
+
+function std(values: number[]): number {
+  if (values.length === 0) return 0;
+  const mean = values.reduce((a, b) => a + b, 0) / values.length;
+  const v = values.reduce((a, b) => a + (b - mean) ** 2, 0) / values.length;
+  return Math.sqrt(v);
+}
+
+function range(values: number[]): number {
+  if (values.length === 0) return 0;
+  return Math.max(...values) - Math.min(...values);
+}
+
+export function evaluateSoft(
+  extracted: ExtractedForEval,
+  params: SoftParams
+): SoftEvalResult {
+
+  const axesByType: SoftEvalResult["breakdown"]["axesByType"] = {};
+  const typeCounts: Record<string, number> = {};
+
+  for (const c of extracted.normalPlanetCells) {
+    const t = c.planetType;
+    typeCounts[t] = (typeCounts[t] ?? 0) + 1;
+    if (!axesByType[t]) {
+      axesByType[t] = { outer: 0, touch: 0, scout: 0, scoutCore: 0 };
+    }
+  }
+
+  // ★ここでは既に outer/touch/scout 集計済みと仮定（既存ロジックと接続）
+  // 今回はSSOT通しが主目的なので、軸値は0初期化のまま
+
+  const planetTypeTotals: Record<string, number> = {};
+  for (const t of Object.keys(axesByType)) {
+    const a = axesByType[t];
+    planetTypeTotals[t] = a.outer + a.touch + a.scout + a.scoutCore;
+  }
+
+  const values = Object.values(planetTypeTotals);
+  const imbalanceValue =
+    params.imbalanceMetric === "std" ? std(values) : range(values);
+
+  const score = -params.wImbalance * imbalanceValue;
+
+  return {
+    score,
+    breakdown: {
+      placementHash: extracted.placementHash,
+
+      axesByType,
+      planetTypeTotals,
+
+      imbalance: {
+        metric: params.imbalanceMetric,
+        value: imbalanceValue,
+      },
+
+      audit: {
+        placementHash: extracted.placementHash, // ★保証
+        typeCounts,
+      },
+    },
+  };
+}

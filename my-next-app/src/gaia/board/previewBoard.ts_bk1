@@ -1,0 +1,184 @@
+// src/gaia/board/previewBoard.ts
+
+export type Axial = { q: number; r: number };
+
+export type SlotAccept = "LARGE" | "MIDDLE" | "SMALL";
+export type Slot = { slotId: string; pos: Axial; accepts: SlotAccept[] };
+
+type AnySector = any;
+
+export type PlacementItem = {
+  slotId: string;
+  sectorId: string;
+  rot: number; // 0..5
+};
+
+export type BoardCell = {
+  pos: Axial; // board absolute
+  kind: "planet" | "space" | "special";
+  planetType?: string;
+  tags: string[];
+  slotId: string;
+  sectorId: string;
+  /**
+   * Template-invariant origin (tile-local) coordinate key.
+   * - This is the raw key from sector.cells (before rotation/placement).
+   * - It remains stable even if the tile rotates or moves.
+   */
+  localKey?: string;
+};
+
+function parseKey(key: string): Axial {
+  const [q, r] = key.split(",").map((v) => Number(v));
+  return { q, r };
+}
+
+function fixSlotWorldPos(pos: Axial): Axial {
+  const shift = Math.floor(pos.r / 2);
+  return { q: pos.q - shift, r: pos.r };
+}
+
+function keyOf(p: Axial) {
+  return `${p.q},${p.r}`;
+}
+
+export function axialAdd(a: Axial, b: Axial): Axial {
+  return { q: a.q + b.q, r: a.r + b.r };
+}
+
+export function axialRotate(pos: Axial, rot: number): Axial {
+  // Axial(q,r) -> Cube(x,y,z): x=q, z=r, y=-x-z
+  let x = pos.q;
+  let z = pos.r;
+  let y = -x - z;
+
+  const r = ((rot % 6) + 6) % 6;
+  for (let i = 0; i < r; i++) {
+    // CCW +60: (x,y,z) -> (-z, -x, -y)
+    const nx = -z;
+    const ny = -x;
+    const nz = -y;
+    x = nx;
+    y = ny;
+    z = nz;
+  }
+  return { q: x, r: z };
+}
+
+export function buildSectorLookup(sectors: AnySector[]): Map<string, AnySector> {
+  const m = new Map<string, AnySector>();
+  for (const s of sectors) {
+    const id = (s?.sectorId ?? s?.id) as string | undefined;
+    if (!id) continue;
+    m.set(id, { ...s, sectorId: id });
+  }
+  return m;
+}
+
+
+function normalizeCell(raw: any): { kind: "planet" | "space" | "special"; planetType?: string; tags: string[] } {
+  const k = raw?.kind;
+  const tags = Array.isArray(raw?.tags) ? raw.tags : [];
+
+  if (k === "planet") {
+    const pt = (raw?.planetType ?? raw?.planet) as string | undefined;
+    return { kind: "planet", planetType: pt, tags };
+  }
+  if (k === "special") return { kind: "special", tags };
+  return { kind: "space", tags };
+}
+
+/**
+ * Base(LARGE)の座標補正（あなたの指定に一致）
+ * - 上から1行目/2行目はそのまま
+ * - 3行目/4行目は1つ左
+ * - 5行目は2つ左
+ *
+ * 一般化：radius=R のとき shift = floor((r + R)/2), q' = q - shift
+ *
+ * 適用条件：sector.radius を持つ（= base sectorTiles_base.ts）
+ */
+function fixBaseLocalCoord(sector: AnySector, local: Axial): Axial {
+  const R = typeof sector?.radius === "number" ? sector.radius : null;
+  if (R === null) return local;
+
+  const shift = Math.floor((local.r + R) / 2);
+  return { q: local.q - shift, r: local.r };
+}
+
+export function expandPlacementToBoardCells(args: {
+  slots: Slot[];
+  placement: PlacementItem[];
+  sectorById: Map<string, AnySector>;
+}): BoardCell[] {
+  const { slots, placement, sectorById } = args;
+  const slotById = new Map(slots.map((s) => [s.slotId, s]));
+
+  const out: BoardCell[] = [];
+
+  for (const p of placement) {
+    const slot = slotById.get(p.slotId);
+    const sector = sectorById.get(p.sectorId);
+    if (!slot || !sector) continue;
+
+    const cells = sector.cells ?? {};
+    for (const [k, rawCell] of Object.entries(cells)) {
+      const local0 = parseKey(k);
+
+      // ★ここが今回の修正：baseは行シフト補正してから回転へ
+      const local = fixBaseLocalCoord(sector, local0);
+
+      const rotated = axialRotate(local, p.rot);
+      const abs = axialAdd(slot.pos, rotated);
+      const norm = normalizeCell(rawCell);
+
+      out.push({
+        pos: abs,
+        kind: norm.kind,
+        planetType: norm.planetType,
+        tags: norm.tags,
+        slotId: p.slotId,
+        sectorId: p.sectorId,
+        localKey: k,
+      });
+    }
+  }
+
+  // プレビュー用：同一座標は後勝ち
+  const uniq = new Map<string, BoardCell>();
+  for (const c of out) uniq.set(keyOf(c.pos), c);
+  return [...uniq.values()];
+}
+
+/**
+ * Template調整用：slot種別に応じて sectorId を順番に割り当てる（rot=0固定）
+ * - LARGE / MIDDLE / SMALL の3プールを用意し、足りなければ循環
+ */
+export function makeCycledPlacement(args: {
+  slots: Slot[];
+  largeIds: string[];
+  middleIds: string[];
+  smallIds: string[];
+}): PlacementItem[] {
+  const { slots, largeIds, middleIds, smallIds } = args;
+
+  let iL = 0,
+    iM = 0,
+    iS = 0;
+
+  return slots.map((s) => {
+    const a0 = s.accepts[0];
+    let sectorId = "";
+    if (a0 === "LARGE") {
+      sectorId = largeIds[iL % Math.max(1, largeIds.length)] ?? "";
+      iL++;
+    } else if (a0 === "MIDDLE") {
+      sectorId = middleIds[iM % Math.max(1, middleIds.length)] ?? "";
+      iM++;
+    } else {
+      sectorId = smallIds[iS % Math.max(1, smallIds.length)] ?? "";
+      iS++;
+    }
+    return { slotId: s.slotId, sectorId, rot: 0 };
+  });
+}

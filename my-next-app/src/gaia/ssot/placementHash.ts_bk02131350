@@ -1,0 +1,52 @@
+// src/gaia/ssot/placementHash.ts
+//
+// placementHash SSOT
+// - placement(slotId, sectorId, rot, rot30) を正規化してハッシュ化
+// - 評価と表示が同一盤面かどうかを機械的に保証する
+//
+
+import type { SlotPlacement } from "../board/types";
+
+/**
+ * 安定ソート：
+ * slotId → sectorId → rot → rot30
+ */
+function normalizePlacement(p: SlotPlacement[]) {
+  return [...p]
+    .map((x: any) => ({
+      slotId: String(x.slotId),
+      sectorId: String(x.sectorId),
+      rot: Number(x.rot ?? 0),
+      rot30: Number(x.rot30 ?? 0),
+    }))
+    .sort((a, b) => {
+      if (a.slotId !== b.slotId) return a.slotId < b.slotId ? -1 : 1;
+      if (a.sectorId !== b.sectorId) return a.sectorId < b.sectorId ? -1 : 1;
+      if (a.rot !== b.rot) return a.rot - b.rot;
+      return a.rot30 - b.rot30;
+    });
+}
+
+/**
+ * 軽量・高速FNV-1aハッシュ（32bit）
+ */
+function fnv1a(str: string): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < str.length; i++) {
+    hash ^= str.charCodeAt(i);
+    hash +=
+      (hash << 1) +
+      (hash << 4) +
+      (hash << 7) +
+      (hash << 8) +
+      (hash << 24);
+  }
+  // unsigned 32bit hex
+  return ("00000000" + (hash >>> 0).toString(16)).slice(-8);
+}
+
+export function computePlacementHash(placement: SlotPlacement[]): string {
+  const normalized = normalizePlacement(placement);
+  const json = JSON.stringify(normalized);
+  return fnv1a(json);
+}

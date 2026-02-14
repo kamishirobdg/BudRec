@@ -1,0 +1,183 @@
+// src/gaia/board/previewBoard.ts
+//
+// Preview-time board expansion used by page.tsx SVG debug view.
+// IMPORTANT:
+// - template.slots[].pos in 3p_lostFleet.ts are authored in odd-r offset coords (col=q,row=r).
+//   We must convert them to axial before placement: axialQ = col - floor(row/2), axialR = row.
+// - Base large sectors (01-10) are also authored in odd-r offset local coords. Convert similarly BEFORE rotation.
+// - Lost Fleet sparse tiles (11a.. etc / 19.. / scouts) are authored in axial already (0,0),(1,0),(1,-1)... so NO conversion.
+
+export type Axial = { q: number; r: number };
+
+export type SlotAccept = "LARGE" | "MIDDLE" | "SMALL";
+export type Slot = { slotId: string; pos: Axial; accepts: SlotAccept[] };
+
+type AnySector = any;
+
+export type PlacementItem = {
+  slotId: string;
+  sectorId: string;
+  rot: number; // 0..5 (60deg steps, CW)
+};
+
+export type BoardCell = {
+  pos: Axial; // board absolute axial
+  kind: "planet" | "space" | "special";
+  planetType?: string;
+  tags: string[];
+  slotId: string;
+  sectorId: string;
+  localKey?: string; // raw key in sector.cells
+};
+
+// ---- helpers
+
+function parseKey(key: string): Axial {
+  const [q, r] = key.split(",").map((v) => Number(v));
+  return { q, r };
+}
+
+function keyOf(p: Axial) {
+  return `${p.q},${p.r}`;
+}
+
+export function axialAdd(a: Axial, b: Axial): Axial {
+  return { q: a.q + b.q, r: a.r + b.r };
+}
+
+/** odd-r offset(col,row) -> axial(q,r) (works with negative rows using Math.floor) */
+function oddrToAxial(pos: Axial): Axial {
+  return { q: pos.q - Math.floor(pos.r / 2), r: pos.r };
+}
+
+/** Rotate axial(q,r) by 60° steps CW using cube rotation. */
+function rotate60(ax: Axial, stepsCW: number): Axial {
+  let q = ax.q;
+  let r = ax.r;
+  const s = ((stepsCW % 6) + 6) % 6;
+
+  for (let i = 0; i < s; i++) {
+    const x = q;
+    const z = r;
+    const y = -x - z;
+
+    // cube CW: (x,y,z) -> (-z, -x, -y)
+    const nx = -z;
+    const ny = -x;
+    const nz = -y;
+
+    q = nx;
+    r = nz;
+  }
+  return { q, r };
+}
+
+function normalizeCell(raw: any): { kind: "planet" | "space" | "special"; planetType?: string; tags: string[] } {
+  const k = raw?.kind;
+  const tags = Array.isArray(raw?.tags) ? raw.tags : [];
+
+  if (k === "planet") {
+    const pt = (raw?.planetType ?? raw?.planet) as string | undefined;
+    return { kind: "planet", planetType: pt, tags };
+  }
+  if (k === "special") return { kind: "special", tags };
+  return { kind: "space", tags };
+}
+
+function isBaseSectorId(sectorId: string): boolean {
+  return /^(0[1-9]|10)$/.test(sectorId);
+}
+
+export function buildSectorLookup(sectors: AnySector[]): Map<string, AnySector> {
+  const m = new Map<string, AnySector>();
+  for (const s of sectors) {
+    const id = (s?.sectorId ?? s?.id) as string | undefined;
+    if (!id) continue;
+    m.set(id, { ...s, sectorId: id });
+  }
+  return m;
+}
+
+export function expandPlacementToBoardCells(args: {
+  slots: Slot[];
+  placement: PlacementItem[];
+  sectorById: Map<string, AnySector>;
+}): BoardCell[] {
+  const { slots, placement, sectorById } = args;
+  const slotById = new Map(slots.map((s) => [s.slotId, s]));
+
+  const out: BoardCell[] = [];
+
+  for (const p of placement) {
+    const slot = slotById.get(p.slotId);
+    const sector = sectorById.get(p.sectorId);
+    if (!slot || !sector) continue;
+
+    // slot.pos authored in odd-r offset => axial
+    const slotPos = oddrToAxial(slot.pos);
+
+    const sectorId = String((sector as any).sectorId ?? (sector as any).id ?? p.sectorId);
+    const baseLocal = isBaseSectorId(sectorId);
+
+    const cells: Record<string, any> = sector.cells ?? {};
+    const rot = Number(p.rot ?? 0);
+
+    for (const [k, rawCell] of Object.entries(cells)) {
+      const local0 = parseKey(k);
+
+      // base(01-10): local keys authored in odd-r offset => convert to axial before rotation
+      // LF tiles: already axial => no conversion
+      const localAx = baseLocal ? oddrToAxial(local0) : local0;
+
+      const rotated = rotate60(localAx, rot);
+      const abs = axialAdd(slotPos, rotated);
+      const norm = normalizeCell(rawCell);
+
+      out.push({
+        pos: abs,
+        kind: norm.kind,
+        planetType: norm.planetType,
+        tags: norm.tags,
+        slotId: p.slotId,
+        sectorId: p.sectorId,
+        localKey: k,
+      });
+    }
+  }
+
+  // preview: last write wins on duplicate coords
+  const uniq = new Map<string, BoardCell>();
+  for (const c of out) uniq.set(keyOf(c.pos), c);
+  return [...uniq.values()];
+}
+
+/**
+ * Template調整用：slot種別に応じて sectorId を順番に割り当てる（rot=0固定）
+ * - LARGE / MIDDLE / SMALL の3プールを用意し、足りなければ循環
+ */
+export function makeCycledPlacement(args: {
+  slots: Slot[];
+  largeIds: string[];
+  middleIds: string[];
+  smallIds: string[];
+}): PlacementItem[] {
+  const { slots, largeIds, middleIds, smallIds } = args;
+
+  let iL = 0, iM = 0, iS = 0;
+
+  return slots.map((s) => {
+    const a0 = s.accepts[0];
+    let sectorId = "";
+    if (a0 === "LARGE") {
+      sectorId = largeIds[iL % Math.max(1, largeIds.length)] ?? "";
+      iL++;
+    } else if (a0 === "MIDDLE") {
+      sectorId = middleIds[iM % Math.max(1, middleIds.length)] ?? "";
+      iM++;
+    } else {
+      sectorId = smallIds[iS % Math.max(1, smallIds.length)] ?? "";
+      iS++;
+    }
+    return { slotId: s.slotId, sectorId, rot: 0 };
+  });
+}
