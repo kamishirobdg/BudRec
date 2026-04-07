@@ -1,0 +1,2 @@
+-keep class com.kaunta.app.data.local.entity.** { *; }
+-keepclassmembers class * extends androidx.room.RoomDatabase { *; }
