@@ -18,6 +18,7 @@ import {
   removeCategory,
 } from '../services/CategoryService';
 import { signOut } from '../services/AuthService';
+import { getCurrentUser, setCurrentUser } from '../services/UserService';
 
 interface Props {
   onSignedOut: () => void;
@@ -28,18 +29,37 @@ export default function SettingsScreen({ onSignedOut }: Props) {
   const [input, setInput]           = useState('');
   const [loading, setLoading]       = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  const [userInput, setUserInput]   = useState<string>('');
+  const [savedUser, setSavedUser]   = useState<string>('');
 
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const list = await getCategories();
+      const [list, u] = await Promise.all([getCategories(), getCurrentUser()]);
       setCategories(list);
+      setUserInput(u);
+      setSavedUser(u);
     } catch (e) {
       Alert.alert('読み込み失敗', e instanceof Error ? e.message : String(e));
     } finally {
       setLoading(false);
     }
   }, []);
+
+  const handleSaveUser = async () => {
+    const name = userInput.trim();
+    if (!name) {
+      Alert.alert('入力エラー', 'ユーザー名を入力してください');
+      return;
+    }
+    try {
+      await setCurrentUser(name);
+      setSavedUser(name);
+      Alert.alert('保存しました', `ユーザー名: ${name}`);
+    } catch (e) {
+      Alert.alert('保存失敗', e instanceof Error ? e.message : String(e));
+    }
+  };
 
   useEffect(() => {
     load();
@@ -123,6 +143,21 @@ export default function SettingsScreen({ onSignedOut }: Props) {
 
   return (
     <SafeAreaView style={styles.container}>
+      <Text style={styles.title}>この端末のユーザー</Text>
+      <View style={styles.inputRow}>
+        <TextInput
+          style={styles.input}
+          value={userInput}
+          onChangeText={setUserInput}
+          placeholder="あなたの名前"
+        />
+        <Button
+          title="保存"
+          onPress={handleSaveUser}
+          disabled={!userInput.trim() || userInput.trim() === savedUser}
+        />
+      </View>
+
       <Text style={styles.title}>カテゴリ設定</Text>
 
       <View style={styles.inputRow}>

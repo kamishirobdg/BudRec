@@ -10,22 +10,37 @@ const SHEETS_API_BASE = 'https://sheets.googleapis.com/v4/spreadsheets';
 
 /** 1 行分の家計簿エントリ */
 export interface ExpenseRow {
-  timestamp: string; // ISO 8601 形式
-  source:    string; // 'receipt' | 'gmail' | 'suica' | 'manual' など
-  user:      string; // 夫 / 妻 など
-  store:     string;
-  category:  string;
-  amount:    number;
-  memo:      string;
+  timestamp:     string; // ISO 8601 形式
+  source:        string; // 'receipt' | 'gmail' | 'suica' | 'manual' など
+  user:          string; // 夫 / 妻 など
+  store:         string;
+  category:      string;
+  amount:        number;
+  memo:          string;
+  countedAmount: number;  // 集計に使う金額（通常は amount と同じ）
+  excluded:      boolean; // true なら集計対象外
+  rowIndex?:     number;  // シート上の行番号（1-based、ヘッダー=1）。getRows で付与
+  sheetName?:    string;  // 取得元シート名（YYYY-MM）。getRows で付与
 }
 
 /** ヘッダー行（新規シート作成時に書き込む） */
 const HEADER_ROW: readonly string[] = [
-  'timestamp', 'source', 'user', 'store', 'category', 'amount', 'memo',
+  'timestamp', 'source', 'user', 'store', 'category',
+  'amount', 'memo', 'counted_amount', 'excluded',
 ];
 
+/** 月次シートの列範囲 */
+const MONTH_RANGE = 'A:I';
+
 /** 設定シート名（先頭の _ で月別シートと区別） */
-const SETTINGS_SHEET = '_settings';
+const SETTINGS_SHEET           = '_settings';
+const CONFIG_SHEET              = '_config';
+const GMAIL_FILTERS_SHEET      = '_gmail_filters';
+const GMAIL_PROCESSED_SHEET    = '_gmail_processed';
+
+/** _config のキー */
+const CONFIG_KEY_DEFAULT_PARTIAL_AMOUNT = 'default_partial_amount';
+const DEFAULT_PARTIAL_AMOUNT = 1000;
 
 /** 初回作成時のデフォルトカテゴリ */
 const DEFAULT_CATEGORIES: readonly string[] = [
@@ -110,10 +125,12 @@ export async function appendRow(entry: ExpenseRow): Promise<void> {
     entry.category,
     entry.amount,
     entry.memo,
+    entry.countedAmount > 0 ? entry.countedAmount : entry.amount,
+    entry.excluded ? 'TRUE' : 'FALSE',
   ];
 
   await client.post(
-    `/values/${encodeURIComponent(sheetName)}!A:G:append`,
+    `/values/${encodeURIComponent(sheetName)}!${MONTH_RANGE}:append`,
     { values: [row] },
     {
       params: {
@@ -137,21 +154,120 @@ export async function getRows(yearMonth?: string): Promise<ExpenseRow[]> {
   if (!existing.includes(sheetName)) return [];
 
   const res = await client.get(
-    `/values/${encodeURIComponent(sheetName)}!A:G`,
+    `/values/${encodeURIComponent(sheetName)}!${MONTH_RANGE}`,
   );
 
   const values: string[][] = res.data.values ?? [];
   if (values.length <= 1) return []; // ヘッダーのみ / 空
 
-  return values.slice(1).map((row) => ({
-    timestamp: row[0] ?? '',
-    source:    row[1] ?? '',
-    user:      row[2] ?? '',
-    store:     row[3] ?? '',
-    category:  row[4] ?? '',
-    amount:    Number(row[5] ?? 0),
-    memo:      row[6] ?? '',
-  }));
+  return values.slice(1).map((row, i) => {
+    const amount = Number(row[5] ?? 0);
+    const countedRaw = row[7];
+    const counted = countedRaw === undefined || countedRaw === ''
+      ? amount
+      : Number(countedRaw);
+    const excludedRaw = (row[8] ?? '').toString().trim().toUpperCase();
+    return {
+      timestamp:     row[0] ?? '',
+      source:        row[1] ?? '',
+      user:          row[2] ?? '',
+      store:         row[3] ?? '',
+      category:      row[4] ?? '',
+      amount,
+      memo:          row[6] ?? '',
+      countedAmount: Number.isFinite(counted) ? counted : amount,
+      excluded:      excludedRaw === 'TRUE',
+      rowIndex:      i + 2, // ヘッダーが行1なので +2
+      sheetName,
+    };
+  });
+}
+
+/** 月次シートの一覧を新しい順に返す（'YYYY-MM' のみ、設定系シートは除外） */
+export async function listMonthSheetNames(): Promise<string[]> {
+  const client = await createClient();
+  const all = await listSheetNames(client);
+  return all
+    .filter((n) => /^\d{4}-\d{2}$/.test(n))
+    .sort((a, b) => (a < b ? 1 : -1));
+}
+
+/** 月次シートに含まれる年（YYYY）一覧を新しい順に返す */
+export async function listAvailableYears(): Promise<string[]> {
+  const months = await listMonthSheetNames();
+  const years  = new Set(months.map((m) => m.slice(0, 4)));
+  return [...years].sort((a, b) => (a < b ? 1 : -1));
+}
+
+/** 範囲指定 */
+export type RangeSpec =
+  | { type: 'month'; yearMonth: string }
+  | { type: 'year';  year:      string }
+  | { type: 'all' };
+
+/** 範囲に応じて行を取得する。複数シートをまたいだ場合も sheetName が各行に付く */
+export async function getRowsForRange(spec: RangeSpec): Promise<ExpenseRow[]> {
+  if (spec.type === 'month') {
+    return getRows(spec.yearMonth);
+  }
+  const months = await listMonthSheetNames();
+  const targets =
+    spec.type === 'year'
+      ? months.filter((m) => m.startsWith(`${spec.year}-`))
+      : months;
+  const results = await Promise.all(targets.map((m) => getRows(m)));
+  return results.flat();
+}
+
+/**
+ * 指定行の counted_amount / excluded を更新する。
+ * @param yearMonth シート名（例: '2026-04'）
+ * @param rowIndex  シート上の行番号（getRows が返した rowIndex）
+ */
+export async function updateRowFlags(
+  yearMonth: string,
+  rowIndex: number,
+  patch: { countedAmount: number; excluded: boolean },
+): Promise<void> {
+  const client = await createClient();
+  await client.put(
+    `/values/${encodeURIComponent(yearMonth)}!H${rowIndex}:I${rowIndex}`,
+    {
+      values: [[
+        patch.countedAmount,
+        patch.excluded ? 'TRUE' : 'FALSE',
+      ]],
+    },
+    { params: { valueInputOption: 'RAW' } },
+  );
+}
+
+/**
+ * 指定行の全項目（A:I）を上書きする。
+ * timestamp の月を変更しても行は元のシートのまま（移動しない）点に注意。
+ */
+export async function updateRow(
+  yearMonth: string,
+  rowIndex: number,
+  entry: ExpenseRow,
+): Promise<void> {
+  const client = await createClient();
+  const row: (string | number)[] = [
+    entry.timestamp,
+    entry.source,
+    entry.user,
+    entry.store,
+    entry.category,
+    entry.amount,
+    entry.memo,
+    entry.countedAmount > 0 ? entry.countedAmount : entry.amount,
+    entry.excluded ? 'TRUE' : 'FALSE',
+  ];
+  await client.put(
+    `/values/${encodeURIComponent(yearMonth)}!A${rowIndex}:I${rowIndex}`,
+    { values: [row] },
+    { params: { valueInputOption: 'USER_ENTERED' } },
+  );
 }
 
 // ─── カテゴリ管理 ─────────────────────────────────────────────────────────────
@@ -234,5 +350,144 @@ export async function removeCategory(name: string): Promise<void> {
       ],
     },
     { params: { valueInputOption: 'RAW' } },
+  );
+}
+
+// ─── 設定値 (_config シート) ─────────────────────────────────────────────────
+
+/** _config シートが無ければ作成しデフォルト値を書き込む */
+async function ensureConfigSheet(client: AxiosInstance): Promise<void> {
+  const existing = await listSheetNames(client);
+  if (existing.includes(CONFIG_SHEET)) return;
+
+  await client.post(':batchUpdate', {
+    requests: [{ addSheet: { properties: { title: CONFIG_SHEET } } }],
+  });
+  await client.put(
+    `/values/${encodeURIComponent(CONFIG_SHEET)}!A1`,
+    {
+      values: [
+        ['key', 'value'],
+        [CONFIG_KEY_DEFAULT_PARTIAL_AMOUNT, DEFAULT_PARTIAL_AMOUNT],
+      ],
+    },
+    { params: { valueInputOption: 'RAW' } },
+  );
+}
+
+/** _config から key/value マップを読み出す */
+async function readConfig(client: AxiosInstance): Promise<Map<string, string>> {
+  await ensureConfigSheet(client);
+  const res = await client.get(
+    `/values/${encodeURIComponent(CONFIG_SHEET)}!A:B`,
+  );
+  const values: string[][] = res.data.values ?? [];
+  const map = new Map<string, string>();
+  for (const r of values.slice(1)) {
+    const k = (r[0] ?? '').trim();
+    if (k) map.set(k, (r[1] ?? '').toString());
+  }
+  return map;
+}
+
+/** 一部計上のデフォルト金額を取得（未設定なら 1000） */
+export async function getDefaultPartialAmount(): Promise<number> {
+  const client = await createClient();
+  const cfg = await readConfig(client);
+  const v = Number(cfg.get(CONFIG_KEY_DEFAULT_PARTIAL_AMOUNT));
+  return Number.isFinite(v) && v > 0 ? v : DEFAULT_PARTIAL_AMOUNT;
+}
+
+// ─── Gmail フィルター / 取り込み履歴 ──────────────────────────────────────────
+
+export interface GmailFilter {
+  from:    string;
+  subject: string;
+}
+
+/** _gmail_filters シートが無ければヘッダーのみ作成する */
+async function ensureGmailFiltersSheet(client: AxiosInstance): Promise<void> {
+  const existing = await listSheetNames(client);
+  if (existing.includes(GMAIL_FILTERS_SHEET)) return;
+
+  await client.post(':batchUpdate', {
+    requests: [{ addSheet: { properties: { title: GMAIL_FILTERS_SHEET } } }],
+  });
+  await client.put(
+    `/values/${encodeURIComponent(GMAIL_FILTERS_SHEET)}!A1`,
+    { values: [['from', 'subject']] },
+    { params: { valueInputOption: 'RAW' } },
+  );
+}
+
+/** _gmail_processed シートが無ければヘッダーのみ作成する */
+async function ensureGmailProcessedSheet(client: AxiosInstance): Promise<void> {
+  const existing = await listSheetNames(client);
+  if (existing.includes(GMAIL_PROCESSED_SHEET)) return;
+
+  await client.post(':batchUpdate', {
+    requests: [{ addSheet: { properties: { title: GMAIL_PROCESSED_SHEET } } }],
+  });
+  await client.put(
+    `/values/${encodeURIComponent(GMAIL_PROCESSED_SHEET)}!A1`,
+    { values: [['message_id', 'processed_at', 'result']] },
+    { params: { valueInputOption: 'RAW' } },
+  );
+}
+
+/** Gmail フィルター一覧を取得（空の行は除外）。シートが無ければ作成して空配列を返す */
+export async function getGmailFilters(): Promise<GmailFilter[]> {
+  const client = await createClient();
+  await ensureGmailFiltersSheet(client);
+
+  const res = await client.get(
+    `/values/${encodeURIComponent(GMAIL_FILTERS_SHEET)}!A:B`,
+  );
+  const values: string[][] = res.data.values ?? [];
+  return values
+    .slice(1)
+    .map((r) => ({ from: (r[0] ?? '').trim(), subject: (r[1] ?? '').trim() }))
+    .filter((f) => f.from.length > 0 || f.subject.length > 0);
+}
+
+/**
+ * 取り込み済みメッセージID集合を取得（重複防止用）。
+ * `error:` で記録された行は次回再試行できるよう除外する。
+ */
+export async function getProcessedGmailIds(): Promise<Set<string>> {
+  const client = await createClient();
+  await ensureGmailProcessedSheet(client);
+
+  const res = await client.get(
+    `/values/${encodeURIComponent(GMAIL_PROCESSED_SHEET)}!A:C`,
+  );
+  const values: string[][] = res.data.values ?? [];
+  return new Set(
+    values
+      .slice(1)
+      .filter((r) => !(r[2] ?? '').startsWith('error'))
+      .map((r) => r[0] ?? '')
+      .filter((id) => id.length > 0),
+  );
+}
+
+/** 取り込み履歴に1件追記する */
+export async function markGmailMessageProcessed(
+  messageId: string,
+  result: string,
+): Promise<void> {
+  const client = await createClient();
+  await ensureGmailProcessedSheet(client);
+
+  const now = new Date().toISOString();
+  await client.post(
+    `/values/${encodeURIComponent(GMAIL_PROCESSED_SHEET)}!A:C:append`,
+    { values: [[messageId, now, result]] },
+    {
+      params: {
+        valueInputOption: 'RAW',
+        insertDataOption: 'INSERT_ROWS',
+      },
+    },
   );
 }

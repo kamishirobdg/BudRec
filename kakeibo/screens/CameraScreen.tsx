@@ -14,10 +14,8 @@ import {
 } from 'expo-camera';
 import { getCategories } from '../services/CategoryService';
 import { appendRow, ExpenseRow } from '../services/SheetsService';
+import { getCurrentUser } from '../services/UserService';
 import { getProvider } from '../providers';
-
-// TODO: 設定画面でユーザー（夫/妻）を切り替えられるようにする
-const DEFAULT_USER = '夫';
 
 export default function CameraScreen() {
   const [permission, requestPermission] = useCameraPermissions();
@@ -64,14 +62,17 @@ export default function CameraScreen() {
 
       setStatusMsg('スプレッドシートに書き込み中...');
       const timestamp = formatTimestamp(data.date);
+      const user = await getCurrentUser();
       const row: ExpenseRow = {
         timestamp,
-        source:   'camera',
-        user:     DEFAULT_USER,
-        store:    data.store,
-        category: data.category,
-        amount:   data.amount,
-        memo:     summarizeItems(data.items),
+        source:        'camera',
+        user,
+        store:         data.store,
+        category:      data.category,
+        amount:        data.amount,
+        memo:          summarizeItems(data.items),
+        countedAmount: data.amount,
+        excluded:      false,
       };
       await appendRow(row);
 

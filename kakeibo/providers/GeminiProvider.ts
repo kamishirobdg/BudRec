@@ -3,6 +3,7 @@ import {
   AIProvider,
   ReceiptData,
   buildReceiptPrompt,
+  buildEmailPrompt,
   parseReceiptResponse,
 } from './AIProvider';
 
@@ -21,54 +22,55 @@ export const geminiProvider: AIProvider = {
   name: 'gemini',
 
   async extractReceipt(imageBase64: string, categories: string[]): Promise<ReceiptData> {
-    if (!GEMINI_API_KEY || GEMINI_API_KEY.startsWith('YOUR_')) {
-      throw new Error('GEMINI_API_KEY が未設定です');
-    }
-
     const prompt = buildReceiptPrompt(categories);
+    const parts = [
+      { text: prompt },
+      { inline_data: { mime_type: 'image/jpeg', data: imageBase64 } },
+    ];
+    return callGemini(parts);
+  },
 
-    try {
-      const res = await axios.post(
-        GEMINI_ENDPOINT,
-        {
-          contents: [
-            {
-              parts: [
-                { text: prompt },
-                {
-                  inline_data: {
-                    mime_type: 'image/jpeg',
-                    data: imageBase64,
-                  },
-                },
-              ],
-            },
-          ],
-          generationConfig: {
-            temperature:      0.1,
-            responseMimeType: 'application/json',
-          },
-        },
-        {
-          params: { key: GEMINI_API_KEY },
-          headers: { 'Content-Type': 'application/json' },
-        },
-      );
-
-      const text: string = res.data?.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
-      if (!text) throw new Error('Gemini から空の応答が返されました');
-
-      return parseReceiptResponse(text);
-    } catch (e: any) {
-      // Gemini API のエラー詳細を可視化
-      if (e?.response) {
-        console.error('[Gemini] HTTP', e.response.status, JSON.stringify(e.response.data));
-        const apiMsg = e.response.data?.error?.message;
-        if (apiMsg) {
-          throw new Error(`Gemini API ${e.response.status}: ${apiMsg}`);
-        }
-      }
-      throw e;
-    }
+  async extractEmail(emailText: string, categories: string[]): Promise<ReceiptData> {
+    const prompt = buildEmailPrompt(categories);
+    const parts = [{ text: `${prompt}\n\n--- メール本文 ---\n${emailText}` }];
+    return callGemini(parts);
   },
 };
+
+/** Gemini API 呼び出し共通処理。parts はモデルに渡すコンテンツ配列。 */
+async function callGemini(parts: object[]): Promise<ReceiptData> {
+  if (!GEMINI_API_KEY || GEMINI_API_KEY.startsWith('YOUR_')) {
+    throw new Error('GEMINI_API_KEY が未設定です');
+  }
+
+  try {
+    const res = await axios.post(
+      GEMINI_ENDPOINT,
+      {
+        contents: [{ parts }],
+        generationConfig: {
+          temperature:      0.1,
+          responseMimeType: 'application/json',
+        },
+      },
+      {
+        params: { key: GEMINI_API_KEY },
+        headers: { 'Content-Type': 'application/json' },
+      },
+    );
+
+    const text: string = res.data?.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
+    if (!text) throw new Error('Gemini から空の応答が返されました');
+
+    return parseReceiptResponse(text);
+  } catch (e: any) {
+    if (e?.response) {
+      console.error('[Gemini] HTTP', e.response.status, JSON.stringify(e.response.data));
+      const apiMsg = e.response.data?.error?.message;
+      if (apiMsg) {
+        throw new Error(`Gemini API ${e.response.status}: ${apiMsg}`);
+      }
+    }
+    throw e;
+  }
+}

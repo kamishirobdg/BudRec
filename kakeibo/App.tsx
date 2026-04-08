@@ -1,19 +1,23 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, Alert, View } from 'react-native';
 import { NavigationContainer } from '@react-navigation/native';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { StatusBar } from 'expo-status-bar';
+import { Ionicons } from '@expo/vector-icons';
 import HomeScreen from './screens/HomeScreen';
 import CameraScreen from './screens/CameraScreen';
-import SettingsScreen from './screens/SettingsScreen';
+import SummaryScreen from './screens/SummaryScreen';
 import { handleAuthCallback, isSignedIn } from './services/AuthService';
+import { runGmailImport } from './services/GmailService';
 
 const Tab = createBottomTabNavigator();
 
 export default function App() {
   const [signedIn, setSignedIn] = useState(false);
   const [checking, setChecking] = useState(true);
+  // Gmail 取り込みをセッション中に1回だけ走らせるためのフラグ
+  const gmailImportedRef = useRef(false);
 
   useEffect(() => {
     (async () => {
@@ -28,6 +32,15 @@ export default function App() {
       setChecking(false);
     })();
   }, []);
+
+  // サインイン後、バックグラウンドで Gmail 取り込みを1度だけ走らせる
+  // （UI ブロック・通知無し、エラーは GmailService 内で console.error に出る）
+  useEffect(() => {
+    if (signedIn && !gmailImportedRef.current) {
+      gmailImportedRef.current = true;
+      runGmailImport();
+    }
+  }, [signedIn]);
 
   return (
     <SafeAreaProvider>
@@ -47,15 +60,25 @@ export default function App() {
           >
             <Tab.Screen
               name="Camera"
-              options={{ title: '撮影' }}
+              options={{
+                title: '撮影',
+                tabBarIcon: ({ color, size }) => (
+                  <Ionicons name="camera" color={color} size={size} />
+                ),
+              }}
             >
               {() => <CameraScreen />}
             </Tab.Screen>
             <Tab.Screen
-              name="Settings"
-              options={{ title: '設定' }}
+              name="Summary"
+              options={{
+                title: '一覧',
+                tabBarIcon: ({ color, size }) => (
+                  <Ionicons name="list" color={color} size={size} />
+                ),
+              }}
             >
-              {() => <SettingsScreen onSignedOut={() => setSignedIn(false)} />}
+              {() => <SummaryScreen onSignedOut={() => setSignedIn(false)} />}
             </Tab.Screen>
           </Tab.Navigator>
         </NavigationContainer>
