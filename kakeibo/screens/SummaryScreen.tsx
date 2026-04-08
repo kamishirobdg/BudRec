@@ -29,6 +29,8 @@ import {
 } from '../services/SheetsService';
 import { getCurrentUser } from '../services/UserService';
 import SettingsScreen from './SettingsScreen';
+import PersonalModal from './PersonalModal';
+import MemoText from './MemoText';
 
 interface Props {
   onSignedOut: () => void;
@@ -53,18 +55,27 @@ export default function SummaryScreen({ onSignedOut }: Props) {
   const [rangeKey, setRangeKey]         = useState<string>(() => `month:${getSheetNameFromDate()}`);
   const [pickerOpen, setPickerOpen]     = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [personalOpen, setPersonalOpen] = useState(false);
   const [editTarget, setEditTarget]     = useState<ExpenseRow | null>(null);
 
-  // ヘッダー右に設定ボタンを置く
+  // ヘッダー右に「個人」「設定」ボタンを置く
   useLayoutEffect(() => {
     navigation.setOptions({
       headerRight: () => (
-        <TouchableOpacity
-          onPress={() => setSettingsOpen(true)}
-          style={{ paddingHorizontal: 16, paddingVertical: 4 }}
-        >
-          <Text style={{ fontSize: 20 }}>⚙</Text>
-        </TouchableOpacity>
+        <View style={{ flexDirection: 'row', alignItems: 'center', paddingRight: 8 }}>
+          <TouchableOpacity
+            onPress={() => setPersonalOpen(true)}
+            style={{ paddingHorizontal: 12, paddingVertical: 4 }}
+          >
+            <Text style={{ fontSize: 14, color: '#2563eb', fontWeight: 'bold' }}>個人</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            onPress={() => setSettingsOpen(true)}
+            style={{ paddingHorizontal: 8, paddingVertical: 4 }}
+          >
+            <Text style={{ fontSize: 20 }}>⚙</Text>
+          </TouchableOpacity>
+        </View>
       ),
     });
   }, [navigation]);
@@ -277,16 +288,11 @@ export default function SummaryScreen({ onSignedOut }: Props) {
         </Text>
         {!!item.memo && (
           <TouchableOpacity onPress={() => toggleExpanded(key)} activeOpacity={0.6}>
-            <Text
+            <MemoText
+              memo={item.memo}
               style={[styles.entryMemo, struck]}
               numberOfLines={isExpanded ? undefined : 2}
-            >
-              {item.memo
-                .split(',')
-                .map((s) => s.trim())
-                .filter((s) => s.length > 0)
-                .join('\n')}
-            </Text>
+            />
           </TouchableOpacity>
         )}
 
@@ -392,6 +398,11 @@ export default function SummaryScreen({ onSignedOut }: Props) {
         target={editTarget}
         onClose={() => setEditTarget(null)}
         onSave={handleSaveEdit}
+      />
+
+      <PersonalModal
+        visible={personalOpen}
+        onClose={() => setPersonalOpen(false)}
       />
     </SafeAreaView>
   );
