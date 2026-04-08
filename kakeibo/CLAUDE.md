@@ -15,8 +15,8 @@ app/screens / providers / services / utils
 ## 開発ステップ
 1. プロジェクト作成 + Google OAuth ✓
 2. Google Sheets API接続 ✓
-3. AIProvider実装（Gemini→Claude→OpenAI） ← 今ここ（Geminiのみ実装済み、未テスト）
-4. カメラ + レシート撮影
-5. Gmail連携
+3. AIProvider実装（Gemini→Claude→OpenAI） ✓ Geminiのみ実装
+4. カメラ + レシート撮影 ✓
+5. Gmail連携 ← 次
 6. SuicaCSVインポート
 7. 可視化画面

@@ -17,24 +17,21 @@ import {
   refresh as refreshCategories,
   removeCategory,
 } from '../services/CategoryService';
-import { isSignedIn } from '../services/AuthService';
+import { signOut } from '../services/AuthService';
 
-export default function SettingsScreen() {
+interface Props {
+  onSignedOut: () => void;
+}
+
+export default function SettingsScreen({ onSignedOut }: Props) {
   const [categories, setCategories] = useState<string[]>([]);
   const [input, setInput]           = useState('');
   const [loading, setLoading]       = useState(false);
   const [refreshing, setRefreshing] = useState(false);
-  const [signedIn, setSignedIn]     = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const ok = await isSignedIn();
-      setSignedIn(ok);
-      if (!ok) {
-        setCategories([]);
-        return;
-      }
       const list = await getCategories();
       setCategories(list);
     } catch (e) {
@@ -102,16 +99,27 @@ export default function SettingsScreen() {
     }
   };
 
-  if (!signedIn) {
-    return (
-      <SafeAreaView style={styles.center}>
-        <Text style={styles.notice}>
-          先に Home タブで Google サインインしてください。
-        </Text>
-        <Button title="再読み込み" onPress={load} />
-      </SafeAreaView>
+  const handleSignOut = () => {
+    Alert.alert(
+      'サインアウト確認',
+      'Googleからサインアウトしますか？',
+      [
+        { text: 'キャンセル', style: 'cancel' },
+        {
+          text: 'サインアウト',
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              await signOut();
+              onSignedOut();
+            } catch (e) {
+              Alert.alert('サインアウト失敗', e instanceof Error ? e.message : String(e));
+            }
+          },
+        },
+      ],
     );
-  }
+  };
 
   return (
     <SafeAreaView style={styles.container}>
@@ -152,6 +160,10 @@ export default function SettingsScreen() {
           </Text>
         }
       />
+
+      <View style={styles.signOutBox}>
+        <Button title="サインアウト" onPress={handleSignOut} color="#888" />
+      </View>
     </SafeAreaView>
   );
 }
@@ -215,9 +227,10 @@ const styles = StyleSheet.create({
     color: '#888',
     marginTop: 24,
   },
-  notice: {
-    textAlign: 'center',
-    fontSize: 14,
-    color: '#666',
+  signOutBox: {
+    marginTop: 16,
+    paddingVertical: 12,
+    borderTopWidth: 1,
+    borderTopColor: '#eee',
   },
 });
