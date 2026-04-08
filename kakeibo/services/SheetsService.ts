@@ -64,6 +64,39 @@ async function createClient(): Promise<AxiosInstance> {
   });
 }
 
+// ─── 内部: timestamp ユーティリティ ──────────────────────────────────────────
+
+/**
+ * Sheets のシリアル日付（1899-12-30 起算の日数）を 'YYYY/MM/DD HH:MM:SS' に変換。
+ * 既存データが USER_ENTERED で書かれて数値化されてしまった行を、読み出し時に
+ * 人間可読な文字列へ戻すために使う。
+ */
+function serialToTimestamp(serial: number): string {
+  const baseUtcMs = Date.UTC(1899, 11, 30);
+  const d = new Date(baseUtcMs + serial * 86400000);
+  const yyyy = d.getUTCFullYear();
+  const mm = pad2(d.getUTCMonth() + 1);
+  const dd = pad2(d.getUTCDate());
+  const hh = pad2(d.getUTCHours());
+  const mi = pad2(d.getUTCMinutes());
+  const ss = pad2(d.getUTCSeconds());
+  return `${yyyy}/${mm}/${dd} ${hh}:${mi}:${ss}`;
+}
+
+function pad2(n: number): string {
+  return String(n).padStart(2, '0');
+}
+
+/** タイムスタンプ列の値を文字列形式に正規化（数値文字列はシリアルとして変換） */
+function normalizeTimestamp(raw: string): string {
+  if (!raw) return '';
+  if (/^-?\d+(\.\d+)?$/.test(raw)) {
+    const n = Number(raw);
+    if (Number.isFinite(n) && n > 0) return serialToTimestamp(n);
+  }
+  return raw;
+}
+
 // ─── 内部: シート名ユーティリティ ────────────────────────────────────────────
 
 /** 年月からシート名を生成（例: 2026-04） */
@@ -134,7 +167,7 @@ export async function appendRow(entry: ExpenseRow): Promise<void> {
     { values: [row] },
     {
       params: {
-        valueInputOption:    'USER_ENTERED',
+        valueInputOption:    'RAW',
         insertDataOption:    'INSERT_ROWS',
       },
     },
@@ -168,7 +201,7 @@ export async function getRows(yearMonth?: string): Promise<ExpenseRow[]> {
       : Number(countedRaw);
     const excludedRaw = (row[8] ?? '').toString().trim().toUpperCase();
     return {
-      timestamp:     row[0] ?? '',
+      timestamp:     normalizeTimestamp(row[0] ?? ''),
       source:        row[1] ?? '',
       user:          row[2] ?? '',
       store:         row[3] ?? '',
@@ -266,7 +299,7 @@ export async function updateRow(
   await client.put(
     `/values/${encodeURIComponent(yearMonth)}!A${rowIndex}:I${rowIndex}`,
     { values: [row] },
-    { params: { valueInputOption: 'USER_ENTERED' } },
+    { params: { valueInputOption: 'RAW' } },
   );
 }
 

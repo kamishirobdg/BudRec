@@ -1,7 +1,8 @@
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
+  Animated,
   Button,
   StyleSheet,
   Text,
@@ -22,7 +23,27 @@ export default function CameraScreen() {
   const [facing] = useState<CameraType>('back');
   const [busy, setBusy]       = useState(false);
   const [statusMsg, setStatusMsg] = useState<string>('');
+  const [toast, setToast]     = useState<string>('');
+  const toastOpacity          = useRef(new Animated.Value(0)).current;
   const cameraRef = useRef<CameraView>(null);
+
+  // toast の表示・自動消滅
+  useEffect(() => {
+    if (!toast) return;
+    Animated.timing(toastOpacity, {
+      toValue: 1,
+      duration: 200,
+      useNativeDriver: true,
+    }).start();
+    const timer = setTimeout(() => {
+      Animated.timing(toastOpacity, {
+        toValue: 0,
+        duration: 300,
+        useNativeDriver: true,
+      }).start(() => setToast(''));
+    }, 3000);
+    return () => clearTimeout(timer);
+  }, [toast, toastOpacity]);
 
   if (!permission) {
     return (
@@ -61,7 +82,7 @@ export default function CameraScreen() {
       const data = await provider.extractReceipt(photo.base64, categories);
 
       setStatusMsg('スプレッドシートに書き込み中...');
-      const timestamp = formatTimestamp(data.date);
+      const timestamp = formatTimestamp(data.date, data.time);
       const user = await getCurrentUser();
       const row: ExpenseRow = {
         timestamp,
@@ -77,9 +98,8 @@ export default function CameraScreen() {
       await appendRow(row);
 
       setStatusMsg('');
-      Alert.alert(
-        '記録しました',
-        `${data.store}\n¥${data.amount.toLocaleString()} / ${data.category}\n${timestamp}`,
+      setToast(
+        `記録しました\n${data.store}  ¥${data.amount.toLocaleString()}\n${data.category} · ${timestamp}`,
       );
     } catch (e) {
       setStatusMsg('');
@@ -109,19 +129,37 @@ export default function CameraScreen() {
           <Button title="撮影して記録" onPress={handleShoot} />
         )}
       </View>
+
+      {!!toast && (
+        <Animated.View
+          pointerEvents="none"
+          style={[styles.toast, { opacity: toastOpacity }]}
+        >
+          <Text style={styles.toastText}>{toast}</Text>
+        </Animated.View>
+      )}
     </View>
   );
 }
 
-/** レシート日付（YYYY-MM-DD）+ 現在時刻で timestamp を組み立てる */
-function formatTimestamp(receiptDate: string): string {
-  const now  = new Date();
-  const time = `${pad(now.getHours())}:${pad(now.getMinutes())}`;
-  // OCR が日付を取れなかった場合は今日の日付にフォールバック
-  const date = /^\d{4}-\d{2}-\d{2}$/.test(receiptDate)
-    ? receiptDate
-    : `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
-  return `${date} ${time}`;
+/**
+ * レシートから抽出した日付・時刻で 'YYYY/MM/DD HH:MM:SS' 形式の timestamp を作る。
+ * 日付・時刻のいずれかが取れなかった場合は撮影時の値で補完する。
+ * 秒は OCR から取れないので 00 固定。
+ */
+function formatTimestamp(receiptDate: string, receiptTime?: string): string {
+  const now = new Date();
+  const datePart = /^\d{4}-\d{2}-\d{2}$/.test(receiptDate)
+    ? receiptDate.replace(/-/g, '/')
+    : `${now.getFullYear()}/${pad(now.getMonth() + 1)}/${pad(now.getDate())}`;
+  let timePart: string;
+  if (receiptTime && /^\d{1,2}:\d{2}(:\d{2})?$/.test(receiptTime)) {
+    const [h, m, s] = receiptTime.split(':');
+    timePart = `${pad(Number(h))}:${pad(Number(m))}:${pad(Number(s ?? 0))}`;
+  } else {
+    timePart = `${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
+  }
+  return `${datePart} ${timePart}`;
 }
 
 function pad(n: number): string {
@@ -173,5 +211,27 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     fontSize:  14,
     color:     '#666',
+  },
+  toast: {
+    position: 'absolute',
+    top:      48,
+    left:     16,
+    right:    16,
+    backgroundColor: 'rgba(34,197,94,0.95)',
+    borderRadius:    12,
+    paddingHorizontal: 20,
+    paddingVertical:   16,
+    shadowColor:    '#000',
+    shadowOpacity:  0.3,
+    shadowRadius:   8,
+    shadowOffset:   { width: 0, height: 4 },
+    elevation:      8,
+  },
+  toastText: {
+    color:      '#fff',
+    fontSize:   16,
+    fontWeight: 'bold',
+    textAlign:  'center',
+    lineHeight: 22,
   },
 });

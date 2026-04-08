@@ -281,7 +281,11 @@ export default function SummaryScreen({ onSignedOut }: Props) {
               style={[styles.entryMemo, struck]}
               numberOfLines={isExpanded ? undefined : 2}
             >
-              {item.memo}
+              {item.memo
+                .split(',')
+                .map((s) => s.trim())
+                .filter((s) => s.length > 0)
+                .join('\n')}
             </Text>
           </TouchableOpacity>
         )}

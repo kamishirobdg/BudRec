@@ -46,8 +46,9 @@ interface GmailMessageRef {
 }
 
 interface GmailMessage {
-  id:      string;
-  payload: GmailPayload;
+  id:           string;
+  internalDate?: string; // Unix ms（文字列）
+  payload:      GmailPayload;
 }
 
 interface GmailPayload {
@@ -116,7 +117,7 @@ export async function runGmailImport(): Promise<void> {
             .join(',')
             .slice(0, 500);
 
-          const timestamp = formatTimestamp(data.date);
+          const timestamp = formatGmailTimestamp(message.internalDate);
           const row: ExpenseRow = {
             timestamp,
             source:        SOURCE_LABEL,
@@ -241,13 +242,11 @@ function stripHtml(html: string): string {
 
 // ─── 内部: timestamp ─────────────────────────────────────────────────────────
 
-function formatTimestamp(dateStr: string): string {
-  const now  = new Date();
-  const time = `${pad(now.getHours())}:${pad(now.getMinutes())}`;
-  const date = /^\d{4}-\d{2}-\d{2}$/.test(dateStr)
-    ? dateStr
-    : `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
-  return `${date} ${time}`;
+/** Gmail の internalDate (Unix ms 文字列) から 'YYYY/MM/DD HH:MM:SS' を組み立てる */
+function formatGmailTimestamp(internalDate?: string): string {
+  const ms = Number(internalDate ?? '0');
+  const d = Number.isFinite(ms) && ms > 0 ? new Date(ms) : new Date();
+  return `${d.getFullYear()}/${pad(d.getMonth() + 1)}/${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
 function pad(n: number): string {

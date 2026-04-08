@@ -12,7 +12,8 @@ export interface ReceiptData {
   store:    string;
   amount:   number;
   category: string;       // categories から選ばれた値（または「その他」）
-  date:     string;       // YYYY-MM-DD
+  date:     string;       // YYYY-MM-DD（取得できなければ空文字）
+  time?:    string;       // HH:MM（取得できなければ undefined / 空文字）
   items?:   ReceiptItem[];
   raw:      string;       // モデルの生レスポンス（デバッグ用）
 }
@@ -43,7 +44,8 @@ export function buildReceiptPrompt(categories: string[]): string {
 抽出する項目:
 - store: 店名
 - amount: 合計金額（数値、円記号やカンマ無し）
-- date: 日付（YYYY-MM-DD 形式）
+- date: 日付（YYYY-MM-DD 形式）。レシートに無ければ空文字。
+- time: 時刻（HH:MM 形式、24時間表記）。レシートに無ければ空文字。
 - category: 以下のリストから最も適切な1つを選ぶ。該当が無ければ「その他」。
 - items: 購入品の配列（任意、{name, price} の形式）
 
@@ -51,7 +53,7 @@ export function buildReceiptPrompt(categories: string[]): string {
 ${list}
 
 出力例:
-{"store":"セブンイレブン","amount":1280,"date":"2026-04-07","category":"食費","items":[{"name":"おにぎり","price":150}]}`;
+{"store":"セブンイレブン","amount":1280,"date":"2026-04-07","time":"18:42","category":"食費","items":[{"name":"おにぎり","price":150}]}`;
 }
 
 /** メール本文用プロンプト（取引でない場合は amount=0 を返させる） */
@@ -101,6 +103,7 @@ export function parseReceiptResponse(raw: string, fallbackCategory = 'その他'
     amount:   Number(parsed.amount ?? 0),
     category: String(parsed.category ?? fallbackCategory),
     date:     String(parsed.date ?? ''),
+    time:     parsed.time ? String(parsed.time) : undefined,
     items:    Array.isArray(parsed.items) ? parsed.items : undefined,
     raw,
   };
