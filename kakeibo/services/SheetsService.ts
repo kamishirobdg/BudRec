@@ -19,6 +19,7 @@ export interface ExpenseRow {
   memo:          string;
   countedAmount: number;  // 集計に使う金額（通常は amount と同じ）
   excluded:      boolean; // true なら集計対象外
+  confirmed:     boolean; // 重複警告を確認済みとしてマーク
   rowIndex?:     number;  // シート上の行番号（1-based、ヘッダー=1）。getRows で付与
   sheetName?:    string;  // 取得元シート名（YYYY-MM）。getRows で付与
 }
@@ -26,11 +27,11 @@ export interface ExpenseRow {
 /** ヘッダー行（新規シート作成時に書き込む） */
 const HEADER_ROW: readonly string[] = [
   'timestamp', 'source', 'user', 'store', 'category',
-  'amount', 'memo', 'counted_amount', 'excluded',
+  'amount', 'memo', 'counted_amount', 'excluded', 'confirmed',
 ];
 
 /** 月次シートの列範囲 */
-const MONTH_RANGE = 'A:I';
+const MONTH_RANGE = 'A:J';
 
 /** 設定シート名（先頭の _ で月別シートと区別） */
 const SETTINGS_SHEET           = '_settings';
@@ -160,6 +161,7 @@ export async function appendRow(entry: ExpenseRow): Promise<void> {
     entry.memo,
     entry.countedAmount > 0 ? entry.countedAmount : entry.amount,
     entry.excluded ? 'TRUE' : 'FALSE',
+    entry.confirmed ? 'TRUE' : 'FALSE',
   ];
 
   await client.post(
@@ -199,7 +201,8 @@ export async function getRows(yearMonth?: string): Promise<ExpenseRow[]> {
     const counted = countedRaw === undefined || countedRaw === ''
       ? amount
       : Number(countedRaw);
-    const excludedRaw = (row[8] ?? '').toString().trim().toUpperCase();
+    const excludedRaw  = (row[8] ?? '').toString().trim().toUpperCase();
+    const confirmedRaw = (row[9] ?? '').toString().trim().toUpperCase();
     return {
       timestamp:     normalizeTimestamp(row[0] ?? ''),
       source:        row[1] ?? '',
@@ -210,6 +213,7 @@ export async function getRows(yearMonth?: string): Promise<ExpenseRow[]> {
       memo:          row[6] ?? '',
       countedAmount: Number.isFinite(counted) ? counted : amount,
       excluded:      excludedRaw === 'TRUE',
+      confirmed:     confirmedRaw === 'TRUE',
       rowIndex:      i + 2, // ヘッダーが行1なので +2
       sheetName,
     };
@@ -253,22 +257,23 @@ export async function getRowsForRange(spec: RangeSpec): Promise<ExpenseRow[]> {
 }
 
 /**
- * 指定行の counted_amount / excluded を更新する。
+ * 指定行の counted_amount / excluded / confirmed を更新する。
  * @param yearMonth シート名（例: '2026-04'）
  * @param rowIndex  シート上の行番号（getRows が返した rowIndex）
  */
 export async function updateRowFlags(
   yearMonth: string,
   rowIndex: number,
-  patch: { countedAmount: number; excluded: boolean },
+  patch: { countedAmount: number; excluded: boolean; confirmed: boolean },
 ): Promise<void> {
   const client = await createClient();
   await client.put(
-    `/values/${encodeURIComponent(yearMonth)}!H${rowIndex}:I${rowIndex}`,
+    `/values/${encodeURIComponent(yearMonth)}!H${rowIndex}:J${rowIndex}`,
     {
       values: [[
         patch.countedAmount,
         patch.excluded ? 'TRUE' : 'FALSE',
+        patch.confirmed ? 'TRUE' : 'FALSE',
       ]],
     },
     { params: { valueInputOption: 'RAW' } },
@@ -295,9 +300,10 @@ export async function updateRow(
     entry.memo,
     entry.countedAmount > 0 ? entry.countedAmount : entry.amount,
     entry.excluded ? 'TRUE' : 'FALSE',
+    entry.confirmed ? 'TRUE' : 'FALSE',
   ];
   await client.put(
-    `/values/${encodeURIComponent(yearMonth)}!A${rowIndex}:I${rowIndex}`,
+    `/values/${encodeURIComponent(yearMonth)}!A${rowIndex}:J${rowIndex}`,
     { values: [row] },
     { params: { valueInputOption: 'RAW' } },
   );

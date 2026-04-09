@@ -94,6 +94,7 @@ export default function CameraScreen() {
         memo:          summarizeItems(data.items),
         countedAmount: data.amount,
         excluded:      false,
+        confirmed:     false,
       };
       await appendRow(row);
 

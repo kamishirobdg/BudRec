@@ -128,6 +128,7 @@ export async function runGmailImport(): Promise<void> {
             memo,
             countedAmount: data.amount,
             excluded:      false,
+            confirmed:     false,
           };
           await appendRow(row);
           await markGmailMessageProcessed(ref.id, 'ok');

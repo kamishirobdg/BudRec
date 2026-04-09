@@ -28,6 +28,8 @@ import {
   updateRowFlags,
 } from '../services/SheetsService';
 import { getCurrentUser } from '../services/UserService';
+import { detectDuplicateWarnings } from '../services/DuplicateDetector';
+import { SortKey, getSortKey, setSortKey } from '../services/PreferencesService';
 import SettingsScreen from './SettingsScreen';
 import PersonalModal from './PersonalModal';
 import MemoText from './MemoText';
@@ -57,6 +59,19 @@ export default function SummaryScreen({ onSignedOut }: Props) {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [personalOpen, setPersonalOpen] = useState(false);
   const [editTarget, setEditTarget]     = useState<ExpenseRow | null>(null);
+  const [sortKey, setSortKeyState]      = useState<SortKey>('timestamp');
+  const [sortPickerOpen, setSortPickerOpen] = useState(false);
+
+  // ソートキーを Storage から復元
+  useEffect(() => {
+    getSortKey().then(setSortKeyState);
+  }, []);
+
+  const changeSort = (k: SortKey) => {
+    setSortKeyState(k);
+    setSortPickerOpen(false);
+    setSortKey(k);
+  };
 
   // ヘッダー右に「個人」「設定」ボタンを置く
   useLayoutEffect(() => {
@@ -120,7 +135,6 @@ export default function SummaryScreen({ onSignedOut }: Props) {
         getDefaultPartialAmount(),
         getCurrentUser(),
       ]);
-      list.sort((a, b) => (a.timestamp < b.timestamp ? 1 : -1));
       setRows(list);
       setDefaultPartial(partial);
       setCurrentUserState(user);
@@ -148,14 +162,13 @@ export default function SummaryScreen({ onSignedOut }: Props) {
   /** 行をローカルで更新しつつスプレッドシートにも反映 */
   const persistRow = async (
     row: ExpenseRow,
-    next: { countedAmount: number; excluded: boolean },
+    next: { countedAmount: number; excluded: boolean; confirmed: boolean },
   ) => {
     if (row.rowIndex === undefined || !row.sheetName) return;
-    const key = `${row.sheetName}:${row.rowIndex}`;
     setRows((prev) =>
       prev.map((r) =>
         r.sheetName === row.sheetName && r.rowIndex === row.rowIndex
-          ? { ...r, countedAmount: next.countedAmount, excluded: next.excluded }
+          ? { ...r, ...next }
           : r,
       ),
     );
@@ -165,13 +178,13 @@ export default function SummaryScreen({ onSignedOut }: Props) {
       Alert.alert('更新失敗', e instanceof Error ? e.message : String(e));
       loadRows(currentRange);
     }
-    void key;
   };
 
   const toggleExcluded = (row: ExpenseRow) => {
     persistRow(row, {
       countedAmount: row.countedAmount,
       excluded:      !row.excluded,
+      confirmed:     row.confirmed,
     });
   };
 
@@ -180,13 +193,22 @@ export default function SummaryScreen({ onSignedOut }: Props) {
     persistRow(row, {
       countedAmount: isPartial ? row.amount : defaultPartial,
       excluded:      row.excluded,
+      confirmed:     row.confirmed,
+    });
+  };
+
+  const toggleConfirmed = (row: ExpenseRow) => {
+    persistRow(row, {
+      countedAmount: row.countedAmount,
+      excluded:      row.excluded,
+      confirmed:     !row.confirmed,
     });
   };
 
   const commitPartialAmount = (row: ExpenseRow, text: string) => {
     const n = Number(text.replace(/[^\d]/g, ''));
     if (!Number.isFinite(n) || n <= 0) return;
-    persistRow(row, { countedAmount: n, excluded: row.excluded });
+    persistRow(row, { countedAmount: n, excluded: row.excluded, confirmed: row.confirmed });
   };
 
   const toggleExpanded = (key: string) => {
@@ -199,10 +221,20 @@ export default function SummaryScreen({ onSignedOut }: Props) {
   };
 
   // ─── 集計対象（自分の行のみ） ───
-  const myRows = useMemo(
-    () => rows.filter((r) => r.user === currentUser),
-    [rows, currentUser],
-  );
+  const myRows = useMemo(() => {
+    const filtered = rows.filter((r) => r.user === currentUser);
+    const sorted = [...filtered];
+    if (sortKey === 'timestamp') {
+      sorted.sort((a, b) => (a.timestamp < b.timestamp ? 1 : -1));
+    } else if (sortKey === 'amount') {
+      sorted.sort((a, b) => b.amount - a.amount);
+    } else if (sortKey === 'category') {
+      sorted.sort((a, b) => (a.category || '').localeCompare(b.category || ''));
+    }
+    return sorted;
+  }, [rows, currentUser, sortKey]);
+
+  const warningKeys = useMemo(() => detectDuplicateWarnings(myRows), [myRows]);
 
   const summary = useMemo(() => {
     const byUser     = new Map<string, number>();
@@ -231,6 +263,13 @@ export default function SummaryScreen({ onSignedOut }: Props) {
           onPress={() => setPickerOpen(true)}
         >
           <Text style={styles.rangeButtonText}>{currentRangeLabel} ▾</Text>
+        </TouchableOpacity>
+        <Text style={[styles.rangeLabel, { marginLeft: 8 }]}>並び</Text>
+        <TouchableOpacity
+          style={styles.rangeButton}
+          onPress={() => setSortPickerOpen(true)}
+        >
+          <Text style={styles.rangeButtonText}>{sortLabel(sortKey)} ▾</Text>
         </TouchableOpacity>
       </View>
 
@@ -271,9 +310,10 @@ export default function SummaryScreen({ onSignedOut }: Props) {
     const struck = item.excluded ? styles.struck : undefined;
     const key = `${item.sheetName ?? ''}:${item.rowIndex ?? ''}`;
     const isExpanded = expanded.has(key);
+    const isWarned = warningKeys.has(key);
 
     return (
-      <View style={[styles.entry, item.excluded && styles.entryExcluded]}>
+      <View style={[styles.entry, item.excluded && styles.entryExcluded, isWarned && styles.entryWarned]}>
         <View style={styles.entryHeader}>
           <Text style={[styles.entryDate, struck]}>{item.timestamp}</Text>
           <Text style={[styles.entryAmount, struck]}>
@@ -311,6 +351,13 @@ export default function SummaryScreen({ onSignedOut }: Props) {
             <PartialAmountInput
               value={item.countedAmount}
               onCommit={(t) => commitPartialAmount(item, t)}
+            />
+          )}
+          {isWarned && (
+            <Checkbox
+              label="確認済み"
+              checked={item.confirmed}
+              onPress={() => toggleConfirmed(item)}
             />
           )}
           <TouchableOpacity
@@ -373,6 +420,13 @@ export default function SummaryScreen({ onSignedOut }: Props) {
           setPickerOpen(false);
         }}
         onClose={() => setPickerOpen(false)}
+      />
+
+      <SortPickerModal
+        visible={sortPickerOpen}
+        selected={sortKey}
+        onSelect={changeSort}
+        onClose={() => setSortPickerOpen(false)}
       />
 
       <Modal
@@ -591,6 +645,59 @@ function Field({
   );
 }
 
+function sortLabel(k: SortKey): string {
+  if (k === 'timestamp') return '日時';
+  if (k === 'amount') return '金額';
+  return 'カテゴリ';
+}
+
+function SortPickerModal({
+  visible,
+  selected,
+  onSelect,
+  onClose,
+}: {
+  visible:  boolean;
+  selected: SortKey;
+  onSelect: (key: SortKey) => void;
+  onClose:  () => void;
+}) {
+  const items: SortKey[] = ['timestamp', 'amount', 'category'];
+  return (
+    <Modal
+      visible={visible}
+      transparent
+      animationType="fade"
+      onRequestClose={onClose}
+    >
+      <Pressable style={styles.modalBackdrop} onPress={onClose}>
+        <Pressable style={styles.modalSheet} onPress={(e) => e.stopPropagation()}>
+          <Text style={styles.modalTitle}>並び順を選択</Text>
+          {items.map((k) => (
+            <TouchableOpacity
+              key={k}
+              style={[
+                styles.modalItem,
+                k === selected && styles.modalItemSelected,
+              ]}
+              onPress={() => onSelect(k)}
+            >
+              <Text
+                style={[
+                  styles.modalItemText,
+                  k === selected && styles.modalItemTextSelected,
+                ]}
+              >
+                {sortLabel(k)}
+              </Text>
+            </TouchableOpacity>
+          ))}
+        </Pressable>
+      </Pressable>
+    </Modal>
+  );
+}
+
 function RangePickerModal({
   visible,
   options,
@@ -684,6 +791,7 @@ const styles = StyleSheet.create({
     borderBottomColor: '#eee',
   },
   entryExcluded: { backgroundColor: '#fafafa' },
+  entryWarned:   { backgroundColor: '#ffedd5' },
   entryHeader:   { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
   entryDate:     { fontSize: 12, color: '#666' },
   entryAmount:   { fontSize: 16, fontWeight: 'bold' },
