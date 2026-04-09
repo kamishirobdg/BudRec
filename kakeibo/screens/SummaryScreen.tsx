@@ -26,6 +26,7 @@ import {
   listMonthSheetNames,
   updateRow,
   updateRowFlags,
+  updateRecurringFlag,
 } from '../services/SheetsService';
 import { getCurrentUser } from '../services/UserService';
 import { detectDuplicateWarnings } from '../services/DuplicateDetector';
@@ -205,6 +206,24 @@ export default function SummaryScreen({ onSignedOut }: Props) {
     });
   };
 
+  const toggleRecurring = async (row: ExpenseRow) => {
+    if (row.rowIndex === undefined || !row.sheetName) return;
+    const next = !row.recurring;
+    setRows((prev) =>
+      prev.map((r) =>
+        r.sheetName === row.sheetName && r.rowIndex === row.rowIndex
+          ? { ...r, recurring: next }
+          : r,
+      ),
+    );
+    try {
+      await updateRecurringFlag(row.sheetName, row.rowIndex, next);
+    } catch (e) {
+      Alert.alert('更新失敗', e instanceof Error ? e.message : String(e));
+      loadRows(currentRange);
+    }
+  };
+
   const commitPartialAmount = (row: ExpenseRow, text: string) => {
     const n = Number(text.replace(/[^\d]/g, ''));
     if (!Number.isFinite(n) || n <= 0) return;
@@ -360,6 +379,11 @@ export default function SummaryScreen({ onSignedOut }: Props) {
               onPress={() => toggleConfirmed(item)}
             />
           )}
+          <Checkbox
+            label="固定費"
+            checked={item.recurring}
+            onPress={() => toggleRecurring(item)}
+          />
           <TouchableOpacity
             style={styles.editBtn}
             onPress={() => setEditTarget(item)}

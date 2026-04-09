@@ -6,6 +6,7 @@ import {
   Button,
   StyleSheet,
   Text,
+  TouchableOpacity,
   View,
 } from 'react-native';
 import {
@@ -13,19 +14,37 @@ import {
   CameraType,
   useCameraPermissions,
 } from 'expo-camera';
+import * as ImagePicker from 'expo-image-picker';
+import * as Notifications from 'expo-notifications';
 import { getCategories } from '../services/CategoryService';
 import { appendRow, ExpenseRow } from '../services/SheetsService';
 import { getCurrentUser } from '../services/UserService';
 import { getProvider } from '../providers';
 
+// 通知チャンネルの設定（Android）
+Notifications.setNotificationHandler({
+  handleNotification: async () => ({
+    shouldShowAlert:  false,
+    shouldShowBanner: false,
+    shouldShowList:   false,
+    shouldPlaySound:  false,
+    shouldSetBadge:   false,
+  }),
+});
+
 export default function CameraScreen() {
   const [permission, requestPermission] = useCameraPermissions();
   const [facing] = useState<CameraType>('back');
-  const [busy, setBusy]       = useState(false);
+  const [busy, setBusy]           = useState(false);
   const [statusMsg, setStatusMsg] = useState<string>('');
-  const [toast, setToast]     = useState<string>('');
-  const toastOpacity          = useRef(new Animated.Value(0)).current;
-  const cameraRef = useRef<CameraView>(null);
+  const [toast, setToast]         = useState<string>('');
+  const toastOpacity              = useRef(new Animated.Value(0)).current;
+  const cameraRef                 = useRef<CameraView>(null);
+
+  // 通知権限を起動時にリクエスト（通知なしでも動作するので静かに）
+  useEffect(() => {
+    Notifications.requestPermissionsAsync().catch(() => {});
+  }, []);
 
   // toast の表示・自動消滅
   useEffect(() => {
@@ -62,24 +81,29 @@ export default function CameraScreen() {
     );
   }
 
-  const handleShoot = async () => {
-    if (!cameraRef.current || busy) return;
-    setBusy(true);
-    setStatusMsg('撮影中...');
+  /** base64 画像を OCR → Sheets 書き込みする共通フロー */
+  const processBase64 = async (base64: string) => {
+    // バックグラウンド移行対策：処理中はフォアグラウンドサービス通知を表示
+    let notifId: string | undefined;
+    try {
+      notifId = await Notifications.scheduleNotificationAsync({
+        content: {
+          title: 'Bud-Rec',
+          body: 'レシートを解析中...',
+          // @ts-ignore Android sticky
+          sticky: true,
+        },
+        trigger: null,
+      });
+    } catch {
+      // 通知権限なしでも処理は続行
+    }
 
     try {
-      const photo = await cameraRef.current.takePictureAsync({
-        base64:  true,
-        quality: 0.6,
-        skipProcessing: true,
-        shutterSound: false,
-      });
-      if (!photo?.base64) throw new Error('画像の取得に失敗しました');
-
       setStatusMsg('OCR解析中...');
       const categories = await getCategories();
       const provider   = getProvider();
-      const data = await provider.extractReceipt(photo.base64, categories);
+      const data = await provider.extractReceipt(base64, categories);
 
       setStatusMsg('スプレッドシートに書き込み中...');
       const timestamp = formatTimestamp(data.date, data.time);
@@ -95,6 +119,7 @@ export default function CameraScreen() {
         countedAmount: data.amount,
         excluded:      false,
         confirmed:     false,
+        recurring:     false,
       };
       await appendRow(row);
 
@@ -102,6 +127,52 @@ export default function CameraScreen() {
       setToast(
         `記録しました\n${data.store}  ¥${data.amount.toLocaleString()}\n${data.category} · ${timestamp}`,
       );
+    } finally {
+      if (notifId) {
+        Notifications.dismissNotificationAsync(notifId).catch(() => {});
+      }
+    }
+  };
+
+  const handleShoot = async () => {
+    if (!cameraRef.current || busy) return;
+    setBusy(true);
+    setStatusMsg('撮影中...');
+
+    try {
+      const photo = await cameraRef.current.takePictureAsync({
+        base64:  true,
+        quality: 0.6,
+        skipProcessing: true,
+        shutterSound: false,
+      });
+      if (!photo?.base64) throw new Error('画像の取得に失敗しました');
+      await processBase64(photo.base64);
+    } catch (e) {
+      setStatusMsg('');
+      const msg = e instanceof Error ? e.message : String(e);
+      Alert.alert('失敗', msg);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handlePickImage = async () => {
+    if (busy) return;
+
+    const result = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ['images'],
+      base64: true,
+      quality: 0.8,
+      allowsMultipleSelection: false,
+    });
+
+    if (result.canceled || !result.assets[0]?.base64) return;
+
+    setBusy(true);
+    setStatusMsg('画像を読み込み中...');
+    try {
+      await processBase64(result.assets[0].base64);
     } catch (e) {
       setStatusMsg('');
       const msg = e instanceof Error ? e.message : String(e);
@@ -127,7 +198,14 @@ export default function CameraScreen() {
             <Text style={styles.statusText}>{statusMsg}</Text>
           </View>
         ) : (
-          <Button title="撮影して記録" onPress={handleShoot} />
+          <View style={styles.buttonRow}>
+            <TouchableOpacity style={styles.shootBtn} onPress={handleShoot}>
+              <Text style={styles.shootBtnText}>撮影して記録</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={styles.galleryBtn} onPress={handlePickImage}>
+              <Text style={styles.galleryBtnText}>ギャラリーから選択</Text>
+            </TouchableOpacity>
+          </View>
         )}
       </View>
 
@@ -145,8 +223,6 @@ export default function CameraScreen() {
 
 /**
  * レシートから抽出した日付・時刻で 'YYYY/MM/DD HH:MM:SS' 形式の timestamp を作る。
- * 日付・時刻のいずれかが取れなかった場合は撮影時の値で補完する。
- * 秒は OCR から取れないので 00 固定。
  */
 function formatTimestamp(receiptDate: string, receiptTime?: string): string {
   const now = new Date();
@@ -198,6 +274,33 @@ const styles = StyleSheet.create({
   },
   statusText: {
     color:    '#fff',
+    fontSize: 14,
+  },
+  buttonRow: {
+    alignItems: 'center',
+    gap: 12,
+  },
+  shootBtn: {
+    backgroundColor: '#2563eb',
+    paddingHorizontal: 32,
+    paddingVertical: 14,
+    borderRadius: 10,
+  },
+  shootBtnText: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: 'bold',
+  },
+  galleryBtn: {
+    backgroundColor: 'rgba(0,0,0,0.55)',
+    paddingHorizontal: 24,
+    paddingVertical: 10,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.4)',
+  },
+  galleryBtnText: {
+    color: '#fff',
     fontSize: 14,
   },
   center: {

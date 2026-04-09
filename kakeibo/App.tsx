@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, Alert, View } from 'react-native';
+import { ActivityIndicator, Alert, AppState, View } from 'react-native';
 import { NavigationContainer } from '@react-navigation/native';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
@@ -16,8 +16,8 @@ const Tab = createBottomTabNavigator();
 export default function App() {
   const [signedIn, setSignedIn] = useState(false);
   const [checking, setChecking] = useState(true);
-  // Gmail 取り込みをセッション中に1回だけ走らせるためのフラグ
-  const gmailImportedRef = useRef(false);
+  // Gmail 取り込みの最終実行時刻（ms）。5分以内の重複実行を防ぐ
+  const lastGmailRunRef = useRef(0);
 
   useEffect(() => {
     (async () => {
@@ -33,13 +33,29 @@ export default function App() {
     })();
   }, []);
 
-  // サインイン後、バックグラウンドで Gmail 取り込みを1度だけ走らせる
-  // （UI ブロック・通知無し、エラーは GmailService 内で console.error に出る）
+  /** 5分以上経過していれば Gmail 取り込みを実行 */
+  const maybeRunGmailImport = () => {
+    const COOLDOWN_MS = 5 * 60 * 1000;
+    const now = Date.now();
+    if (now - lastGmailRunRef.current < COOLDOWN_MS) return;
+    lastGmailRunRef.current = now;
+    runGmailImport();
+  };
+
+  // サインイン直後に実行
   useEffect(() => {
-    if (signedIn && !gmailImportedRef.current) {
-      gmailImportedRef.current = true;
-      runGmailImport();
-    }
+    if (signedIn) maybeRunGmailImport();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [signedIn]);
+
+  // フォアグラウンド復帰時にも実行
+  useEffect(() => {
+    if (!signedIn) return;
+    const sub = AppState.addEventListener('change', (state) => {
+      if (state === 'active') maybeRunGmailImport();
+    });
+    return () => sub.remove();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [signedIn]);
 
   return (

@@ -20,6 +20,7 @@ export interface ExpenseRow {
   countedAmount: number;  // 集計に使う金額（通常は amount と同じ）
   excluded:      boolean; // true なら集計対象外
   confirmed:     boolean; // 重複警告を確認済みとしてマーク
+  recurring:     boolean; // true なら翌月新規シート作成時に自動コピー（固定費）
   rowIndex?:     number;  // シート上の行番号（1-based、ヘッダー=1）。getRows で付与
   sheetName?:    string;  // 取得元シート名（YYYY-MM）。getRows で付与
 }
@@ -27,11 +28,11 @@ export interface ExpenseRow {
 /** ヘッダー行（新規シート作成時に書き込む） */
 const HEADER_ROW: readonly string[] = [
   'timestamp', 'source', 'user', 'store', 'category',
-  'amount', 'memo', 'counted_amount', 'excluded', 'confirmed',
+  'amount', 'memo', 'counted_amount', 'excluded', 'confirmed', 'recurring',
 ];
 
 /** 月次シートの列範囲 */
-const MONTH_RANGE = 'A:J';
+const MONTH_RANGE = 'A:K';
 
 /** 設定シート名（先頭の _ で月別シートと区別） */
 const SETTINGS_SHEET           = '_settings';
@@ -121,7 +122,65 @@ async function listSheetNames(client: AxiosInstance): Promise<string[]> {
   return sheets.map((s: { properties: { title: string } }) => s.properties.title);
 }
 
-/** シートが無ければ新規作成しヘッダー行を書き込む */
+/** YYYY/MM/DD... のタイムスタンプの年月を targetYearMonth (YYYY-MM) に差し替える */
+function shiftTimestampToMonth(ts: string, targetYearMonth: string): string {
+  const [y, m] = targetYearMonth.split('-').map(Number);
+  const match = ts.match(/^(\d{4})[\/\-](\d{2})[\/\-](\d{2})(.*)/);
+  if (!match) return ts;
+  const lastDay = new Date(y, m, 0).getDate();
+  const day = Math.min(Number(match[3]), lastDay);
+  return `${y}/${String(m).padStart(2, '0')}/${String(day).padStart(2, '0')}${match[4]}`;
+}
+
+/**
+ * 直近の月シートから recurring=TRUE の行を取得し targetMonth シートにコピーする。
+ * 新規シート作成直後に呼ぶ想定。
+ */
+async function copyRecurringRowsToNewMonth(
+  client: AxiosInstance,
+  targetMonth: string,
+  allSheetNames: string[],
+): Promise<void> {
+  const prevMonths = allSheetNames
+    .filter((n) => /^\d{4}-\d{2}$/.test(n) && n < targetMonth)
+    .sort((a, b) => (a < b ? 1 : -1));
+
+  for (const month of prevMonths) {
+    const res = await client.get(
+      `/values/${encodeURIComponent(month)}!${MONTH_RANGE}`,
+    );
+    const values: string[][] = res.data.values ?? [];
+    if (values.length <= 1) continue;
+
+    const recurringRows = values.slice(1).filter(
+      (row) => (row[10] ?? '').toString().trim().toUpperCase() === 'TRUE',
+    );
+    if (recurringRows.length === 0) continue;
+
+    const shifted = recurringRows.map((row) => [
+      shiftTimestampToMonth(row[0] ?? '', targetMonth),
+      row[1] ?? '',   // source
+      row[2] ?? '',   // user
+      row[3] ?? '',   // store
+      row[4] ?? '',   // category
+      row[5] ?? '0',  // amount
+      row[6] ?? '',   // memo
+      row[7] ?? '0',  // counted_amount
+      'FALSE',        // excluded
+      'FALSE',        // confirmed
+      'TRUE',         // recurring
+    ]);
+
+    await client.post(
+      `/values/${encodeURIComponent(targetMonth)}!${MONTH_RANGE}:append`,
+      { values: shifted },
+      { params: { valueInputOption: 'RAW', insertDataOption: 'INSERT_ROWS' } },
+    );
+    break; // 最新の月だけ使えばよい
+  }
+}
+
+/** シートが無ければ新規作成しヘッダー行を書き込む。固定費行も自動コピー */
 async function ensureSheetExists(client: AxiosInstance, sheetName: string): Promise<void> {
   const existing = await listSheetNames(client);
   if (existing.includes(sheetName)) return;
@@ -137,6 +196,11 @@ async function ensureSheetExists(client: AxiosInstance, sheetName: string): Prom
     { values: [HEADER_ROW] },
     { params: { valueInputOption: 'RAW' } },
   );
+
+  // 前月の固定費行をコピー（月次シートのみ対象）
+  if (/^\d{4}-\d{2}$/.test(sheetName)) {
+    await copyRecurringRowsToNewMonth(client, sheetName, existing);
+  }
 }
 
 // ─── 公開 API ─────────────────────────────────────────────────────────────────
@@ -160,8 +224,9 @@ export async function appendRow(entry: ExpenseRow): Promise<void> {
     entry.amount,
     entry.memo,
     entry.countedAmount > 0 ? entry.countedAmount : entry.amount,
-    entry.excluded ? 'TRUE' : 'FALSE',
+    entry.excluded  ? 'TRUE' : 'FALSE',
     entry.confirmed ? 'TRUE' : 'FALSE',
+    entry.recurring ? 'TRUE' : 'FALSE',
   ];
 
   await client.post(
@@ -201,8 +266,9 @@ export async function getRows(yearMonth?: string): Promise<ExpenseRow[]> {
     const counted = countedRaw === undefined || countedRaw === ''
       ? amount
       : Number(countedRaw);
-    const excludedRaw  = (row[8] ?? '').toString().trim().toUpperCase();
-    const confirmedRaw = (row[9] ?? '').toString().trim().toUpperCase();
+    const excludedRaw   = (row[8]  ?? '').toString().trim().toUpperCase();
+    const confirmedRaw  = (row[9]  ?? '').toString().trim().toUpperCase();
+    const recurringRaw  = (row[10] ?? '').toString().trim().toUpperCase();
     return {
       timestamp:     normalizeTimestamp(row[0] ?? ''),
       source:        row[1] ?? '',
@@ -212,8 +278,9 @@ export async function getRows(yearMonth?: string): Promise<ExpenseRow[]> {
       amount,
       memo:          row[6] ?? '',
       countedAmount: Number.isFinite(counted) ? counted : amount,
-      excluded:      excludedRaw === 'TRUE',
+      excluded:      excludedRaw  === 'TRUE',
       confirmed:     confirmedRaw === 'TRUE',
+      recurring:     recurringRaw === 'TRUE',
       rowIndex:      i + 2, // ヘッダーが行1なので +2
       sheetName,
     };
@@ -299,12 +366,27 @@ export async function updateRow(
     entry.amount,
     entry.memo,
     entry.countedAmount > 0 ? entry.countedAmount : entry.amount,
-    entry.excluded ? 'TRUE' : 'FALSE',
+    entry.excluded  ? 'TRUE' : 'FALSE',
     entry.confirmed ? 'TRUE' : 'FALSE',
+    entry.recurring ? 'TRUE' : 'FALSE',
   ];
   await client.put(
-    `/values/${encodeURIComponent(yearMonth)}!A${rowIndex}:J${rowIndex}`,
+    `/values/${encodeURIComponent(yearMonth)}!A${rowIndex}:K${rowIndex}`,
     { values: [row] },
+    { params: { valueInputOption: 'RAW' } },
+  );
+}
+
+/** 指定行の recurring フラグ（K列）のみ更新する */
+export async function updateRecurringFlag(
+  yearMonth: string,
+  rowIndex: number,
+  recurring: boolean,
+): Promise<void> {
+  const client = await createClient();
+  await client.put(
+    `/values/${encodeURIComponent(yearMonth)}!K${rowIndex}`,
+    { values: [[recurring ? 'TRUE' : 'FALSE']] },
     { params: { valueInputOption: 'RAW' } },
   );
 }

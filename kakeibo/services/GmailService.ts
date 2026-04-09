@@ -129,6 +129,7 @@ export async function runGmailImport(): Promise<void> {
             countedAmount: data.amount,
             excluded:      false,
             confirmed:     false,
+            recurring:     false,
           };
           await appendRow(row);
           await markGmailMessageProcessed(ref.id, 'ok');
