@@ -21,6 +21,7 @@ export interface ExpenseRow {
   excluded:      boolean; // true なら集計対象外
   confirmed:     boolean; // 重複警告を確認済みとしてマーク
   recurring:     boolean; // true なら翌月新規シート作成時に自動コピー（固定費）
+  deleted?:      boolean; // 論理削除フラグ。true の行は getRows で除外される
   rowIndex?:     number;  // シート上の行番号（1-based、ヘッダー=1）。getRows で付与
   sheetName?:    string;  // 取得元シート名（YYYY-MM）。getRows で付与
 }
@@ -29,10 +30,11 @@ export interface ExpenseRow {
 const HEADER_ROW: readonly string[] = [
   'timestamp', 'source', 'user', 'store', 'category',
   'amount', 'memo', 'counted_amount', 'excluded', 'confirmed', 'recurring',
+  'deleted',
 ];
 
-/** 月次シートの列範囲 */
-const MONTH_RANGE = 'A:K';
+/** 月次シートの列範囲（A:L = timestamp 〜 deleted） */
+const MONTH_RANGE = 'A:L';
 
 /** 設定シート名（先頭の _ で月別シートと区別） */
 const SETTINGS_SHEET           = '_settings';
@@ -43,6 +45,14 @@ const GMAIL_PROCESSED_SHEET    = '_gmail_processed';
 /** _config のキー */
 const CONFIG_KEY_DEFAULT_PARTIAL_AMOUNT = 'default_partial_amount';
 const DEFAULT_PARTIAL_AMOUNT = 1000;
+const CONFIG_KEY_GMAIL_SEARCH_WINDOW = 'gmail_search_window';
+const DEFAULT_GMAIL_SEARCH_WINDOW: GmailSearchWindow = '60d';
+
+/** Gmail 検索ウィンドウの選択肢 */
+export type GmailSearchWindow = '30d' | '60d' | '180d' | '1y' | 'all';
+export const GMAIL_SEARCH_WINDOW_OPTIONS: GmailSearchWindow[] = [
+  '30d', '60d', '180d', '1y', 'all',
+];
 
 /** 初回作成時のデフォルトカテゴリ */
 const DEFAULT_CATEGORIES: readonly string[] = [
@@ -164,19 +174,24 @@ async function copyRecurringRowsToNewMonth(
     );
     if (recurringRows.length === 0) continue;
 
-    const shifted = recurringRows.map((row) => [
-      shiftTimestampToMonth(row[0] ?? '', targetMonth),
-      row[1] ?? '',   // source
-      row[2] ?? '',   // user
-      row[3] ?? '',   // store
-      row[4] ?? '',   // category
-      row[5] ?? '0',  // amount
-      row[6] ?? '',   // memo
-      row[7] ?? '0',  // counted_amount
-      'FALSE',        // excluded
-      'FALSE',        // confirmed
-      'TRUE',         // recurring
-    ]);
+    const shifted = recurringRows
+      // 論理削除済みは固定費コピーしない
+      .filter((row) => (row[11] ?? '').toString().trim().toUpperCase() !== 'TRUE')
+      .map((row) => [
+        shiftTimestampToMonth(row[0] ?? '', targetMonth),
+        row[1] ?? '',   // source
+        row[2] ?? '',   // user
+        row[3] ?? '',   // store
+        row[4] ?? '',   // category
+        row[5] ?? '0',  // amount
+        row[6] ?? '',   // memo
+        row[7] ?? '0',  // counted_amount
+        'FALSE',        // excluded
+        'FALSE',        // confirmed
+        'TRUE',         // recurring
+        'FALSE',        // deleted
+      ]);
+    if (shifted.length === 0) continue;
 
     await client.post(
       `/values/${encodeURIComponent(targetMonth)}!${MONTH_RANGE}:append`,
@@ -234,6 +249,7 @@ export async function appendRow(entry: ExpenseRow): Promise<void> {
     entry.excluded  ? 'TRUE' : 'FALSE',
     entry.confirmed ? 'TRUE' : 'FALSE',
     entry.recurring ? 'TRUE' : 'FALSE',
+    entry.deleted   ? 'TRUE' : 'FALSE',
   ];
 
   await client.post(
@@ -267,31 +283,37 @@ export async function getRows(yearMonth?: string): Promise<ExpenseRow[]> {
   const values: string[][] = res.data.values ?? [];
   if (values.length <= 1) return []; // ヘッダーのみ / 空
 
-  return values.slice(1).map((row, i) => {
-    const amount = Number(row[5] ?? 0);
-    const countedRaw = row[7];
-    const counted = countedRaw === undefined || countedRaw === ''
-      ? amount
-      : Number(countedRaw);
-    const excludedRaw   = (row[8]  ?? '').toString().trim().toUpperCase();
-    const confirmedRaw  = (row[9]  ?? '').toString().trim().toUpperCase();
-    const recurringRaw  = (row[10] ?? '').toString().trim().toUpperCase();
-    return {
-      timestamp:     normalizeTimestamp(row[0] ?? ''),
-      source:        row[1] ?? '',
-      user:          row[2] ?? '',
-      store:         row[3] ?? '',
-      category:      row[4] ?? '',
-      amount,
-      memo:          row[6] ?? '',
-      countedAmount: Number.isFinite(counted) ? counted : amount,
-      excluded:      excludedRaw  === 'TRUE',
-      confirmed:     confirmedRaw === 'TRUE',
-      recurring:     recurringRaw === 'TRUE',
-      rowIndex:      i + 2, // ヘッダーが行1なので +2
-      sheetName,
-    };
-  });
+  return values
+    .slice(1)
+    .map((row, i) => {
+      const amount = Number(row[5] ?? 0);
+      const countedRaw = row[7];
+      const counted = countedRaw === undefined || countedRaw === ''
+        ? amount
+        : Number(countedRaw);
+      const excludedRaw   = (row[8]  ?? '').toString().trim().toUpperCase();
+      const confirmedRaw  = (row[9]  ?? '').toString().trim().toUpperCase();
+      const recurringRaw  = (row[10] ?? '').toString().trim().toUpperCase();
+      const deletedRaw    = (row[11] ?? '').toString().trim().toUpperCase();
+      return {
+        timestamp:     normalizeTimestamp(row[0] ?? ''),
+        source:        row[1] ?? '',
+        user:          row[2] ?? '',
+        store:         row[3] ?? '',
+        category:      row[4] ?? '',
+        amount,
+        memo:          row[6] ?? '',
+        countedAmount: Number.isFinite(counted) ? counted : amount,
+        excluded:      excludedRaw  === 'TRUE',
+        confirmed:     confirmedRaw === 'TRUE',
+        recurring:     recurringRaw === 'TRUE',
+        deleted:       deletedRaw   === 'TRUE',
+        rowIndex:      i + 2, // ヘッダーが行1なので +2
+        sheetName,
+      };
+    })
+    // 論理削除された行はアプリからは完全に見せない（復活不可）
+    .filter((r) => !r.deleted);
 }
 
 /** 月次シートの一覧を新しい順に返す（'YYYY-MM' のみ、設定系シートは除外） */
@@ -376,10 +398,28 @@ export async function updateRow(
     entry.excluded  ? 'TRUE' : 'FALSE',
     entry.confirmed ? 'TRUE' : 'FALSE',
     entry.recurring ? 'TRUE' : 'FALSE',
+    entry.deleted   ? 'TRUE' : 'FALSE',
   ];
   await client.put(
-    `/values/${encodeURIComponent(yearMonth)}!A${rowIndex}:K${rowIndex}`,
+    `/values/${encodeURIComponent(yearMonth)}!A${rowIndex}:L${rowIndex}`,
     { values: [row] },
+    { params: { valueInputOption: 'RAW' } },
+  );
+}
+
+/**
+ * 指定行を論理削除する。L 列に TRUE を書き込むだけで行は残す。
+ * アプリ側の getRows は deleted=TRUE の行を返さないので、アプリからは復活不可。
+ * スプレッドシートを直接編集すれば L 列を FALSE に戻すことで復活可能。
+ */
+export async function markRowDeleted(
+  yearMonth: string,
+  rowIndex: number,
+): Promise<void> {
+  const client = await createClient();
+  await client.put(
+    `/values/${encodeURIComponent(yearMonth)}!L${rowIndex}`,
+    { values: [['TRUE']] },
     { params: { valueInputOption: 'RAW' } },
   );
 }
@@ -526,6 +566,61 @@ export async function getDefaultPartialAmount(): Promise<number> {
   return Number.isFinite(v) && v > 0 ? v : DEFAULT_PARTIAL_AMOUNT;
 }
 
+/** Gmail 検索ウィンドウを取得（未設定なら 60d） */
+export async function getGmailSearchWindow(): Promise<GmailSearchWindow> {
+  const client = await createClient();
+  const cfg = await readConfig(client);
+  const raw = (cfg.get(CONFIG_KEY_GMAIL_SEARCH_WINDOW) ?? '').trim();
+  if ((GMAIL_SEARCH_WINDOW_OPTIONS as string[]).includes(raw)) {
+    return raw as GmailSearchWindow;
+  }
+  return DEFAULT_GMAIL_SEARCH_WINDOW;
+}
+
+/** _config の key に value を upsert する */
+async function upsertConfigValue(
+  client: AxiosInstance,
+  key: string,
+  value: string,
+): Promise<void> {
+  await ensureConfigSheet(client);
+  const res = await client.get(
+    `/values/${encodeURIComponent(CONFIG_SHEET)}!A:B`,
+  );
+  const values: string[][] = res.data.values ?? [];
+  let rowIndex = -1;
+  for (let i = 1; i < values.length; i++) {
+    if ((values[i][0] ?? '').trim() === key) {
+      rowIndex = i + 1; // 1-based
+      break;
+    }
+  }
+  if (rowIndex > 0) {
+    await client.put(
+      `/values/${encodeURIComponent(CONFIG_SHEET)}!B${rowIndex}`,
+      { values: [[value]] },
+      { params: { valueInputOption: 'RAW' } },
+    );
+  } else {
+    await client.post(
+      `/values/${encodeURIComponent(CONFIG_SHEET)}!A:B:append`,
+      { values: [[key, value]] },
+      {
+        params: {
+          valueInputOption: 'RAW',
+          insertDataOption: 'INSERT_ROWS',
+        },
+      },
+    );
+  }
+}
+
+/** Gmail 検索ウィンドウを更新 */
+export async function setGmailSearchWindow(v: GmailSearchWindow): Promise<void> {
+  const client = await createClient();
+  await upsertConfigValue(client, CONFIG_KEY_GMAIL_SEARCH_WINDOW, v);
+}
+
 // ─── Gmail フィルター / 取り込み履歴 ──────────────────────────────────────────
 
 export interface GmailFilter {
@@ -597,6 +692,59 @@ export async function getProcessedGmailIds(): Promise<Set<string>> {
       .map((r) => r[0] ?? '')
       .filter((id) => id.length > 0),
   );
+}
+
+/**
+ * "skipped: not a transaction" として記録されたメッセージID一覧を返す。
+ */
+export async function getSkippedNotTransactionMessageIds(): Promise<{ id: string; processedAt: string }[]> {
+  const client = await createClient();
+  await ensureGmailProcessedSheet(client);
+
+  const res = await client.get(
+    `/values/${encodeURIComponent(GMAIL_PROCESSED_SHEET)}!A:C`,
+  );
+  const values: string[][] = res.data.values ?? [];
+  return values
+    .slice(1)
+    .filter((r) => (r[2] ?? '') === 'skipped: not a transaction')
+    .map((r) => ({ id: r[0] ?? '', processedAt: r[1] ?? '' }))
+    .filter((r) => r.id.length > 0);
+}
+
+/**
+ * "skipped: not a transaction" として記録されたメッセージIDを再試行対象に戻す。
+ * result 列を "error: retry-requested" に書き換えることで、次回 runGmailImport で
+ * getProcessedGmailIds() の除外対象（error: で始まる行）に組み込まれ再処理される。
+ * @returns 書き換えた件数
+ */
+export async function resetSkippedNotTransactionIds(): Promise<number> {
+  const client = await createClient();
+  await ensureGmailProcessedSheet(client);
+
+  const res = await client.get(
+    `/values/${encodeURIComponent(GMAIL_PROCESSED_SHEET)}!A:C`,
+  );
+  const values: string[][] = res.data.values ?? [];
+
+  const data: { range: string; values: string[][] }[] = [];
+  for (let i = 1; i < values.length; i++) {
+    if ((values[i][2] ?? '') === 'skipped: not a transaction') {
+      data.push({
+        range: `${GMAIL_PROCESSED_SHEET}!C${i + 1}`,
+        values: [['error: retry-requested']],
+      });
+    }
+  }
+
+  if (data.length === 0) return 0;
+
+  await client.post('/values:batchUpdate', {
+    valueInputOption: 'RAW',
+    data,
+  });
+
+  return data.length;
 }
 
 /** 取り込み履歴に1件追記する */

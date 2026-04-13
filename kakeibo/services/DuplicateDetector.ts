@@ -15,11 +15,18 @@ import { ExpenseRow } from './SheetsService';
 
 const TIMESTAMP_WINDOW_MS = 24 * 60 * 60 * 1000; // 24 時間
 
-/** 'YYYY/MM/DD HH:MM:SS' を Date に */
+/**
+ * 'YYYY/MM/DD HH:MM:SS' または 'YYYY-MM-DD HH:MM:SS' を Date に。
+ * Hermes はスラッシュ区切りを new Date() でパースできず NaN を返すため、
+ * 正規表現で直接フィールドを取り出してから Date を組み立てる。
+ */
 function parseTimestamp(s: string): Date | null {
   if (!s) return null;
-  const d = new Date(s.replace(/-/g, '/'));
-  return isNaN(d.getTime()) ? null : d;
+  const m = s.match(
+    /^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})[ T](\d{1,2}):(\d{1,2}):(\d{1,2})/,
+  );
+  if (!m) return null;
+  return new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]);
 }
 
 /** memo を 2 文字以上のトークン集合に分解 */

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -24,12 +24,15 @@ import {
   getSheetNameFromDate,
   listAvailableYears,
   listMonthSheetNames,
+  markRowDeleted,
   updateRow,
   updateRowFlags,
   updateRecurringFlag,
 } from '../services/SheetsService';
+import * as CategoryService from '../services/CategoryService';
 import { getCurrentUser } from '../services/UserService';
 import { detectDuplicateWarnings } from '../services/DuplicateDetector';
+import { useGmailProgress } from '../services/GmailProgressService';
 import { SortKey, getSortKey, setSortKey } from '../services/PreferencesService';
 import SettingsScreen from './SettingsScreen';
 import PersonalModal from './PersonalModal';
@@ -62,6 +65,7 @@ export default function SummaryScreen({ onSignedOut }: Props) {
   const [editTarget, setEditTarget]     = useState<ExpenseRow | null>(null);
   const [sortKey, setSortKeyState]      = useState<SortKey>('timestamp');
   const [sortPickerOpen, setSortPickerOpen] = useState(false);
+  const gmailProgress                    = useGmailProgress();
 
   // ソートキーを Storage から復元
   useEffect(() => {
@@ -153,6 +157,19 @@ export default function SummaryScreen({ onSignedOut }: Props) {
   useEffect(() => {
     loadRows(currentRange);
   }, [loadRows, currentRange]);
+
+  // Gmail 取り込みが完了して imported > 0 なら一覧を再取得
+  const lastGmailFinishedRef = useRef(false);
+  useEffect(() => {
+    if (gmailProgress.finished && !lastGmailFinishedRef.current) {
+      lastGmailFinishedRef.current = true;
+      if ((gmailProgress.result?.imported ?? 0) > 0) {
+        loadRows(currentRange);
+      }
+    } else if (!gmailProgress.finished) {
+      lastGmailFinishedRef.current = false;
+    }
+  }, [gmailProgress.finished, gmailProgress.result, loadRows, currentRange]);
 
   const handleRefresh = async () => {
     setRefreshing(true);
@@ -253,7 +270,9 @@ export default function SummaryScreen({ onSignedOut }: Props) {
     return sorted;
   }, [rows, currentUser, sortKey]);
 
-  const warningKeys = useMemo(() => detectDuplicateWarnings(myRows), [myRows]);
+  // 重複判定は全ユーザーの行を対象にする（夫婦間で同じ買い物を二人とも記録した
+  // ケースも検出するため）。表示は myRows だが、key で照合するので問題ない。
+  const warningKeys = useMemo(() => detectDuplicateWarnings(rows), [rows]);
 
   const summary = useMemo(() => {
     const byUser     = new Map<string, number>();
@@ -412,6 +431,35 @@ export default function SummaryScreen({ onSignedOut }: Props) {
     }
   };
 
+  const handleDeleteEdit = (target: ExpenseRow) => {
+    if (!target.sheetName || target.rowIndex === undefined) return;
+    Alert.alert(
+      '本当に削除しますか？',
+      'この明細を削除します。アプリ上からは復活できません。',
+      [
+        { text: 'キャンセル', style: 'cancel' },
+        {
+          text: '削除',
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              await markRowDeleted(target.sheetName!, target.rowIndex!);
+              setRows((prev) =>
+                prev.filter(
+                  (r) =>
+                    !(r.sheetName === target.sheetName && r.rowIndex === target.rowIndex),
+                ),
+              );
+              setEditTarget(null);
+            } catch (e) {
+              Alert.alert('削除失敗', e instanceof Error ? e.message : String(e));
+            }
+          },
+        },
+      ],
+    );
+  };
+
   if (loading && rows.length === 0) {
     return (
       <SafeAreaView style={styles.center}>
@@ -422,6 +470,26 @@ export default function SummaryScreen({ onSignedOut }: Props) {
 
   return (
     <SafeAreaView style={styles.container}>
+      {(gmailProgress.running || gmailProgress.finished) && (
+        <View
+          style={[
+            styles.gmailBanner,
+            gmailProgress.finished && !gmailProgress.running && styles.gmailBannerDone,
+          ]}
+        >
+          {gmailProgress.running && <ActivityIndicator color="#fff" size="small" />}
+          <Text style={styles.gmailBannerText}>
+            {gmailProgress.running
+              ? gmailProgress.total > 0
+                ? `Gmail 取り込み中 ${gmailProgress.current}/${gmailProgress.total}`
+                : `Gmail ${gmailProgress.phase}`
+              : gmailProgress.result
+                ? `Gmail 取り込み完了: 取込 ${gmailProgress.result.imported} / スキップ ${gmailProgress.result.skipped} / 失敗 ${gmailProgress.result.failed}`
+                : `Gmail ${gmailProgress.phase}`}
+          </Text>
+        </View>
+      )}
+
       <FlatList
         data={myRows}
         keyExtractor={(r) => `${r.sheetName ?? ''}:${r.rowIndex ?? r.timestamp}`}
@@ -476,6 +544,7 @@ export default function SummaryScreen({ onSignedOut }: Props) {
         target={editTarget}
         onClose={() => setEditTarget(null)}
         onSave={handleSaveEdit}
+        onDelete={handleDeleteEdit}
       />
 
       <PersonalModal
@@ -530,14 +599,18 @@ function PartialAmountInput({
   );
 }
 
+const ADD_CATEGORY_SENTINEL = '__add_category__';
+
 function EditEntryModal({
   target,
   onClose,
   onSave,
+  onDelete,
 }: {
-  target:  ExpenseRow | null;
-  onClose: () => void;
-  onSave:  (updated: ExpenseRow) => void;
+  target:   ExpenseRow | null;
+  onClose:  () => void;
+  onSave:   (updated: ExpenseRow) => void;
+  onDelete: (target: ExpenseRow) => void;
 }) {
   const [timestamp, setTimestamp]         = useState('');
   const [source, setSource]               = useState('');
@@ -548,6 +621,12 @@ function EditEntryModal({
   const [memo, setMemo]                   = useState('');
   const [countedAmount, setCountedAmount] = useState('');
   const [excluded, setExcluded]           = useState(false);
+
+  const [categories, setCategories]       = useState<string[]>([]);
+  const [categoryPickerOpen, setCategoryPickerOpen] = useState(false);
+  const [addCategoryOpen, setAddCategoryOpen]       = useState(false);
+  const [newCategoryText, setNewCategoryText]       = useState('');
+  const [savingCategory, setSavingCategory]         = useState(false);
 
   useEffect(() => {
     if (!target) return;
@@ -560,6 +639,10 @@ function EditEntryModal({
     setMemo(target.memo);
     setCountedAmount(String(target.countedAmount));
     setExcluded(target.excluded);
+    // カテゴリ一覧を取得（キャッシュがあれば即座に返る）
+    CategoryService.getCategories()
+      .then(setCategories)
+      .catch(() => setCategories([]));
   }, [target]);
 
   if (!target) return null;
@@ -585,6 +668,37 @@ function EditEntryModal({
     });
   };
 
+  const handlePickCategory = (value: string) => {
+    if (value === ADD_CATEGORY_SENTINEL) {
+      setCategoryPickerOpen(false);
+      setNewCategoryText('');
+      setAddCategoryOpen(true);
+      return;
+    }
+    setCategory(value);
+    setCategoryPickerOpen(false);
+  };
+
+  const handleAddCategoryConfirm = async () => {
+    const name = newCategoryText.trim();
+    if (!name) {
+      Alert.alert('入力エラー', 'カテゴリ名が空です');
+      return;
+    }
+    setSavingCategory(true);
+    try {
+      await CategoryService.addCategory(name);
+      const next = await CategoryService.getCategories();
+      setCategories(next);
+      setCategory(name);
+      setAddCategoryOpen(false);
+    } catch (e) {
+      Alert.alert('追加失敗', e instanceof Error ? e.message : String(e));
+    } finally {
+      setSavingCategory(false);
+    }
+  };
+
   return (
     <Modal
       visible={target !== null}
@@ -601,7 +715,20 @@ function EditEntryModal({
           <Field label="取込元 (source)" value={source} onChangeText={setSource} />
           <Field label="ユーザー" value={user} onChangeText={setUser} />
           <Field label="店舗" value={store} onChangeText={setStore} />
-          <Field label="カテゴリ" value={category} onChangeText={setCategory} />
+
+          {/* カテゴリはプルダウン選択 */}
+          <View style={styles.fieldBox}>
+            <Text style={styles.fieldLabel}>カテゴリ</Text>
+            <TouchableOpacity
+              style={styles.pickerButton}
+              onPress={() => setCategoryPickerOpen(true)}
+            >
+              <Text style={styles.pickerButtonText}>
+                {category || '(未選択)'} ▾
+              </Text>
+            </TouchableOpacity>
+          </View>
+
           <Field
             label="金額"
             value={amount}
@@ -633,11 +760,104 @@ function EditEntryModal({
 
           <View style={{ height: 16 }} />
           <Button title="保存" onPress={handleSave} />
+
+          <View style={{ height: 24 }} />
+          <TouchableOpacity
+            style={styles.deleteBtn}
+            onPress={() => onDelete(target)}
+          >
+            <Text style={styles.deleteBtnText}>この明細を削除</Text>
+          </TouchableOpacity>
+
           <Text style={styles.editNote}>
             ※ 日時の月を変更しても行は元のシート（{target.sheetName}）のまま残ります
           </Text>
         </ScrollView>
       </SafeAreaView>
+
+      {/* カテゴリ選択モーダル */}
+      <Modal
+        visible={categoryPickerOpen}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setCategoryPickerOpen(false)}
+      >
+        <Pressable
+          style={styles.modalBackdrop}
+          onPress={() => setCategoryPickerOpen(false)}
+        >
+          <Pressable style={styles.modalSheet} onPress={(e) => e.stopPropagation()}>
+            <Text style={styles.modalTitle}>カテゴリを選択</Text>
+            <FlatList
+              data={[...categories, ADD_CATEGORY_SENTINEL]}
+              keyExtractor={(c) => c}
+              renderItem={({ item }) => {
+                const isAdd = item === ADD_CATEGORY_SENTINEL;
+                const isSelected = !isAdd && item === category;
+                return (
+                  <TouchableOpacity
+                    style={[
+                      styles.modalItem,
+                      isSelected && styles.modalItemSelected,
+                    ]}
+                    onPress={() => handlePickCategory(item)}
+                  >
+                    <Text
+                      style={[
+                        styles.modalItemText,
+                        isSelected && styles.modalItemTextSelected,
+                        isAdd && styles.modalItemTextAdd,
+                      ]}
+                    >
+                      {isAdd ? '＋ カテゴリを追加...' : item}
+                    </Text>
+                  </TouchableOpacity>
+                );
+              }}
+            />
+          </Pressable>
+        </Pressable>
+      </Modal>
+
+      {/* カテゴリ追加モーダル */}
+      <Modal
+        visible={addCategoryOpen}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setAddCategoryOpen(false)}
+      >
+        <Pressable
+          style={styles.modalBackdrop}
+          onPress={() => !savingCategory && setAddCategoryOpen(false)}
+        >
+          <Pressable style={styles.modalSheet} onPress={(e) => e.stopPropagation()}>
+            <Text style={styles.modalTitle}>カテゴリを追加</Text>
+            <View style={{ padding: 16 }}>
+              <TextInput
+                style={styles.fieldInput}
+                value={newCategoryText}
+                onChangeText={setNewCategoryText}
+                placeholder="例: 趣味"
+                autoFocus
+                editable={!savingCategory}
+              />
+              <View style={{ height: 12 }} />
+              <View style={{ flexDirection: 'row', justifyContent: 'flex-end', gap: 8 }}>
+                <Button
+                  title="キャンセル"
+                  onPress={() => setAddCategoryOpen(false)}
+                  disabled={savingCategory}
+                />
+                <Button
+                  title={savingCategory ? '追加中...' : '追加'}
+                  onPress={handleAddCategoryConfirm}
+                  disabled={savingCategory}
+                />
+              </View>
+            </View>
+          </Pressable>
+        </Pressable>
+      </Modal>
     </Modal>
   );
 }
@@ -918,4 +1138,37 @@ const styles = StyleSheet.create({
   },
   fieldInputMulti: { minHeight: 80, textAlignVertical: 'top' },
   editNote: { fontSize: 11, color: '#888', marginTop: 12 },
+
+  pickerButton: {
+    borderWidth: 1,
+    borderColor: '#ccc',
+    borderRadius: 6,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    backgroundColor: '#fff',
+  },
+  pickerButtonText: { fontSize: 15, color: '#222' },
+
+  modalItemTextAdd: { color: '#2563eb', fontWeight: 'bold' },
+
+  deleteBtn: {
+    borderWidth: 1,
+    borderColor: '#dc2626',
+    borderRadius: 6,
+    paddingVertical: 10,
+    alignItems: 'center',
+    backgroundColor: '#fff',
+  },
+  deleteBtnText: { fontSize: 15, color: '#dc2626', fontWeight: 'bold' },
+
+  gmailBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    backgroundColor: '#2563eb',
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+  },
+  gmailBannerDone: { backgroundColor: '#16a34a' },
+  gmailBannerText: { color: '#fff', fontSize: 13, fontWeight: 'bold', flexShrink: 1 },
 });
