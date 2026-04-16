@@ -1,9 +1,9 @@
 import axios, { AxiosInstance } from 'axios';
 import { getAccessToken } from './AuthService';
 
-// ─── スプレッドシート設定（後で設定） ────────────────────────────────────────
+// ─── スプレッドシート設定（.env の EXPO_PUBLIC_SPREADSHEET_ID に設定） ───────
 // Google Sheets の URL から取得: https://docs.google.com/spreadsheets/d/{ID}/edit
-export const SPREADSHEET_ID = 'REMOVED_SPREADSHEET_ID';
+export const SPREADSHEET_ID = process.env.EXPO_PUBLIC_SPREADSHEET_ID ?? '';
 // ─────────────────────────────────────────────────────────────────────────────
 
 const SHEETS_API_BASE = 'https://sheets.googleapis.com/v4/spreadsheets';

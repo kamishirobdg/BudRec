@@ -5,12 +5,12 @@ import * as Storage from './Storage';
 
 WebBrowser.maybeCompleteAuthSession();
 
-// ─── クライアントID ──────────────────────────────────────────────────────────
+// ─── クライアントID（.env の EXPO_PUBLIC_GOOGLE_CLIENT_ID_* に設定） ─────────
 // Google Cloud Console → 認証情報 → OAuthクライアントID で取得
 // Web用: Web 動作確認 / Dev Build 両方で使用
 // Android用: Dev Build 用（カスタムスキーム経由）
-export const GOOGLE_CLIENT_ID_ANDROID = 'REMOVED_ANDROID_CLIENT_ID';
-export const GOOGLE_CLIENT_ID_WEB     = 'REMOVED_WEB_CLIENT_ID';
+export const GOOGLE_CLIENT_ID_ANDROID = process.env.EXPO_PUBLIC_GOOGLE_CLIENT_ID_ANDROID ?? '';
+export const GOOGLE_CLIENT_ID_WEB     = process.env.EXPO_PUBLIC_GOOGLE_CLIENT_ID_WEB     ?? '';
 // ─────────────────────────────────────────────────────────────────────────────
 
 const SCOPES = [

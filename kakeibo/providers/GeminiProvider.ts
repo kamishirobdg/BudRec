@@ -7,9 +7,9 @@ import {
   parseReceiptResponse,
 } from './AIProvider';
 
-// ─── API キー（後で設定 / 将来的には SecureStore に移行） ───────────────────
-// https://aistudio.google.com/apikey で取得
-export const GEMINI_API_KEY = 'REMOVED_GEMINI_KEY';
+// ─── API キー（.env の EXPO_PUBLIC_GEMINI_API_KEY に設定） ──────────────────
+// https://aistudio.google.com/apikey で取得し .env に記載
+export const GEMINI_API_KEY = process.env.EXPO_PUBLIC_GEMINI_API_KEY ?? '';
 // ─────────────────────────────────────────────────────────────────────────────
 
 // 新規アカウントでは gemini-2.0-flash / 2.5-flash は無料枠が 0 のことがある。
