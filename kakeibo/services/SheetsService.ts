@@ -1,5 +1,5 @@
 import axios, { AxiosInstance } from 'axios';
-import { getAccessToken } from './AuthService';
+import { AuthError, getAccessToken } from './AuthService';
 
 // ─── スプレッドシート設定（.env の EXPO_PUBLIC_SPREADSHEET_ID に設定） ───────
 // Google Sheets の URL から取得: https://docs.google.com/spreadsheets/d/{ID}/edit
@@ -64,9 +64,7 @@ const DEFAULT_CATEGORIES: readonly string[] = [
 
 async function createClient(): Promise<AxiosInstance> {
   const token = await getAccessToken();
-  if (!token) {
-    throw new Error('未サインインです。先に signInWithGoogle() を呼んでください。');
-  }
+  if (!token) throw new AuthError();
   return axios.create({
     baseURL: `${SHEETS_API_BASE}/${SPREADSHEET_ID}`,
     headers: {

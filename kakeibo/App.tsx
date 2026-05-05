@@ -92,7 +92,7 @@ export default function App() {
                 ),
               }}
             >
-              {() => <CameraScreen />}
+              {() => <CameraScreen onSignedOut={() => setSignedIn(false)} />}
             </Tab.Screen>
             <Tab.Screen
               name="Summary"

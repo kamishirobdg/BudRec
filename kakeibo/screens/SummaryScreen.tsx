@@ -34,6 +34,7 @@ import { getCurrentUser } from '../services/UserService';
 import { detectDuplicateWarnings } from '../services/DuplicateDetector';
 import { useGmailProgress } from '../services/GmailProgressService';
 import { SortKey, getSortKey, setSortKey } from '../services/PreferencesService';
+import { AuthError } from '../services/AuthService';
 import SettingsScreen from './SettingsScreen';
 import PersonalModal from './PersonalModal';
 import MemoText from './MemoText';
@@ -113,10 +114,13 @@ export default function SummaryScreen({ onSignedOut }: Props) {
 
   // 範囲オプションを作る（月一覧と年一覧をシートから取得）
   const buildRangeOptions = useCallback(async () => {
-    const [months, years] = await Promise.all([
-      listMonthSheetNames(),
-      listAvailableYears(),
-    ]);
+    let months: string[], years: number[];
+    try {
+      [months, years] = await Promise.all([listMonthSheetNames(), listAvailableYears()]);
+    } catch (e) {
+      if (e instanceof AuthError) { onSignedOut(); return; }
+      return; // 取得失敗時はデフォルト表示のまま
+    }
     const current = getSheetNameFromDate();
     // 当月が一覧に無くても先頭に置く
     const monthList = months.includes(current) ? months : [current, ...months];
@@ -144,11 +148,12 @@ export default function SummaryScreen({ onSignedOut }: Props) {
       setDefaultPartial(partial);
       setCurrentUserState(user);
     } catch (e) {
+      if (e instanceof AuthError) { onSignedOut(); return; }
       Alert.alert('読み込み失敗', e instanceof Error ? e.message : String(e));
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [onSignedOut]);
 
   useEffect(() => {
     buildRangeOptions();
@@ -193,6 +198,7 @@ export default function SummaryScreen({ onSignedOut }: Props) {
     try {
       await updateRowFlags(row.sheetName, row.rowIndex, next);
     } catch (e) {
+      if (e instanceof AuthError) { onSignedOut(); return; }
       Alert.alert('更新失敗', e instanceof Error ? e.message : String(e));
       loadRows(currentRange);
     }
@@ -236,6 +242,7 @@ export default function SummaryScreen({ onSignedOut }: Props) {
     try {
       await updateRecurringFlag(row.sheetName, row.rowIndex, next);
     } catch (e) {
+      if (e instanceof AuthError) { onSignedOut(); return; }
       Alert.alert('更新失敗', e instanceof Error ? e.message : String(e));
       loadRows(currentRange);
     }
@@ -427,6 +434,7 @@ export default function SummaryScreen({ onSignedOut }: Props) {
       );
       setEditTarget(null);
     } catch (e) {
+      if (e instanceof AuthError) { onSignedOut(); return; }
       Alert.alert('保存失敗', e instanceof Error ? e.message : String(e));
     }
   };
@@ -452,6 +460,7 @@ export default function SummaryScreen({ onSignedOut }: Props) {
               );
               setEditTarget(null);
             } catch (e) {
+              if (e instanceof AuthError) { onSignedOut(); return; }
               Alert.alert('削除失敗', e instanceof Error ? e.message : String(e));
             }
           },

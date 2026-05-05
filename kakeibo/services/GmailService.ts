@@ -13,7 +13,7 @@
  */
 
 import axios from 'axios';
-import { getAccessToken } from './AuthService';
+import { AuthError, getAccessToken } from './AuthService';
 import {
   appendRow,
   ExpenseRow,
@@ -187,6 +187,7 @@ export async function runGmailImport(): Promise<void> {
     console.log(`[Gmail] 取り込み完了: imported=${imported}, skipped=${skipped}, failed=${failed}`);
     Progress.finish({ imported, skipped, failed });
   } catch (e) {
+    if (e instanceof AuthError) throw e; // App.tsx 側でサインイン画面に戻す
     const msg = e instanceof Error ? e.message : String(e);
     console.error('[Gmail] runGmailImport 失敗:', e);
     Progress.fail(msg);
@@ -243,7 +244,7 @@ function buildQuery(filter: GmailFilter, window: GmailSearchWindow): string {
 
 async function gmailGet<T>(path: string, params?: object): Promise<T> {
   const token = await getAccessToken();
-  if (!token) throw new Error('未サインインです');
+  if (!token) throw new AuthError();
 
   const res = await axios.get<T>(`${GMAIL_API_BASE}${path}`, {
     headers: { Authorization: `Bearer ${token}` },

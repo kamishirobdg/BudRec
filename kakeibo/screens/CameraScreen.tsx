@@ -25,6 +25,7 @@ import * as ImagePicker from 'expo-image-picker';
 import * as Notifications from 'expo-notifications';
 import * as CategoryService from '../services/CategoryService';
 import { appendRow, ExpenseRow } from '../services/SheetsService';
+import { AuthError } from '../services/AuthService';
 import { getCurrentUser } from '../services/UserService';
 import { getProvider } from '../providers';
 import * as ReceiptQueue from '../services/ReceiptQueueService';
@@ -41,7 +42,11 @@ Notifications.setNotificationHandler({
   }),
 });
 
-export default function CameraScreen() {
+interface Props {
+  onSignedOut: () => void;
+}
+
+export default function CameraScreen({ onSignedOut }: Props) {
   const [permission, requestPermission] = useCameraPermissions();
   const [facing] = useState<CameraType>('back');
   const [busy, setBusy]           = useState(false);
@@ -177,6 +182,7 @@ export default function CameraScreen() {
         refreshPending();
         return;
       } catch (firstErr) {
+        if (firstErr instanceof AuthError) throw firstErr;
         console.warn('[Receipt] OCR 1回目失敗、リトライ:', firstErr);
       }
 
@@ -188,8 +194,15 @@ export default function CameraScreen() {
         ReceiptQueue.deleteReceipt(uri);
         refreshPending();
       } catch (secondErr) {
+        if (secondErr instanceof AuthError) throw secondErr;
         const msg = secondErr instanceof Error ? secondErr.message : String(secondErr);
         showFailureDialog(uri, msg);
+      }
+    } catch (e) {
+      if (e instanceof AuthError) {
+        Alert.alert('再サインインが必要です', 'セッションが期限切れです。再度サインインしてください。', [
+          { text: 'OK', onPress: onSignedOut },
+        ]);
       }
     } finally {
       setBusy(false);
@@ -301,6 +314,12 @@ export default function CameraScreen() {
         `手動入力を記録しました\n${entry.store}  ¥${entry.amount.toLocaleString()}`,
       );
     } catch (e) {
+      if (e instanceof AuthError) {
+        Alert.alert('再サインインが必要です', 'セッションが期限切れです。再度サインインしてください。', [
+          { text: 'OK', onPress: onSignedOut },
+        ]);
+        return;
+      }
       Alert.alert('保存失敗', e instanceof Error ? e.message : String(e));
     }
   };

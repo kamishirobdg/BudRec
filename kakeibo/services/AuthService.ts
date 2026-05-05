@@ -5,6 +5,14 @@ import * as Storage from './Storage';
 
 WebBrowser.maybeCompleteAuthSession();
 
+/** 認証エラー（トークン無効・期限切れ）を表す識別可能なエラークラス */
+export class AuthError extends Error {
+  constructor() {
+    super('再サインインが必要です');
+    this.name = 'AuthError';
+  }
+}
+
 // ─── クライアントID（.env の EXPO_PUBLIC_GOOGLE_CLIENT_ID_* に設定） ─────────
 // Google Cloud Console → 認証情報 → OAuthクライアントID で取得
 // Web用: Web 動作確認 / Dev Build 両方で使用
