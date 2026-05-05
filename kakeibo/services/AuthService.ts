@@ -108,8 +108,11 @@ async function signInNative(): Promise<string> {
     scopes: SCOPES,
     redirectUri,
     usePKCE: true,
-    // 注: Android OAuth クライアントは access_type=offline や prompt=consent を
-    // サポートしておらず、付与すると invalid_request になる
+    // access_type=offline は Android クライアントでは不要（インストール済みアプリは
+    // デフォルトでオフラインアクセス付き）。ただし prompt=consent を付けないと
+    // 2回目以降のサインイン時にリフレッシュトークンが返らず、1時間ごとに
+    // 再ログインが必要になるため必須。
+    extraParams: { prompt: 'consent' },
   });
 
   const result = await request.promptAsync(GOOGLE_DISCOVERY);
@@ -229,9 +232,9 @@ export async function signOut(): Promise<void> {
   }
 }
 
-/** サインイン済みかどうかを確認する（トークン自動更新は行わない） */
+/** サインイン済みかどうかを確認する（期限切れ時はリフレッシュを試みる） */
 export async function isSignedIn(): Promise<boolean> {
-  const token = await Storage.getItem(SECURE_STORE_KEYS.ACCESS_TOKEN);
+  const token = await getAccessToken();
   return token !== null;
 }
 

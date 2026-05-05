@@ -39,7 +39,10 @@ export default function App() {
     const now = Date.now();
     if (now - lastGmailRunRef.current < COOLDOWN_MS) return;
     lastGmailRunRef.current = now;
-    runGmailImport();
+    runGmailImport().catch(async () => {
+      const ok = await isSignedIn();
+      if (!ok) setSignedIn(false);
+    });
   };
 
   // サインイン直後に実行
@@ -48,11 +51,17 @@ export default function App() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [signedIn]);
 
-  // フォアグラウンド復帰時にも実行
+  // フォアグラウンド復帰時にも実行（トークン有効性を再確認してから）
   useEffect(() => {
     if (!signedIn) return;
-    const sub = AppState.addEventListener('change', (state) => {
-      if (state === 'active') maybeRunGmailImport();
+    const sub = AppState.addEventListener('change', async (state) => {
+      if (state !== 'active') return;
+      const ok = await isSignedIn();
+      if (!ok) {
+        setSignedIn(false);
+        return;
+      }
+      maybeRunGmailImport();
     });
     return () => sub.remove();
   // eslint-disable-next-line react-hooks/exhaustive-deps
