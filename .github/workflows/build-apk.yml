@@ -1,0 +1,63 @@
+name: Build Android APK
+
+on:
+  push:
+    branches:
+      - claude/competent-bose
+      - main
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: kakeibo/package-lock.json
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install dependencies
+        working-directory: kakeibo
+        run: npm ci
+
+      - name: Create .env
+        working-directory: kakeibo
+        run: |
+          cat > .env << 'EOF'
+          EXPO_PUBLIC_GEMINI_API_KEY=${{ secrets.EXPO_PUBLIC_GEMINI_API_KEY }}
+          EXPO_PUBLIC_GOOGLE_CLIENT_ID_ANDROID=${{ secrets.EXPO_PUBLIC_GOOGLE_CLIENT_ID_ANDROID }}
+          EXPO_PUBLIC_GOOGLE_CLIENT_ID_WEB=${{ secrets.EXPO_PUBLIC_GOOGLE_CLIENT_ID_WEB }}
+          EXPO_PUBLIC_SPREADSHEET_ID=${{ secrets.EXPO_PUBLIC_SPREADSHEET_ID }}
+          EOF
+
+      - name: Expo prebuild (generate Android native code)
+        working-directory: kakeibo
+        run: npx expo prebuild --platform android --no-install
+
+      - name: Build debug APK
+        working-directory: kakeibo/android
+        run: ./gradlew assembleDebug --no-daemon
+        env:
+          GRADLE_OPTS: '-Dorg.gradle.jvmargs=-Xmx4g'
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: bud-rec-debug
+          path: kakeibo/android/app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 14
