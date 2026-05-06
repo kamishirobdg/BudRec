@@ -2,7 +2,6 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
-  Animated,
   Button,
   FlatList,
   Image,
@@ -23,6 +22,7 @@ import {
 } from 'expo-camera';
 import * as ImagePicker from 'expo-image-picker';
 import * as Notifications from 'expo-notifications';
+import { useNavigation } from '@react-navigation/native';
 import * as CategoryService from '../services/CategoryService';
 import { appendRow, ExpenseRow } from '../services/SheetsService';
 import { AuthError } from '../services/AuthService';
@@ -43,16 +43,17 @@ Notifications.setNotificationHandler({
 });
 
 interface Props {
-  onSignedOut: () => void;
+  onSignedOut:    () => void;
+  onStatusChange: (msg: string) => void;
+  onSuccess:      (msg: string) => void;
 }
 
-export default function CameraScreen({ onSignedOut }: Props) {
+export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }: Props) {
+  const navigation = useNavigation();
   const [permission, requestPermission] = useCameraPermissions();
   const [facing] = useState<CameraType>('back');
   const [busy, setBusy]           = useState(false);
   const [statusMsg, setStatusMsg] = useState<string>('');
-  const [toast, setToast]         = useState<string>('');
-  const toastOpacity              = useRef(new Animated.Value(0)).current;
   const cameraRef                 = useRef<CameraView>(null);
 
   // 未処理レシートの URI 一覧
@@ -64,24 +65,6 @@ export default function CameraScreen({ onSignedOut }: Props) {
   useEffect(() => {
     Notifications.requestPermissionsAsync().catch(() => {});
   }, []);
-
-  // toast の表示・自動消滅
-  useEffect(() => {
-    if (!toast) return;
-    Animated.timing(toastOpacity, {
-      toValue: 1,
-      duration: 200,
-      useNativeDriver: true,
-    }).start();
-    const timer = setTimeout(() => {
-      Animated.timing(toastOpacity, {
-        toValue: 0,
-        duration: 300,
-        useNativeDriver: true,
-      }).start(() => setToast(''));
-    }, 3000);
-    return () => clearTimeout(timer);
-  }, [toast, toastOpacity]);
 
   /** pending-receipts ディレクトリを読み直して state に反映 */
   const refreshPending = useCallback(() => {
@@ -97,14 +80,16 @@ export default function CameraScreen({ onSignedOut }: Props) {
     refreshPending();
   }, [refreshPending]);
 
-  /** OCR → スプレッドシート書き込み。例外は投げるのみ、後始末しない */
-  const runOcrAndSave = async (base64: string) => {
+  /** OCR → スプレッドシート書き込み。成功時は通知メッセージを返す。例外は投げるのみ */
+  const runOcrAndSave = async (base64: string): Promise<string> => {
     setStatusMsg('OCR解析中...');
+    onStatusChange('OCR解析中...');
     const categories = await CategoryService.getCategories();
     const provider = getProvider();
     const data = await provider.extractReceipt(base64, categories);
 
-    setStatusMsg('スプレッドシートに書き込み中...');
+    setStatusMsg('書き込み中...');
+    onStatusChange('スプレッドシートに書き込み中...');
     const timestamp = formatTimestamp(data.date, data.time);
     const user = await getCurrentUser();
     const row: ExpenseRow = {
@@ -121,9 +106,7 @@ export default function CameraScreen({ onSignedOut }: Props) {
       recurring:     false,
     };
     await appendRow(row);
-    setToast(
-      `記録しました\n${data.store}  ¥${data.amount.toLocaleString()}\n${data.category} · ${timestamp}`,
-    );
+    return `記録しました\n${data.store}  ¥${data.amount.toLocaleString()}\n${data.category} · ${timestamp}`;
   };
 
   /** 2 回失敗時のダイアログ（再試行 / 手動入力 / 諦める） */
@@ -177,9 +160,10 @@ export default function CameraScreen({ onSignedOut }: Props) {
       }
 
       try {
-        await runOcrAndSave(base64);
+        const msg = await runOcrAndSave(base64);
         ReceiptQueue.deleteReceipt(uri);
         refreshPending();
+        onSuccess(msg);
         return;
       } catch (firstErr) {
         if (firstErr instanceof AuthError) throw firstErr;
@@ -188,11 +172,13 @@ export default function CameraScreen({ onSignedOut }: Props) {
 
       // 自動リトライ
       setStatusMsg('OCR再試行中...');
+      onStatusChange('OCR再試行中...');
       await new Promise((r) => setTimeout(r, 1000));
       try {
-        await runOcrAndSave(base64);
+        const msg = await runOcrAndSave(base64);
         ReceiptQueue.deleteReceipt(uri);
         refreshPending();
+        onSuccess(msg);
       } catch (secondErr) {
         if (secondErr instanceof AuthError) throw secondErr;
         const msg = secondErr instanceof Error ? secondErr.message : String(secondErr);
@@ -207,6 +193,7 @@ export default function CameraScreen({ onSignedOut }: Props) {
     } finally {
       setBusy(false);
       setStatusMsg('');
+      onStatusChange('');
     }
   };
 
@@ -225,9 +212,9 @@ export default function CameraScreen({ onSignedOut }: Props) {
       if (!photo?.base64) throw new Error('画像の取得に失敗しました');
       const uri = ReceiptQueue.saveReceipt(photo.base64);
       refreshPending();
-      // busy は processReceipt 側でも制御するので一旦 false にしておく
       setBusy(false);
       setStatusMsg('');
+      navigation.navigate('Summary' as never);
       await processReceipt(uri);
     } catch (e) {
       setBusy(false);
@@ -251,6 +238,7 @@ export default function CameraScreen({ onSignedOut }: Props) {
     try {
       const uri = ReceiptQueue.saveReceipt(result.assets[0].base64);
       refreshPending();
+      navigation.navigate('Summary' as never);
       await processReceipt(uri);
     } catch (e) {
       Alert.alert('失敗', e instanceof Error ? e.message : String(e));
@@ -260,7 +248,7 @@ export default function CameraScreen({ onSignedOut }: Props) {
   /** pending バナーから一括処理 */
   const handleProcessPending = async () => {
     if (busy || pendingUris.length === 0) return;
-    // スナップショットをコピーしてから 1 件ずつ順に処理
+    navigation.navigate('Summary' as never);
     const snapshot = [...pendingUris];
     for (const uri of snapshot) {
       // 途中で失敗 → 3択ダイアログが出るのでそこで止まる。
@@ -310,9 +298,8 @@ export default function CameraScreen({ onSignedOut }: Props) {
       ReceiptQueue.deleteReceipt(manualTarget);
       setManualTarget(null);
       refreshPending();
-      setToast(
-        `手動入力を記録しました\n${entry.store}  ¥${entry.amount.toLocaleString()}`,
-      );
+      onSuccess(`手動入力を記録しました\n${entry.store}  ¥${entry.amount.toLocaleString()}`);
+      navigation.navigate('Summary' as never);
     } catch (e) {
       if (e instanceof AuthError) {
         Alert.alert('再サインインが必要です', 'セッションが期限切れです。再度サインインしてください。', [
@@ -393,15 +380,6 @@ export default function CameraScreen({ onSignedOut }: Props) {
           </View>
         )}
       </View>
-
-      {!!toast && (
-        <Animated.View
-          pointerEvents="none"
-          style={[styles.toast, { opacity: toastOpacity }]}
-        >
-          <Text style={styles.toastText}>{toast}</Text>
-        </Animated.View>
-      )}
 
       <ManualEntryModal
         imageUri={manualTarget}
@@ -780,29 +758,6 @@ const styles = StyleSheet.create({
     fontSize:  14,
     color:     '#666',
   },
-  toast: {
-    position: 'absolute',
-    top:      48,
-    left:     16,
-    right:    16,
-    backgroundColor: 'rgba(34,197,94,0.95)',
-    borderRadius:    12,
-    paddingHorizontal: 20,
-    paddingVertical:   16,
-    shadowColor:    '#000',
-    shadowOpacity:  0.3,
-    shadowRadius:   8,
-    shadowOffset:   { width: 0, height: 4 },
-    elevation:      8,
-  },
-  toastText: {
-    color:      '#fff',
-    fontSize:   16,
-    fontWeight: 'bold',
-    textAlign:  'center',
-    lineHeight: 22,
-  },
-
   pendingBanner: {
     position: 'absolute',
     top: 48,

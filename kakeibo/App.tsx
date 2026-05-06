@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, Alert, AppState, View } from 'react-native';
+import { ActivityIndicator, Alert, Animated, AppState, StyleSheet, Text, View } from 'react-native';
 import { NavigationContainer } from '@react-navigation/native';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
@@ -16,8 +16,22 @@ const Tab = createBottomTabNavigator();
 export default function App() {
   const [signedIn, setSignedIn] = useState(false);
   const [checking, setChecking] = useState(true);
-  // Gmail 取り込みの最終実行時刻（ms）。5分以内の重複実行を防ぐ
   const lastGmailRunRef = useRef(0);
+
+  // OCR 処理中ステータスと成功トースト（画面遷移をまたいで表示するためここで管理）
+  const [ocrStatus, setOcrStatus] = useState('');
+  const [ocrToast,  setOcrToast]  = useState('');
+  const toastOpacity = useRef(new Animated.Value(0)).current;
+
+  useEffect(() => {
+    if (!ocrToast) return;
+    Animated.timing(toastOpacity, { toValue: 1, duration: 200, useNativeDriver: true }).start();
+    const timer = setTimeout(() => {
+      Animated.timing(toastOpacity, { toValue: 0, duration: 300, useNativeDriver: true })
+        .start(() => setOcrToast(''));
+    }, 3000);
+    return () => clearTimeout(timer);
+  }, [ocrToast, toastOpacity]);
 
   useEffect(() => {
     (async () => {
@@ -92,7 +106,13 @@ export default function App() {
                 ),
               }}
             >
-              {() => <CameraScreen onSignedOut={() => setSignedIn(false)} />}
+              {() => (
+                <CameraScreen
+                  onSignedOut={() => setSignedIn(false)}
+                  onStatusChange={setOcrStatus}
+                  onSuccess={setOcrToast}
+                />
+              )}
             </Tab.Screen>
             <Tab.Screen
               name="Summary"
@@ -108,7 +128,68 @@ export default function App() {
           </Tab.Navigator>
         </NavigationContainer>
       )}
+      {/* OCR 処理中バナー（全画面共通） */}
+      {!!ocrStatus && (
+        <View style={styles.statusBanner} pointerEvents="none">
+          <ActivityIndicator color="#fff" size="small" />
+          <Text style={styles.statusBannerText}>{ocrStatus}</Text>
+        </View>
+      )}
+
+      {/* 成功トースト（全画面共通） */}
+      {!!ocrToast && (
+        <Animated.View style={[styles.toast, { opacity: toastOpacity }]} pointerEvents="none">
+          <Text style={styles.toastText}>{ocrToast}</Text>
+        </Animated.View>
+      )}
+
       <StatusBar style="auto" />
     </SafeAreaProvider>
   );
 }
+
+const styles = StyleSheet.create({
+  statusBanner: {
+    position:        'absolute',
+    top:             56,
+    left:            16,
+    right:           16,
+    flexDirection:   'row',
+    alignItems:      'center',
+    gap:             8,
+    backgroundColor: 'rgba(30,30,30,0.88)',
+    borderRadius:    10,
+    paddingHorizontal: 16,
+    paddingVertical:   10,
+    elevation:       10,
+    zIndex:          100,
+  },
+  statusBannerText: {
+    color:      '#fff',
+    fontSize:   14,
+    fontWeight: '600',
+  },
+  toast: {
+    position:        'absolute',
+    top:             56,
+    left:            16,
+    right:           16,
+    backgroundColor: 'rgba(34,197,94,0.95)',
+    borderRadius:    12,
+    paddingHorizontal: 20,
+    paddingVertical:   16,
+    elevation:       10,
+    zIndex:          100,
+    shadowColor:     '#000',
+    shadowOpacity:   0.3,
+    shadowRadius:    8,
+    shadowOffset:    { width: 0, height: 4 },
+  },
+  toastText: {
+    color:      '#fff',
+    fontSize:   16,
+    fontWeight: 'bold',
+    textAlign:  'center',
+    lineHeight: 22,
+  },
+});
