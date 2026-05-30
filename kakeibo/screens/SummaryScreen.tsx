@@ -263,9 +263,11 @@ export default function SummaryScreen({ onSignedOut }: Props) {
     });
   };
 
-  // ─── 集計対象（自分の行のみ） ───
+  // ─── 集計対象（自分の行 ＋ 自分が代理入力した行） ───
   const myRows = useMemo(() => {
-    const filtered = rows.filter((r) => r.user === currentUser);
+    const isProxyEntry = (r: ExpenseRow) =>
+      (r.source === 'proxy_camera' || r.source === 'proxy_manual') && r.user !== currentUser;
+    const filtered = rows.filter((r) => r.user === currentUser || isProxyEntry(r));
     const sorted = [...filtered];
     if (sortKey === 'timestamp') {
       sorted.sort((a, b) => (a.timestamp < b.timestamp ? 1 : -1));
@@ -356,9 +358,10 @@ export default function SummaryScreen({ onSignedOut }: Props) {
     const key = `${item.sheetName ?? ''}:${item.rowIndex ?? ''}`;
     const isExpanded = expanded.has(key);
     const isWarned = warningKeys.has(key);
+    const isProxy = item.source === 'proxy_camera' || item.source === 'proxy_manual';
 
     return (
-      <View style={[styles.entry, item.excluded && styles.entryExcluded, isWarned && styles.entryWarned]}>
+      <View style={[styles.entry, isProxy && styles.entryProxy, item.excluded && styles.entryExcluded, isWarned && styles.entryWarned]}>
         <View style={styles.entryHeader}>
           <Text style={[styles.entryDate, struck]}>{item.timestamp}</Text>
           <Text style={[styles.entryAmount, struck]}>
@@ -369,7 +372,7 @@ export default function SummaryScreen({ onSignedOut }: Props) {
           {item.store || '(店舗無し)'} / {item.category}
         </Text>
         <Text style={[styles.entryMeta, struck]}>
-          {item.user} · {item.source}
+          {isProxy ? `${item.user}（代理）` : item.user} · {item.source}
         </Text>
         {!!item.memo && (
           <TouchableOpacity onPress={() => toggleExpanded(key)} activeOpacity={0.6}>
@@ -1045,6 +1048,7 @@ const styles = StyleSheet.create({
   },
   entryExcluded: { backgroundColor: '#fafafa' },
   entryWarned:   { backgroundColor: '#ffedd5' },
+  entryProxy:    { backgroundColor: '#d1fae5' },
   entryHeader:   { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
   entryDate:     { fontSize: 12, color: '#666' },
   entryAmount:   { fontSize: 16, fontWeight: 'bold' },

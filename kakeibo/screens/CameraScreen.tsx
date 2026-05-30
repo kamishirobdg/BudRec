@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -24,7 +24,7 @@ import * as ImagePicker from 'expo-image-picker';
 import * as Notifications from 'expo-notifications';
 import { useNavigation } from '@react-navigation/native';
 import * as CategoryService from '../services/CategoryService';
-import { appendRow, ExpenseRow } from '../services/SheetsService';
+import { appendRow, ExpenseRow, getUniqueUsers } from '../services/SheetsService';
 import { AuthError } from '../services/AuthService';
 import { getCurrentUser } from '../services/UserService';
 import { getProvider } from '../providers';
@@ -61,6 +61,10 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
   // 手動入力モーダルの対象レシート
   const [manualTarget, setManualTarget] = useState<string | null>(null);
 
+  // 代理入力モード
+  const [proxyMode, setProxyMode] = useState(false);
+  const [proxyUser, setProxyUser] = useState('');
+
   // 通知権限を起動時にリクエスト（通知なしでも動作するので静かに）
   useEffect(() => {
     Notifications.requestPermissionsAsync().catch(() => {});
@@ -80,6 +84,50 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
     refreshPending();
   }, [refreshPending]);
 
+  const handleProxyToggle = useCallback(async () => {
+    if (proxyMode) {
+      setProxyMode(false);
+      setProxyUser('');
+      return;
+    }
+    try {
+      const currentUser = await getCurrentUser();
+      const allUsers = await getUniqueUsers();
+      const others = allUsers.filter((u) => u !== currentUser);
+      if (others.length === 0) {
+        Alert.alert('代理入力', '他のユーザーが見つかりません。相手のユーザーが入力を行った後に利用できます。');
+        return;
+      }
+      if (others.length === 1) {
+        setProxyUser(others[0]);
+        setProxyMode(true);
+        return;
+      }
+      Alert.alert(
+        '代理入力するユーザーを選択',
+        '',
+        others.map((u) => ({ text: u, onPress: () => { setProxyUser(u); setProxyMode(true); } })),
+      );
+    } catch {
+      Alert.alert('エラー', '代理入力の設定に失敗しました');
+    }
+  }, [proxyMode]);
+
+  useLayoutEffect(() => {
+    navigation.setOptions({
+      headerRight: () => (
+        <TouchableOpacity
+          style={[styles.proxyHeaderBtn, proxyMode && styles.proxyHeaderBtnActive]}
+          onPress={handleProxyToggle}
+        >
+          <Text style={[styles.proxyHeaderBtnText, proxyMode && styles.proxyHeaderBtnTextActive]}>
+            {proxyMode ? `代理: ${proxyUser}` : '代理入力'}
+          </Text>
+        </TouchableOpacity>
+      ),
+    });
+  }, [navigation, proxyMode, proxyUser, handleProxyToggle]);
+
   /** OCR → スプレッドシート書き込み。成功時は通知メッセージを返す。例外は投げるのみ */
   const runOcrAndSave = async (base64: string): Promise<string> => {
     setStatusMsg('OCR解析中...');
@@ -91,10 +139,11 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
     setStatusMsg('書き込み中...');
     onStatusChange('スプレッドシートに書き込み中...');
     const timestamp = formatTimestamp(data.date, data.time);
-    const user = await getCurrentUser();
+    const user = proxyMode ? proxyUser : await getCurrentUser();
+    const source = proxyMode ? 'proxy_camera' : 'camera';
     const row: ExpenseRow = {
       timestamp,
-      source:        'camera',
+      source,
       user,
       store:         data.store,
       category:      data.category,
@@ -338,6 +387,13 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
         mute
       />
 
+      {/* 代理入力モードバナー */}
+      {proxyMode && (
+        <View style={styles.proxyBanner}>
+          <Text style={styles.proxyBannerText}>代理入力中: {proxyUser}</Text>
+        </View>
+      )}
+
       {/* 未処理レシートバナー */}
       {pendingUris.length > 0 && !busy && (
         <View style={styles.pendingBanner}>
@@ -385,6 +441,7 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
         imageUri={manualTarget}
         onClose={() => setManualTarget(null)}
         onSave={handleManualSave}
+        proxyUser={proxyMode ? proxyUser : undefined}
       />
     </View>
   );
@@ -398,10 +455,12 @@ function ManualEntryModal({
   imageUri,
   onClose,
   onSave,
+  proxyUser,
 }: {
-  imageUri: string | null;
-  onClose:  () => void;
-  onSave:   (entry: ExpenseRow) => void;
+  imageUri:   string | null;
+  onClose:    () => void;
+  onSave:     (entry: ExpenseRow) => void;
+  proxyUser?: string;
 }) {
   const [timestamp, setTimestamp]   = useState('');
   const [store, setStore]           = useState('');
@@ -428,11 +487,13 @@ function ManualEntryModal({
     setCategory('');
     setAmount('');
     setMemo('');
-    getCurrentUser().then(setCurrentUserState).catch(() => setCurrentUserState(''));
+    if (!proxyUser) {
+      getCurrentUser().then(setCurrentUserState).catch(() => setCurrentUserState(''));
+    }
     CategoryService.getCategories()
       .then(setCategories)
       .catch(() => setCategories([]));
-  }, [imageUri]);
+  }, [imageUri, proxyUser]);
 
   if (!imageUri) return null;
 
@@ -452,8 +513,8 @@ function ManualEntryModal({
     }
     onSave({
       timestamp,
-      source:        'manual',
-      user:          currentUser,
+      source:        proxyUser ? 'proxy_manual' : 'manual',
+      user:          proxyUser ?? currentUser,
       store:         store.trim(),
       category:      category.trim(),
       amount:        amt,
@@ -504,7 +565,9 @@ function ManualEntryModal({
     >
       <SafeAreaView style={{ flex: 1, backgroundColor: '#fff' }}>
         <View style={styles.modalHeader}>
-          <Text style={styles.modalHeaderTitle}>手動入力</Text>
+          <Text style={styles.modalHeaderTitle}>
+            {proxyUser ? `手動入力（${proxyUser}の代理）` : '手動入力'}
+          </Text>
           <Button title="閉じる" onPress={onClose} />
         </View>
 
@@ -771,6 +834,42 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'space-between',
     elevation: 6,
+  },
+  proxyHeaderBtn: {
+    marginRight: 12,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: '#888',
+  },
+  proxyHeaderBtnActive: {
+    backgroundColor: '#16a34a',
+    borderColor: '#16a34a',
+  },
+  proxyHeaderBtnText: {
+    fontSize: 13,
+    color: '#444',
+  },
+  proxyHeaderBtnTextActive: {
+    color: '#fff',
+    fontWeight: 'bold',
+  },
+  proxyBanner: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    backgroundColor: 'rgba(22, 163, 74, 0.9)',
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    alignItems: 'center',
+    zIndex: 10,
+  },
+  proxyBannerText: {
+    color: '#fff',
+    fontSize: 14,
+    fontWeight: 'bold',
   },
   pendingBannerText: {
     color: '#1f2937',

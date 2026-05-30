@@ -745,6 +745,24 @@ export async function resetSkippedNotTransactionIds(): Promise<number> {
   return data.length;
 }
 
+/** 直近シートに存在するユーザー名一覧を返す。代理入力対象の選択に使用 */
+export async function getUniqueUsers(): Promise<string[]> {
+  const sheetName = getSheetNameFromDate();
+  const client = await createClient();
+  try {
+    const res = await client.get(`/values/${encodeURIComponent(sheetName)}!C:C`);
+    const rows: string[][] = res.data.values ?? [];
+    const users = new Set<string>();
+    for (let i = 1; i < rows.length; i++) {
+      const cell = rows[i]?.[0];
+      if (cell && cell.trim()) users.add(cell.trim());
+    }
+    return [...users];
+  } catch {
+    return [];
+  }
+}
+
 /** 取り込み履歴に1件追記する */
 export async function markGmailMessageProcessed(
   messageId: string,
