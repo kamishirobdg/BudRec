@@ -52,7 +52,7 @@ jobs:
 
       - name: Build debug APK
         working-directory: kakeibo/android
-        run: ./gradlew assembleDebug --no-daemon
+        run: ./gradlew assembleDebug --no-daemon -PbundleInDebug=true
         env:
           GRADLE_OPTS: '-Dorg.gradle.jvmargs=-Xmx4g'
 
