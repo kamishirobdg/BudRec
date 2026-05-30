@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - claude/competent-bose
+      - claude/reduce-google-relogin-MCMj8
       - main
   workflow_dispatch:
 
