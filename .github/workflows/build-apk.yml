@@ -49,6 +49,14 @@ jobs:
           echo "EXPO_PUBLIC_GOOGLE_CLIENT_ID_WEB=$WEB_CLIENT_ID" >> .env
           echo "EXPO_PUBLIC_SPREADSHEET_ID=$SPREADSHEET_ID" >> .env
 
+      - name: Verify .env keys and value lengths
+        working-directory: kakeibo
+        run: |
+          echo "=== .env contents (keys + value lengths) ==="
+          while IFS='=' read -r key value; do
+            echo "$key: ${#value} chars"
+          done < .env
+
       - name: Expo prebuild (generate Android native code)
         working-directory: kakeibo
         run: npx expo prebuild --platform android --no-install
