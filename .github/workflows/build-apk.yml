@@ -50,16 +50,13 @@ jobs:
         working-directory: kakeibo
         run: npx expo prebuild --platform android --no-install
 
-      - name: Bundle JavaScript into APK assets
+      - name: Enable JS bundling in debug builds
         working-directory: kakeibo
         run: |
-          mkdir -p android/app/src/main/assets
-          npx react-native bundle \
-            --platform android \
-            --dev false \
-            --entry-file index.js \
-            --bundle-output android/app/src/main/assets/index.android.bundle \
-            --assets-dest android/app/src/main/res/
+          # RNGP の react{} ブロックに bundleInDebug = true を追加
+          sed -i 's/^react {/react {\n    bundleInDebug = true/' android/app/build.gradle
+          echo "=== patched react{} block ==="
+          grep -A 5 "^react {" android/app/build.gradle
 
       - name: Build debug APK
         working-directory: kakeibo/android
