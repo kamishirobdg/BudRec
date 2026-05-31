@@ -50,9 +50,20 @@ jobs:
         working-directory: kakeibo
         run: npx expo prebuild --platform android --no-install
 
+      - name: Bundle JavaScript into APK assets
+        working-directory: kakeibo
+        run: |
+          mkdir -p android/app/src/main/assets
+          npx react-native bundle \
+            --platform android \
+            --dev false \
+            --entry-file index.js \
+            --bundle-output android/app/src/main/assets/index.android.bundle \
+            --assets-dest android/app/src/main/res/
+
       - name: Build debug APK
         working-directory: kakeibo/android
-        run: ./gradlew assembleDebug --no-daemon -PbundleInDebug=true
+        run: ./gradlew assembleDebug --no-daemon
         env:
           GRADLE_OPTS: '-Dorg.gradle.jvmargs=-Xmx4g'
 
