@@ -50,23 +50,40 @@ jobs:
         working-directory: kakeibo
         run: npx expo prebuild --platform android --no-install
 
-      - name: Enable JS bundling in debug builds
+      - name: Prepare signing keystore
         working-directory: kakeibo
         run: |
-          # RNGP の react{} ブロックに bundleInDebug = true を追加
-          sed -i 's/^react {/react {\n    bundleInDebug = true/' android/app/build.gradle
-          echo "=== patched react{} block ==="
-          grep -A 5 "^react {" android/app/build.gradle
+          if [ -n "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" ]; then
+            echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > release.keystore
+            echo "KEYSTORE_PASSWORD=${{ secrets.ANDROID_KEYSTORE_PASSWORD }}" >> $GITHUB_ENV
+            echo "KEY_ALIAS=${{ secrets.ANDROID_KEY_ALIAS }}" >> $GITHUB_ENV
+            echo "KEY_PASSWORD=${{ secrets.ANDROID_KEY_PASSWORD }}" >> $GITHUB_ENV
+          else
+            keytool -genkeypair -v \
+              -keystore release.keystore \
+              -alias release \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass android -keypass android \
+              -dname "CN=BudRec,O=Android,C=JP"
+            echo "KEYSTORE_PASSWORD=android" >> $GITHUB_ENV
+            echo "KEY_ALIAS=release" >> $GITHUB_ENV
+            echo "KEY_PASSWORD=android" >> $GITHUB_ENV
+          fi
 
-      - name: Build debug APK
+      - name: Build release APK
         working-directory: kakeibo/android
-        run: ./gradlew assembleDebug --no-daemon
+        run: |
+          ./gradlew assembleRelease --no-daemon \
+            -Pandroid.injected.signing.store.file=$(realpath ../release.keystore) \
+            -Pandroid.injected.signing.store.password=${{ env.KEYSTORE_PASSWORD }} \
+            -Pandroid.injected.signing.key.alias=${{ env.KEY_ALIAS }} \
+            -Pandroid.injected.signing.key.password=${{ env.KEY_PASSWORD }}
         env:
           GRADLE_OPTS: '-Dorg.gradle.jvmargs=-Xmx4g'
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: bud-rec-debug
-          path: kakeibo/android/app/build/outputs/apk/debug/app-debug.apk
+          name: bud-rec-release
+          path: kakeibo/android/app/build/outputs/apk/release/app-release.apk
           retention-days: 14
