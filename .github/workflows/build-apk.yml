@@ -38,13 +38,16 @@ jobs:
 
       - name: Create .env
         working-directory: kakeibo
+        env:
+          GEMINI_KEY: ${{ secrets.EXPO_PUBLIC_GEMINI_API_KEY }}
+          ANDROID_CLIENT_ID: ${{ secrets.EXPO_PUBLIC_GOOGLE_CLIENT_ID_ANDROID }}
+          WEB_CLIENT_ID: ${{ secrets.EXPO_PUBLIC_GOOGLE_CLIENT_ID_WEB }}
+          SPREADSHEET_ID: ${{ secrets.EXPO_PUBLIC_SPREADSHEET_ID }}
         run: |
-          cat > .env << 'EOF'
-          EXPO_PUBLIC_GEMINI_API_KEY=${{ secrets.EXPO_PUBLIC_GEMINI_API_KEY }}
-          EXPO_PUBLIC_GOOGLE_CLIENT_ID_ANDROID=${{ secrets.EXPO_PUBLIC_GOOGLE_CLIENT_ID_ANDROID }}
-          EXPO_PUBLIC_GOOGLE_CLIENT_ID_WEB=${{ secrets.EXPO_PUBLIC_GOOGLE_CLIENT_ID_WEB }}
-          EXPO_PUBLIC_SPREADSHEET_ID=${{ secrets.EXPO_PUBLIC_SPREADSHEET_ID }}
-          EOF
+          echo "EXPO_PUBLIC_GEMINI_API_KEY=$GEMINI_KEY" > .env
+          echo "EXPO_PUBLIC_GOOGLE_CLIENT_ID_ANDROID=$ANDROID_CLIENT_ID" >> .env
+          echo "EXPO_PUBLIC_GOOGLE_CLIENT_ID_WEB=$WEB_CLIENT_ID" >> .env
+          echo "EXPO_PUBLIC_SPREADSHEET_ID=$SPREADSHEET_ID" >> .env
 
       - name: Expo prebuild (generate Android native code)
         working-directory: kakeibo
