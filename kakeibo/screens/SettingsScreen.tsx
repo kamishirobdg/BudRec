@@ -232,113 +232,110 @@ export default function SettingsScreen({ onSignedOut }: Props) {
 
   return (
     <SafeAreaView style={styles.container}>
-      <Text style={styles.title}>この端末のユーザー</Text>
-      <View style={styles.inputRow}>
-        <TextInput
-          style={styles.input}
-          value={userInput}
-          onChangeText={setUserInput}
-          placeholder="あなたの名前"
-        />
-        <Button
-          title="保存"
-          onPress={handleSaveUser}
-          disabled={!userInput.trim() || userInput.trim() === savedUser}
-        />
-      </View>
-
-      <Text style={styles.title}>Gmail 取り込み</Text>
-      <View style={styles.gmailRow}>
-        <Text style={styles.gmailLabel}>検索期間</Text>
-        <TouchableOpacity
-          style={styles.pickerButton}
-          onPress={() => setWindowPickerOpen(true)}
-        >
-          <Text style={styles.pickerButtonText}>
-            {gmailWindowLabel(gmailWindow)} ▾
-          </Text>
-        </TouchableOpacity>
-      </View>
-      <TouchableOpacity
-        style={[
-          styles.runGmailBtn,
-          gmailProgress.running && styles.runGmailBtnDisabled,
-        ]}
-        onPress={handleRunGmailImport}
-        disabled={gmailProgress.running}
-      >
-        <Text style={styles.runGmailBtnText}>
-          {gmailProgress.running
-            ? `取り込み中... ${gmailProgress.phase}`
-            : '今すぐ取り込みを実行'}
-        </Text>
-      </TouchableOpacity>
-      <View style={styles.skippedRow}>
-        <TouchableOpacity
-          style={styles.skippedCheckBtn}
-          onPress={handleOpenSkipped}
-        >
-          <Text style={styles.skippedCheckBtnText}>スキップ済みを確認</Text>
-        </TouchableOpacity>
-        <TouchableOpacity
-          style={[
-            styles.resetSkippedBtn,
-            gmailProgress.running && styles.runGmailBtnDisabled,
-          ]}
-          onPress={handleResetSkipped}
-          disabled={gmailProgress.running}
-        >
-          <Text style={styles.resetSkippedBtnText}>再取り込み</Text>
-        </TouchableOpacity>
-      </View>
-      {gmailProgress.finished && gmailProgress.result && (
-        <Text style={styles.gmailResultText}>
-          前回: 取込 {gmailProgress.result.imported} / スキップ{' '}
-          {gmailProgress.result.skipped} / 失敗 {gmailProgress.result.failed}
-        </Text>
-      )}
-
-      <Text style={[styles.title, { marginTop: 20 }]}>カテゴリ設定</Text>
-
-      <View style={styles.inputRow}>
-        <TextInput
-          style={styles.input}
-          value={input}
-          onChangeText={setInput}
-          placeholder="新しいカテゴリ名"
-          editable={!loading}
-        />
-        <Button title="追加" onPress={handleAdd} disabled={loading || !input.trim()} />
-      </View>
-
       <FlatList
         data={categories}
         keyExtractor={(item) => item}
-        refreshControl={
-          <RefreshControl refreshing={refreshing} onRefresh={handleRefresh} />
+        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={handleRefresh} />}
+        ListHeaderComponent={
+          <View style={styles.body}>
+            {/* ユーザー */}
+            <Text style={styles.sectionLabel}>このデバイスのユーザー</Text>
+            <View style={styles.card}>
+              <View style={styles.cardRow}>
+                <TextInput
+                  style={styles.cardInput}
+                  value={userInput}
+                  onChangeText={setUserInput}
+                  placeholder="あなたの名前"
+                />
+                <TouchableOpacity
+                  style={[styles.smallBtn, (!userInput.trim() || userInput.trim() === savedUser) && styles.smallBtnDisabled]}
+                  onPress={handleSaveUser}
+                  disabled={!userInput.trim() || userInput.trim() === savedUser}
+                >
+                  <Text style={styles.smallBtnText}>保存</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+
+            {/* Gmail */}
+            <Text style={styles.sectionLabel}>Gmail 連携</Text>
+            <View style={styles.card}>
+              <View style={[styles.cardRow, styles.cardRowBorder]}>
+                <Text style={styles.cardRowLabel}>検索期間</Text>
+                <TouchableOpacity style={styles.pillBtn} onPress={() => setWindowPickerOpen(true)}>
+                  <Text style={styles.pillBtnText}>{gmailWindowLabel(gmailWindow)} ▾</Text>
+                </TouchableOpacity>
+              </View>
+              <TouchableOpacity
+                style={[styles.gmailRunBtn, gmailProgress.running && styles.gmailRunBtnDisabled]}
+                onPress={handleRunGmailImport}
+                disabled={gmailProgress.running}
+              >
+                <Text style={styles.gmailRunBtnText}>
+                  {gmailProgress.running ? `取り込み中... ${gmailProgress.phase}` : '今すぐ取り込みを実行'}
+                </Text>
+              </TouchableOpacity>
+              <View style={styles.skippedRow}>
+                <TouchableOpacity style={styles.skippedCheckBtn} onPress={handleOpenSkipped}>
+                  <Text style={styles.skippedCheckBtnText}>スキップ済みを確認</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.resetSkippedBtn, gmailProgress.running && styles.gmailRunBtnDisabled]}
+                  onPress={handleResetSkipped}
+                  disabled={gmailProgress.running}
+                >
+                  <Text style={styles.resetSkippedBtnText}>再取り込み</Text>
+                </TouchableOpacity>
+              </View>
+              {gmailProgress.finished && gmailProgress.result && (
+                <Text style={styles.gmailResultText}>
+                  前回: 取込 {gmailProgress.result.imported} / スキップ {gmailProgress.result.skipped} / 失敗 {gmailProgress.result.failed}
+                </Text>
+              )}
+            </View>
+
+            {/* カテゴリ */}
+            <Text style={styles.sectionLabel}>カテゴリ</Text>
+            <View style={[styles.card, { paddingBottom: 8 }]}>
+              <View style={[styles.cardRow, styles.cardRowBorder]}>
+                <TextInput
+                  style={styles.cardInput}
+                  value={input}
+                  onChangeText={setInput}
+                  placeholder="新しいカテゴリ名"
+                  editable={!loading}
+                />
+                <TouchableOpacity
+                  style={[styles.smallBtn, (loading || !input.trim()) && styles.smallBtnDisabled]}
+                  onPress={handleAdd}
+                  disabled={loading || !input.trim()}
+                >
+                  <Text style={styles.smallBtnText}>追加</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+          </View>
         }
         renderItem={({ item }) => (
-          <View style={styles.row}>
-            <Text style={styles.rowText}>{item}</Text>
-            <TouchableOpacity
-              onPress={() => handleDelete(item)}
-              disabled={loading}
-              style={styles.deleteBtn}
-            >
+          <View style={styles.categoryItem}>
+            <Text style={styles.categoryItemText}>{item}</Text>
+            <TouchableOpacity onPress={() => handleDelete(item)} disabled={loading} style={styles.deleteBtn}>
               <Text style={styles.deleteText}>削除</Text>
             </TouchableOpacity>
           </View>
         )}
         ListEmptyComponent={
-          <Text style={styles.empty}>
-            {loading ? '読み込み中...' : 'カテゴリがありません'}
-          </Text>
+          <Text style={styles.empty}>{loading ? '読み込み中...' : 'カテゴリがありません'}</Text>
+        }
+        ListFooterComponent={
+          <View style={styles.footer}>
+            <TouchableOpacity style={styles.signOutBtn} onPress={handleSignOut}>
+              <Text style={styles.signOutBtnText}>サインアウト</Text>
+            </TouchableOpacity>
+          </View>
         }
       />
-
-      <View style={styles.signOutBox}>
-        <Button title="サインアウト" onPress={handleSignOut} color="#888" />
-      </View>
 
       {/* スキップ済みメール確認モーダル */}
       <Modal
@@ -427,121 +424,70 @@ function gmailWindowLabel(w: GmailSearchWindow): string {
 }
 
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
+  container: { flex: 1, backgroundColor: '#f2f4f7' },
+  center:    { flex: 1, backgroundColor: '#f2f4f7', alignItems: 'center', justifyContent: 'center', gap: 16, paddingHorizontal: 24 },
+  empty:     { textAlign: 'center', color: '#888', marginTop: 16, paddingHorizontal: 16 },
+
+  body: { padding: 16 },
+
+  sectionLabel: { fontSize: 12, fontWeight: '600', color: '#888', letterSpacing: 0.5, marginBottom: 8, marginTop: 4, paddingHorizontal: 4 },
+
+  card: {
     backgroundColor: '#fff',
+    borderRadius: 16,
+    overflow: 'hidden',
+    marginBottom: 16,
     paddingHorizontal: 16,
-    paddingTop: 8,
+    paddingTop: 4,
   },
-  center: {
+  cardRow: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 12 },
+  cardRowBorder: { borderBottomWidth: 1, borderBottomColor: '#f0f0f0' },
+  cardRowLabel: { fontSize: 14, color: '#555', flex: 1 },
+  cardInput: {
     flex: 1,
-    backgroundColor: '#fff',
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: 16,
-    paddingHorizontal: 24,
+    fontSize: 15,
+    color: '#1a1a1a',
+    paddingVertical: 4,
   },
-  title: {
-    fontSize: 20,
-    fontWeight: 'bold',
-    marginBottom: 12,
-  },
-  inputRow: {
-    flexDirection: 'row',
-    gap: 8,
-    marginBottom: 12,
-    alignItems: 'center',
-  },
-  input: {
-    flex: 1,
-    borderWidth: 1,
-    borderColor: '#ccc',
-    borderRadius: 6,
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    fontSize: 16,
-  },
-  row: {
+
+  smallBtn: { backgroundColor: '#2e7d32', borderRadius: 10, paddingHorizontal: 16, paddingVertical: 8 },
+  smallBtnDisabled: { backgroundColor: '#ccc' },
+  smallBtnText: { color: '#fff', fontSize: 13, fontWeight: '600' },
+
+  pillBtn: { backgroundColor: '#f5f5f5', borderWidth: 1, borderColor: '#e0e0e0', borderRadius: 20, paddingHorizontal: 12, paddingVertical: 6 },
+  pillBtnText: { fontSize: 13, color: '#333' },
+
+  gmailRunBtn: { backgroundColor: '#2e7d32', borderRadius: 12, paddingVertical: 13, alignItems: 'center', marginVertical: 10 },
+  gmailRunBtnDisabled: { backgroundColor: '#9ca3af' },
+  gmailRunBtnText: { color: '#fff', fontSize: 14, fontWeight: 'bold' },
+
+  skippedRow:  { flexDirection: 'row', gap: 8, marginBottom: 10 },
+  skippedCheckBtn:      { flex: 1, borderWidth: 1, borderColor: '#9ca3af', borderRadius: 10, paddingVertical: 10, alignItems: 'center' },
+  skippedCheckBtnText:  { color: '#374151', fontSize: 13, fontWeight: '600' },
+  resetSkippedBtn:      { flex: 1, borderWidth: 1, borderColor: '#d97706', borderRadius: 10, paddingVertical: 10, alignItems: 'center' },
+  resetSkippedBtnText:  { color: '#d97706', fontSize: 13, fontWeight: '600' },
+  gmailResultText: { fontSize: 12, color: '#888', marginBottom: 10 },
+
+  categoryItem: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    paddingVertical: 12,
-    borderBottomWidth: 1,
-    borderBottomColor: '#eee',
-  },
-  rowText: {
-    fontSize: 16,
-  },
-  deleteBtn: {
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-  },
-  deleteText: {
-    color: '#d33',
-    fontSize: 14,
-  },
-  empty: {
-    textAlign: 'center',
-    color: '#888',
-    marginTop: 24,
-  },
-  signOutBox: {
-    marginTop: 16,
-    paddingVertical: 12,
-    borderTopWidth: 1,
-    borderTopColor: '#eee',
-  },
-
-  gmailRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 12,
-    marginBottom: 8,
-  },
-  gmailLabel: { fontSize: 14, color: '#444' },
-  pickerButton: {
-    borderWidth: 1,
-    borderColor: '#ccc',
-    borderRadius: 6,
-    paddingHorizontal: 12,
-    paddingVertical: 8,
+    marginHorizontal: 16,
+    paddingVertical: 13,
+    paddingHorizontal: 16,
     backgroundColor: '#fff',
+    borderBottomWidth: 1,
+    borderBottomColor: '#f5f5f5',
   },
-  pickerButtonText: { fontSize: 14, color: '#222' },
-  runGmailBtn: {
-    backgroundColor: '#2563eb',
-    borderRadius: 8,
-    paddingVertical: 12,
-    alignItems: 'center',
-    marginBottom: 8,
-  },
-  runGmailBtnDisabled: {
-    backgroundColor: '#9ca3af',
-  },
-  runGmailBtnText: { color: '#fff', fontSize: 14, fontWeight: 'bold' },
-  skippedRow: {
-    flexDirection: 'row',
-    gap: 8,
-    marginBottom: 8,
-  },
-  skippedCheckBtn: {
-    flex: 1,
-    borderWidth: 1,
-    borderColor: '#6b7280',
-    borderRadius: 8,
-    paddingVertical: 10,
-    alignItems: 'center',
-  },
-  skippedCheckBtnText: { color: '#374151', fontSize: 14, fontWeight: 'bold' },
-  resetSkippedBtn: {
-    flex: 1,
-    borderWidth: 1,
-    borderColor: '#d97706',
-    borderRadius: 8,
-    paddingVertical: 10,
-    alignItems: 'center',
-  },
-  resetSkippedBtnText: { color: '#d97706', fontSize: 14, fontWeight: 'bold' },
+  categoryItemText: { fontSize: 15, color: '#1a1a1a' },
+
+  deleteBtn:  { paddingHorizontal: 10, paddingVertical: 4 },
+  deleteText: { color: '#e53935', fontSize: 13, fontWeight: '600' },
+
+  footer: { padding: 16, paddingTop: 8 },
+  signOutBtn:     { borderRadius: 14, paddingVertical: 14, alignItems: 'center', backgroundColor: '#fff' },
+  signOutBtnText: { color: '#e53935', fontSize: 15, fontWeight: '600' },
+
   skippedModalContainer: {
     flex: 1,
     backgroundColor: '#fff',
@@ -572,31 +518,18 @@ const styles = StyleSheet.create({
   skippedSubject: { fontSize: 14, fontWeight: 'bold', color: '#111', marginBottom: 2 },
   skippedDate: { fontSize: 11, color: '#6b7280', marginBottom: 6 },
   skippedBody: { fontSize: 12, color: '#374151', lineHeight: 18 },
-  gmailResultText: { fontSize: 12, color: '#666', marginBottom: 8 },
-
-  modalBackdrop: {
-    flex: 1,
-    backgroundColor: 'rgba(0,0,0,0.4)',
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  modalSheet: {
-    backgroundColor: '#fff',
-    borderRadius: 12,
-    width: '80%',
-    maxHeight: '70%',
-    paddingVertical: 12,
-  },
+  modalBackdrop: { flex: 1, backgroundColor: 'rgba(0,0,0,0.4)', justifyContent: 'center', alignItems: 'center' },
+  modalSheet:    { backgroundColor: '#fff', borderRadius: 16, width: '80%', maxHeight: '70%', paddingVertical: 12 },
   modalTitle: {
     fontSize: 16,
     fontWeight: 'bold',
     paddingHorizontal: 16,
-    paddingBottom: 8,
+    paddingBottom: 10,
     borderBottomWidth: 1,
     borderBottomColor: '#eee',
   },
-  modalItem: { paddingHorizontal: 16, paddingVertical: 12 },
-  modalItemSelected: { backgroundColor: '#eaf2ff' },
-  modalItemText: { fontSize: 15, color: '#222' },
-  modalItemTextSelected: { color: '#2563eb', fontWeight: 'bold' },
+  modalItem:             { paddingHorizontal: 16, paddingVertical: 12 },
+  modalItemSelected:     { backgroundColor: '#e8f5e9' },
+  modalItemText:         { fontSize: 15, color: '#222' },
+  modalItemTextSelected: { color: '#2e7d32', fontWeight: 'bold' },
 });

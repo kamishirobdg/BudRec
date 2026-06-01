@@ -39,6 +39,29 @@ import SettingsScreen from './SettingsScreen';
 import PersonalModal from './PersonalModal';
 import MemoText from './MemoText';
 
+// ─── UI helpers ──────────────────────────────────────────────────────────────
+
+function sourceLabel(s: string): string {
+  if (s === 'camera' || s === 'proxy_camera') return 'カメラ';
+  if (s === 'gmail')  return 'Gmail';
+  if (s === 'manual' || s === 'proxy_manual') return '手入力';
+  if (s === 'suica')  return 'Suica';
+  return s;
+}
+
+function sourceBadgeColors(s: string): [string, string] {
+  if (s === 'gmail')  return ['#fce4ec', '#c62828'];
+  if (s === 'manual' || s === 'proxy_manual') return ['#f3e5f5', '#6a1b9a'];
+  return ['#e3f2fd', '#1565c0'];
+}
+
+function formatTimestamp(ts: string): string {
+  const m = ts.match(/\d{4}[\/\-](\d{2})[\/\-](\d{2})\s+(\d{2}:\d{2})/);
+  return m ? `${m[1]}/${m[2]} ${m[3]}` : ts;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 interface Props {
   onSignedOut: () => void;
 }
@@ -301,56 +324,65 @@ export default function SummaryScreen({ onSignedOut }: Props) {
     };
   }, [rows]);
 
-  const renderHeader = () => (
-    <View style={styles.summaryBox}>
-      <View style={styles.rangeRow}>
-        <Text style={styles.rangeLabel}>範囲</Text>
-        <TouchableOpacity
-          style={styles.rangeButton}
-          onPress={() => setPickerOpen(true)}
-        >
-          <Text style={styles.rangeButtonText}>{currentRangeLabel} ▾</Text>
-        </TouchableOpacity>
-        <Text style={[styles.rangeLabel, { marginLeft: 8 }]}>並び</Text>
-        <TouchableOpacity
-          style={styles.rangeButton}
-          onPress={() => setSortPickerOpen(true)}
-        >
-          <Text style={styles.rangeButtonText}>{sortLabel(sortKey)} ▾</Text>
-        </TouchableOpacity>
+  const renderHeader = () => {
+    const maxCat = summary.categories[0]?.[1] ?? 1;
+    return (
+      <View>
+        {/* コントロール行 */}
+        <View style={styles.rangeRow}>
+          <Text style={styles.rangeLabel}>期間</Text>
+          <TouchableOpacity style={styles.rangeButton} onPress={() => setPickerOpen(true)}>
+            <Text style={styles.rangeButtonText}>{currentRangeLabel} ▾</Text>
+          </TouchableOpacity>
+          <Text style={[styles.rangeLabel, { marginLeft: 8 }]}>並び</Text>
+          <TouchableOpacity style={styles.rangeButton} onPress={() => setSortPickerOpen(true)}>
+            <Text style={styles.rangeButtonText}>{sortLabel(sortKey)} ▾</Text>
+          </TouchableOpacity>
+        </View>
+
+        {/* 合計カード */}
+        <View style={styles.totalCard}>
+          <Text style={styles.totalCardLabel}>{currentRangeLabel}の支出合計</Text>
+          <Text style={styles.totalCardAmount}>¥{summary.total.toLocaleString()}</Text>
+          {summary.users.length > 0 && (
+            <View style={styles.userPills}>
+              {summary.users.map(([u, v]) => (
+                <View key={u} style={styles.userPill}>
+                  <Text style={styles.userPillName}>{u || '未設定'}</Text>
+                  <Text style={styles.userPillAmount}>¥{v.toLocaleString()}</Text>
+                </View>
+              ))}
+            </View>
+          )}
+        </View>
+
+        {/* カテゴリ別 */}
+        {summary.categories.length > 0 && (
+          <View style={styles.catCard}>
+            <Text style={styles.catCardTitle}>カテゴリ別</Text>
+            {summary.categories.map(([c, v]) => (
+              <View key={c} style={styles.catRow}>
+                <View style={styles.catRowLeft}>
+                  <Text style={styles.catName}>{c || '未設定'}</Text>
+                  <View style={styles.catBarBg}>
+                    <View style={[styles.catBarFill, { width: `${Math.min(100, Math.round((v / maxCat) * 100))}%` as any }]} />
+                  </View>
+                </View>
+                <Text style={styles.catAmount}>¥{v.toLocaleString()}</Text>
+              </View>
+            ))}
+          </View>
+        )}
+
+        {/* 明細セクションヘッダー */}
+        <View style={styles.detailsHeader}>
+          <Text style={styles.detailsHeaderText}>
+            明細 — <Text style={styles.detailsHeaderUser}>{currentUser || '自分'}</Text>
+          </Text>
+        </View>
       </View>
-
-      <Text style={styles.summaryTotal}>合計 ¥{summary.total.toLocaleString()}</Text>
-
-      <Text style={styles.summarySection}>ユーザー別</Text>
-      {summary.users.length === 0 ? (
-        <Text style={styles.summaryEmpty}>データ無し</Text>
-      ) : (
-        summary.users.map(([u, v]) => (
-          <View key={u} style={styles.summaryRow}>
-            <Text style={styles.summaryLabel}>{u || '(未設定)'}</Text>
-            <Text style={styles.summaryValue}>¥{v.toLocaleString()}</Text>
-          </View>
-        ))
-      )}
-
-      <Text style={styles.summarySection}>カテゴリ別</Text>
-      {summary.categories.length === 0 ? (
-        <Text style={styles.summaryEmpty}>データ無し</Text>
-      ) : (
-        summary.categories.map(([c, v]) => (
-          <View key={c} style={styles.summaryRow}>
-            <Text style={styles.summaryLabel}>{c || '(未設定)'}</Text>
-            <Text style={styles.summaryValue}>¥{v.toLocaleString()}</Text>
-          </View>
-        ))
-      )}
-
-      <Text style={[styles.summarySection, { marginTop: 16 }]}>
-        明細（{currentUser || '自分'}）
-      </Text>
-    </View>
-  );
+    );
+  };
 
   const renderItem = ({ item }: { item: ExpenseRow }) => {
     const isPartial = item.countedAmount !== item.amount;
@@ -359,64 +391,53 @@ export default function SummaryScreen({ onSignedOut }: Props) {
     const isExpanded = expanded.has(key);
     const isWarned = warningKeys.has(key);
     const isProxy = item.source === 'proxy_camera' || item.source === 'proxy_manual';
+    const [badgeBg, badgeColor] = sourceBadgeColors(item.source);
 
     return (
       <View style={[styles.entry, isProxy && styles.entryProxy, item.excluded && styles.entryExcluded, isWarned && styles.entryWarned]}>
-        <View style={styles.entryHeader}>
-          <Text style={[styles.entryDate, struck]}>{item.timestamp}</Text>
-          <Text style={[styles.entryAmount, struck]}>
-            ¥{item.amount.toLocaleString()}
-          </Text>
+        {/* 上段: 日時・バッジ + 金額 */}
+        <View style={styles.entryTop}>
+          <View style={styles.entryMetaRow}>
+            <Text style={[styles.entryDate, struck]}>{formatTimestamp(item.timestamp)}</Text>
+            <View style={[styles.sourceBadge, { backgroundColor: badgeBg }]}>
+              <Text style={[styles.sourceBadgeText, { color: badgeColor }]}>{sourceLabel(item.source)}</Text>
+            </View>
+            {isProxy && (
+              <View style={styles.proxyBadge}>
+                <Text style={styles.proxyBadgeText}>{item.user}（代理）</Text>
+              </View>
+            )}
+          </View>
+          <Text style={[styles.entryAmount, struck]}>¥{item.amount.toLocaleString()}</Text>
         </View>
+
+        {/* 店舗 / カテゴリ */}
         <Text style={[styles.entryStore, struck]}>
           {item.store || '(店舗無し)'} / {item.category}
         </Text>
-        <Text style={[styles.entryMeta, struck]}>
-          {isProxy ? `${item.user}（代理）` : item.user} · {item.source}
-        </Text>
+
+        {/* ユーザー (代理でない場合) */}
+        {!isProxy && <Text style={[styles.entryMeta, struck]}>{item.user}</Text>}
+
+        {/* メモ */}
         {!!item.memo && (
           <TouchableOpacity onPress={() => toggleExpanded(key)} activeOpacity={0.6}>
-            <MemoText
-              memo={item.memo}
-              style={[styles.entryMemo, struck]}
-              numberOfLines={isExpanded ? undefined : 2}
-            />
+            <MemoText memo={item.memo} style={[styles.entryMemo, struck]} numberOfLines={isExpanded ? undefined : 2} />
           </TouchableOpacity>
         )}
 
+        {/* トグルチップ */}
         <View style={styles.controls}>
-          <Checkbox
-            label="除外"
-            checked={item.excluded}
-            onPress={() => toggleExcluded(item)}
-          />
-          <Checkbox
-            label="一部計上"
-            checked={isPartial}
-            onPress={() => togglePartial(item)}
-          />
+          <ToggleChip label="除外" activeLabel="除外中" checked={item.excluded} onPress={() => toggleExcluded(item)} activeColor="#ef4444" />
+          <ToggleChip label="一部計上" checked={isPartial} onPress={() => togglePartial(item)} activeColor="#f59e0b" />
           {isPartial && (
-            <PartialAmountInput
-              value={item.countedAmount}
-              onCommit={(t) => commitPartialAmount(item, t)}
-            />
+            <PartialAmountInput value={item.countedAmount} onCommit={(t) => commitPartialAmount(item, t)} />
           )}
           {isWarned && (
-            <Checkbox
-              label="確認済み"
-              checked={item.confirmed}
-              onPress={() => toggleConfirmed(item)}
-            />
+            <ToggleChip label="確認済み" checked={item.confirmed} onPress={() => toggleConfirmed(item)} activeColor="#8b5cf6" />
           )}
-          <Checkbox
-            label="固定費"
-            checked={item.recurring}
-            onPress={() => toggleRecurring(item)}
-          />
-          <TouchableOpacity
-            style={styles.editBtn}
-            onPress={() => setEditTarget(item)}
-          >
+          <ToggleChip label="固定費" checked={item.recurring} onPress={() => toggleRecurring(item)} activeColor="#3b82f6" />
+          <TouchableOpacity style={styles.editBtn} onPress={() => setEditTarget(item)}>
             <Text style={styles.editBtnText}>編集</Text>
           </TouchableOpacity>
         </View>
@@ -588,6 +609,34 @@ function Checkbox({
   );
 }
 
+function ToggleChip({
+  label,
+  activeLabel,
+  checked,
+  onPress,
+  activeColor = '#ef4444',
+}: {
+  label:        string;
+  activeLabel?: string;
+  checked:      boolean;
+  onPress:      () => void;
+  activeColor?: string;
+}) {
+  const r = parseInt(activeColor.slice(1, 3), 16);
+  const g = parseInt(activeColor.slice(3, 5), 16);
+  const b = parseInt(activeColor.slice(5, 7), 16);
+  const bg = checked ? `rgba(${r},${g},${b},0.12)` : '#f5f5f5';
+  const col = checked ? activeColor : '#888';
+  return (
+    <TouchableOpacity style={[styles.toggleChip, { backgroundColor: bg }]} onPress={onPress}>
+      <View style={[styles.toggleDot, checked && { backgroundColor: col, borderColor: col }]} />
+      <Text style={[styles.toggleChipText, { color: col }]}>
+        {checked && activeLabel ? activeLabel : label}
+      </Text>
+    </TouchableOpacity>
+  );
+}
+
 function PartialAmountInput({
   value,
   onCommit,
@@ -723,9 +772,28 @@ function EditEntryModal({
           <Button title="閉じる" onPress={onClose} />
         </View>
         <ScrollView contentContainerStyle={styles.editForm}>
+          {/* 読み取り専用フィールド */}
+          <View style={styles.readOnlyGroup}>
+            <View style={styles.readOnlyRow}>
+              <Text style={styles.readOnlyLabel}>取込元</Text>
+              <View style={styles.readOnlyValueRow}>
+                {(() => { const [bg, col] = sourceBadgeColors(source); return (
+                  <View style={[styles.sourceBadge, { backgroundColor: bg }]}>
+                    <Text style={[styles.sourceBadgeText, { color: col }]}>{sourceLabel(source)}</Text>
+                  </View>
+                ); })()}
+                <Text style={styles.readOnlyNote}>変更不可</Text>
+              </View>
+            </View>
+            <View style={[styles.readOnlyRow, { borderBottomWidth: 0 }]}>
+              <Text style={styles.readOnlyLabel}>ユーザー</Text>
+              <View style={styles.readOnlyValueRow}>
+                <Text style={styles.readOnlyValue}>{user}</Text>
+                <Text style={styles.readOnlyNote}>変更不可</Text>
+              </View>
+            </View>
+          </View>
           <Field label="日時 (YYYY-MM-DD HH:MM)" value={timestamp} onChangeText={setTimestamp} />
-          <Field label="取込元 (source)" value={source} onChangeText={setSource} />
-          <Field label="ユーザー" value={user} onChangeText={setUser} />
           <Field label="店舗" value={store} onChangeText={setStore} />
 
           {/* カテゴリはプルダウン選択 */}
@@ -770,8 +838,10 @@ function EditEntryModal({
             <Text style={styles.checkboxLabel}>集計から除外</Text>
           </TouchableOpacity>
 
-          <View style={{ height: 16 }} />
-          <Button title="保存" onPress={handleSave} />
+          <View style={{ height: 8 }} />
+          <TouchableOpacity style={styles.saveBtn} onPress={handleSave}>
+            <Text style={styles.saveBtnText}>保存する</Text>
+          </TouchableOpacity>
 
           <View style={{ height: 24 }} />
           <TouchableOpacity
@@ -1006,126 +1076,157 @@ function RangePickerModal({
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#fff' },
-  center:    { flex: 1, backgroundColor: '#fff', alignItems: 'center', justifyContent: 'center' },
-  empty:     { textAlign: 'center', color: '#888', marginTop: 24 },
+  // ─── レイアウト ───────────────────────────────────────────────────────────
+  container: { flex: 1, backgroundColor: '#f2f4f7' },
+  center:    { flex: 1, backgroundColor: '#f2f4f7', alignItems: 'center', justifyContent: 'center' },
+  empty:     { textAlign: 'center', color: '#888', marginTop: 24, marginHorizontal: 16 },
 
-  summaryBox: {
-    padding: 16,
-    backgroundColor: '#f7f7f9',
-    borderBottomWidth: 1,
-    borderBottomColor: '#eee',
-  },
+  // ─── コントロール行 ───────────────────────────────────────────────────────
   rangeRow: {
     flexDirection: 'row',
     alignItems:    'center',
     gap:           8,
-    marginBottom:  8,
-  },
-  rangeLabel:      { fontSize: 13, color: '#444' },
-  rangeButton: {
-    paddingHorizontal: 12,
-    paddingVertical:   6,
-    backgroundColor:   '#fff',
-    borderWidth:       1,
-    borderColor:       '#ccc',
-    borderRadius:      6,
-  },
-  rangeButtonText: { fontSize: 14, color: '#222' },
-
-  summaryTotal:   { fontSize: 22, fontWeight: 'bold', color: '#2563eb', marginBottom: 12 },
-  summarySection: { fontSize: 14, fontWeight: 'bold', color: '#444', marginTop: 8, marginBottom: 4 },
-  summaryEmpty:   { fontSize: 13, color: '#888' },
-  summaryRow:     { flexDirection: 'row', justifyContent: 'space-between', paddingVertical: 2 },
-  summaryLabel:   { fontSize: 14, color: '#222' },
-  summaryValue:   { fontSize: 14, color: '#222' },
-
-  entry: {
     paddingHorizontal: 16,
     paddingVertical:   12,
+    backgroundColor:   '#fff',
     borderBottomWidth: 1,
-    borderBottomColor: '#eee',
+    borderBottomColor: '#f0f0f0',
+  },
+  rangeLabel:      { fontSize: 13, color: '#666' },
+  rangeButton: {
+    paddingHorizontal: 12,
+    paddingVertical:    5,
+    backgroundColor:   '#f5f5f5',
+    borderWidth:        1,
+    borderColor:       '#e0e0e0',
+    borderRadius:      20,
+  },
+  rangeButtonText: { fontSize: 13, color: '#333' },
+
+  // ─── 合計カード ───────────────────────────────────────────────────────────
+  totalCard: {
+    margin: 16,
+    marginBottom: 0,
+    backgroundColor: '#2e7d32',
+    borderRadius: 20,
+    padding: 20,
+  },
+  totalCardLabel:  { fontSize: 12, color: 'rgba(255,255,255,0.8)', marginBottom: 4 },
+  totalCardAmount: { fontSize: 30, fontWeight: '700', color: '#fff', letterSpacing: -0.5, marginBottom: 16 },
+  userPills:       { flexDirection: 'row', gap: 10 },
+  userPill: {
+    flex: 1,
+    backgroundColor: 'rgba(255,255,255,0.2)',
+    borderRadius: 12,
+    padding: 10,
+  },
+  userPillName:   { fontSize: 12, color: 'rgba(255,255,255,0.85)', marginBottom: 2 },
+  userPillAmount: { fontSize: 15, fontWeight: '700', color: '#fff' },
+
+  // ─── カテゴリカード ───────────────────────────────────────────────────────
+  catCard: {
+    margin: 16,
+    marginBottom: 0,
+    backgroundColor: '#fff',
+    borderRadius: 16,
+    overflow: 'hidden',
+  },
+  catCardTitle: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: '#333',
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: '#f5f5f5',
+  },
+  catRow:    { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, paddingVertical: 10, gap: 12 },
+  catRowLeft: { flex: 1, gap: 4 },
+  catName:   { fontSize: 13, color: '#333' },
+  catBarBg:  { height: 4, backgroundColor: '#f0f0f0', borderRadius: 2 },
+  catBarFill: { height: 4, backgroundColor: '#2e7d32', borderRadius: 2 },
+  catAmount: { fontSize: 14, fontWeight: '600', color: '#333' },
+
+  // ─── 明細ヘッダー ─────────────────────────────────────────────────────────
+  detailsHeader: {
+    marginTop: 16,
+    marginHorizontal: 16,
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    backgroundColor: '#fff',
+    borderTopLeftRadius: 16,
+    borderTopRightRadius: 16,
+    borderBottomWidth: 1,
+    borderBottomColor: '#f0f0f0',
+  },
+  detailsHeaderText: { fontSize: 14, fontWeight: '700', color: '#333' },
+  detailsHeaderUser: { color: '#2e7d32' },
+
+  // ─── 明細カード ───────────────────────────────────────────────────────────
+  entry: {
+    paddingHorizontal: 16,
+    paddingVertical:   14,
+    backgroundColor:   '#fff',
+    marginHorizontal:  16,
+    borderBottomWidth: 1,
+    borderBottomColor: '#f5f5f5',
   },
   entryExcluded: { backgroundColor: '#fafafa' },
-  entryWarned:   { backgroundColor: '#ffedd5' },
-  entryProxy:    { backgroundColor: '#d1fae5' },
-  entryHeader:   { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
-  entryDate:     { fontSize: 12, color: '#666' },
-  entryAmount:   { fontSize: 16, fontWeight: 'bold' },
-  entryStore:    { fontSize: 15, marginTop: 2 },
-  entryMeta:     { fontSize: 12, color: '#888', marginTop: 2 },
-  entryMemo:     { fontSize: 12, color: '#666', marginTop: 2 },
-  struck:        { textDecorationLine: 'line-through', color: '#999' },
+  entryWarned:   { backgroundColor: '#fff7ed' },
+  entryProxy:    { backgroundColor: '#f0fdf4' },
 
-  controls: {
-    flexDirection: 'row',
-    alignItems:    'center',
-    flexWrap:      'wrap',
-    gap:           12,
-    marginTop:     8,
-  },
-  checkbox:      { flexDirection: 'row', alignItems: 'center', gap: 6 },
-  checkboxLabel: { fontSize: 13 },
-  box: {
-    width:        18,
-    height:       18,
-    borderWidth:  1,
-    borderColor:  '#888',
-    borderRadius: 3,
-    alignItems:   'center',
-    justifyContent: 'center',
-  },
-  boxChecked: { backgroundColor: '#2563eb', borderColor: '#2563eb' },
-  boxMark:    { color: '#fff', fontSize: 12, lineHeight: 14 },
+  entryTop:     { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 6 },
+  entryMetaRow: { flexDirection: 'row', alignItems: 'center', gap: 5, flex: 1, flexWrap: 'wrap' },
+  entryDate:    { fontSize: 12, color: '#999' },
+  entryAmount:  { fontSize: 17, fontWeight: '700', color: '#1a1a1a' },
+  entryStore:   { fontSize: 15, fontWeight: '600', color: '#1a1a1a', marginBottom: 2 },
+  entryMeta:    { fontSize: 12, color: '#888', marginBottom: 4 },
+  entryMemo:    { fontSize: 12, color: '#aaa', marginTop: 4 },
+  struck:       { textDecorationLine: 'line-through', color: '#bbb' },
+
+  // ─── バッジ ───────────────────────────────────────────────────────────────
+  sourceBadge:     { paddingHorizontal: 7, paddingVertical: 2, borderRadius: 8 },
+  sourceBadgeText: { fontSize: 10, fontWeight: '500' },
+  proxyBadge:      { paddingHorizontal: 7, paddingVertical: 2, borderRadius: 8, backgroundColor: '#dcfce7' },
+  proxyBadgeText:  { fontSize: 10, fontWeight: '500', color: '#166534' },
+
+  // ─── トグルチップ ─────────────────────────────────────────────────────────
+  controls: { flexDirection: 'row', alignItems: 'center', flexWrap: 'wrap', gap: 6, marginTop: 10 },
+  toggleChip:     { flexDirection: 'row', alignItems: 'center', gap: 4, paddingHorizontal: 10, paddingVertical: 5, borderRadius: 12 },
+  toggleDot:      { width: 8, height: 8, borderRadius: 4, borderWidth: 1.5, borderColor: '#ccc' },
+  toggleChipText: { fontSize: 11 },
 
   partialInput: {
     borderWidth: 1,
-    borderColor: '#ccc',
-    borderRadius: 4,
+    borderColor: '#e0e0e0',
+    borderRadius: 8,
     paddingHorizontal: 8,
     paddingVertical: 4,
     fontSize: 14,
     minWidth: 80,
     textAlign: 'right',
+    backgroundColor: '#fff',
   },
 
-  modalBackdrop: {
-    flex: 1,
-    backgroundColor: 'rgba(0,0,0,0.4)',
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  modalSheet: {
-    backgroundColor: '#fff',
-    borderRadius: 12,
-    width: '80%',
-    maxHeight: '70%',
-    paddingVertical: 12,
-  },
+  editBtn:     { marginLeft: 'auto' as any, paddingHorizontal: 14, paddingVertical: 5, backgroundColor: '#f5f5f5', borderRadius: 10 },
+  editBtnText: { fontSize: 12, color: '#555', fontWeight: '600' },
+
+  // ─── モーダル共通 ─────────────────────────────────────────────────────────
+  modalBackdrop: { flex: 1, backgroundColor: 'rgba(0,0,0,0.4)', justifyContent: 'center', alignItems: 'center' },
+  modalSheet:    { backgroundColor: '#fff', borderRadius: 16, width: '85%', maxHeight: '70%', paddingVertical: 12 },
   modalTitle: {
     fontSize: 16,
     fontWeight: 'bold',
     paddingHorizontal: 16,
-    paddingBottom: 8,
+    paddingBottom: 10,
     borderBottomWidth: 1,
     borderBottomColor: '#eee',
   },
-  modalItem: {
-    paddingHorizontal: 16,
-    paddingVertical: 12,
-  },
-  modalItemSelected: { backgroundColor: '#eaf2ff' },
-  modalItemText: { fontSize: 15, color: '#222' },
-  modalItemTextSelected: { color: '#2563eb', fontWeight: 'bold' },
-
-  editBtn: {
-    paddingHorizontal: 12,
-    paddingVertical:   4,
-    borderWidth:       1,
-    borderColor:       '#2563eb',
-    borderRadius:      4,
-  },
-  editBtnText: { fontSize: 13, color: '#2563eb' },
+  modalItem:             { paddingHorizontal: 16, paddingVertical: 12 },
+  modalItemSelected:     { backgroundColor: '#e8f5e9' },
+  modalItemText:         { fontSize: 15, color: '#222' },
+  modalItemTextSelected: { color: '#2e7d32', fontWeight: 'bold' },
+  modalItemTextAdd:      { color: '#2e7d32', fontWeight: 'bold' },
 
   modalHeader: {
     flexDirection: 'row',
@@ -1135,50 +1236,71 @@ const styles = StyleSheet.create({
     paddingVertical: 12,
     borderBottomWidth: 1,
     borderBottomColor: '#eee',
+    backgroundColor: '#fff',
   },
-  modalHeaderTitle: { fontSize: 18, fontWeight: 'bold' },
+  modalHeaderTitle: { fontSize: 18, fontWeight: '700' },
 
-  editForm: { padding: 16 },
-  fieldBox:   { marginBottom: 12 },
-  fieldLabel: { fontSize: 12, color: '#666', marginBottom: 4 },
+  // ─── 編集フォーム ─────────────────────────────────────────────────────────
+  editForm: { padding: 16, backgroundColor: '#f2f4f7', gap: 0 },
+
+  readOnlyGroup: { backgroundColor: '#fff', borderRadius: 14, overflow: 'hidden', marginBottom: 12 },
+  readOnlyRow:   { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: '#f5f5f5', gap: 10 },
+  readOnlyLabel:    { fontSize: 13, color: '#888', width: 60 },
+  readOnlyValueRow: { flexDirection: 'row', alignItems: 'center', gap: 8, flex: 1 },
+  readOnlyValue:    { fontSize: 15, color: '#333' },
+  readOnlyNote:     { fontSize: 10, backgroundColor: '#f5f5f5', color: '#999', paddingHorizontal: 6, paddingVertical: 2, borderRadius: 6 },
+
+  fieldBox:        { marginBottom: 12 },
+  fieldLabel:      { fontSize: 12, color: '#666', marginBottom: 4 },
   fieldInput: {
     borderWidth: 1,
-    borderColor: '#ccc',
-    borderRadius: 6,
-    paddingHorizontal: 12,
-    paddingVertical: 8,
+    borderColor: '#e0e0e0',
+    borderRadius: 12,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
     fontSize: 15,
+    backgroundColor: '#fff',
   },
   fieldInputMulti: { minHeight: 80, textAlignVertical: 'top' },
-  editNote: { fontSize: 11, color: '#888', marginTop: 12 },
+  editNote:        { fontSize: 11, color: '#999', marginTop: 12, lineHeight: 16 },
 
   pickerButton: {
     borderWidth: 1,
-    borderColor: '#ccc',
-    borderRadius: 6,
-    paddingHorizontal: 12,
+    borderColor: '#e0e0e0',
+    borderRadius: 12,
+    paddingHorizontal: 14,
     paddingVertical: 10,
     backgroundColor: '#fff',
   },
   pickerButtonText: { fontSize: 15, color: '#222' },
 
-  modalItemTextAdd: { color: '#2563eb', fontWeight: 'bold' },
+  saveBtn:     { backgroundColor: '#2e7d32', borderRadius: 14, paddingVertical: 14, alignItems: 'center', marginTop: 4 },
+  saveBtnText: { color: '#fff', fontSize: 16, fontWeight: '700' },
 
-  deleteBtn: {
-    borderWidth: 1,
-    borderColor: '#dc2626',
-    borderRadius: 6,
-    paddingVertical: 10,
+  deleteBtn:     { borderWidth: 1, borderColor: '#dc2626', borderRadius: 12, paddingVertical: 12, alignItems: 'center', backgroundColor: '#fff' },
+  deleteBtnText: { fontSize: 15, color: '#dc2626', fontWeight: '600' },
+
+  // ─── チェックボックス (編集モーダル内) ───────────────────────────────────
+  checkbox:      { flexDirection: 'row', alignItems: 'center', gap: 8, paddingVertical: 4 },
+  checkboxLabel: { fontSize: 14, color: '#333' },
+  box: {
+    width: 20,
+    height: 20,
+    borderWidth: 1.5,
+    borderColor: '#ccc',
+    borderRadius: 4,
     alignItems: 'center',
-    backgroundColor: '#fff',
+    justifyContent: 'center',
   },
-  deleteBtnText: { fontSize: 15, color: '#dc2626', fontWeight: 'bold' },
+  boxChecked: { backgroundColor: '#2e7d32', borderColor: '#2e7d32' },
+  boxMark:    { color: '#fff', fontSize: 13, lineHeight: 15 },
 
+  // ─── Gmail バナー ─────────────────────────────────────────────────────────
   gmailBanner: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 10,
-    backgroundColor: '#2563eb',
+    backgroundColor: '#1d4ed8',
     paddingHorizontal: 14,
     paddingVertical: 8,
   },
