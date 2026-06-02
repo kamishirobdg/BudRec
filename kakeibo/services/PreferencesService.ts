@@ -19,3 +19,17 @@ export async function getSortKey(): Promise<SortKey> {
 export async function setSortKey(key: SortKey): Promise<void> {
   await setItem(SORT_KEY, key);
 }
+
+// ─── 固定費 月次適用 ──────────────────────────────────────────────────────────
+
+const RECURRING_APPLIED_MONTH = 'recurring_applied_month';
+
+/** 最後に固定費を月初コピーした月（'YYYY-MM'）を返す */
+export async function getRecurringAppliedMonth(): Promise<string | null> {
+  return getItem(RECURRING_APPLIED_MONTH);
+}
+
+/** 固定費コピー済み月を記録する */
+export async function setRecurringAppliedMonth(month: string): Promise<void> {
+  await setItem(RECURRING_APPLIED_MONTH, month);
+}

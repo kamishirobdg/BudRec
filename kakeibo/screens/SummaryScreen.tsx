@@ -28,12 +28,19 @@ import {
   updateRow,
   updateRowFlags,
   updateRecurringFlag,
+  applyRecurringEntries,
 } from '../services/SheetsService';
 import * as CategoryService from '../services/CategoryService';
 import { getCurrentUser } from '../services/UserService';
 import { detectDuplicateWarnings } from '../services/DuplicateDetector';
 import { useGmailProgress } from '../services/GmailProgressService';
-import { SortKey, getSortKey, setSortKey } from '../services/PreferencesService';
+import {
+  SortKey,
+  getSortKey,
+  setSortKey,
+  getRecurringAppliedMonth,
+  setRecurringAppliedMonth,
+} from '../services/PreferencesService';
 import { AuthError } from '../services/AuthService';
 import SettingsScreen from './SettingsScreen';
 import PersonalModal from './PersonalModal';
@@ -43,15 +50,17 @@ import MemoText from './MemoText';
 
 function sourceLabel(s: string): string {
   if (s === 'camera' || s === 'proxy_camera') return 'カメラ';
-  if (s === 'gmail')  return 'Gmail';
+  if (s === 'gmail')    return 'Gmail';
   if (s === 'manual' || s === 'proxy_manual') return '手入力';
-  if (s === 'suica')  return 'Suica';
+  if (s === 'suica')    return 'Suica';
+  if (s === 'recurring') return '固定費';
   return s;
 }
 
 function sourceBadgeColors(s: string): [string, string] {
-  if (s === 'gmail')  return ['#fce4ec', '#c62828'];
+  if (s === 'gmail')    return ['#fce4ec', '#c62828'];
   if (s === 'manual' || s === 'proxy_manual') return ['#f3e5f5', '#6a1b9a'];
+  if (s === 'recurring') return ['#e8f5e9', '#2e7d32'];
   return ['#e3f2fd', '#1565c0'];
 }
 
@@ -89,6 +98,7 @@ export default function SummaryScreen({ onSignedOut }: Props) {
   const [editTarget, setEditTarget]     = useState<ExpenseRow | null>(null);
   const [sortKey, setSortKeyState]      = useState<SortKey>('timestamp');
   const [sortPickerOpen, setSortPickerOpen] = useState(false);
+  const [catView, setCatView]           = useState<'total' | 'byUser'>('total');
   const gmailProgress                    = useGmailProgress();
 
   // ソートキーを Storage から復元
@@ -286,6 +296,25 @@ export default function SummaryScreen({ onSignedOut }: Props) {
     });
   };
 
+  // ─── 固定費: 月初に未適用なら自動コピー ─────────────────────────────────────
+  const checkAndApplyRecurring = useCallback(async () => {
+    const currentMonth = getSheetNameFromDate();
+    try {
+      const applied = await getRecurringAppliedMonth();
+      if (applied === currentMonth) return;
+      const count = await applyRecurringEntries();
+      await setRecurringAppliedMonth(currentMonth);
+      if (count > 0) loadRows(currentRange);
+    } catch (e) {
+      if (e instanceof AuthError) onSignedOut();
+    }
+  }, [currentRange, loadRows, onSignedOut]);
+
+  useEffect(() => {
+    checkAndApplyRecurring();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // 起動時1回のみ
+
   // ─── 集計対象（自分の行 ＋ 自分が代理入力した行） ───
   const myRows = useMemo(() => {
     const isProxyEntry = (r: ExpenseRow) =>
@@ -324,6 +353,25 @@ export default function SummaryScreen({ onSignedOut }: Props) {
     };
   }, [rows]);
 
+  // カテゴリ×ユーザー別集計（全ユーザー対象）
+  const summaryByUserCat = useMemo(() => {
+    const byCatUser = new Map<string, Map<string, number>>();
+    for (const r of rows) {
+      if (r.excluded) continue;
+      const cat = r.category || '未設定';
+      if (!byCatUser.has(cat)) byCatUser.set(cat, new Map());
+      const um = byCatUser.get(cat)!;
+      um.set(r.user, (um.get(r.user) ?? 0) + r.countedAmount);
+    }
+    return [...byCatUser.entries()]
+      .map(([cat, um]) => ({
+        cat,
+        total: [...um.values()].reduce((a, b) => a + b, 0),
+        users: [...um.entries()].sort((a, b) => b[1] - a[1]),
+      }))
+      .sort((a, b) => b.total - a.total);
+  }, [rows]);
+
   const renderHeader = () => {
     const maxCat = summary.categories[0]?.[1] ?? 1;
     return (
@@ -359,18 +407,55 @@ export default function SummaryScreen({ onSignedOut }: Props) {
         {/* カテゴリ別 */}
         {summary.categories.length > 0 && (
           <View style={styles.catCard}>
-            <Text style={styles.catCardTitle}>カテゴリ別</Text>
-            {summary.categories.map(([c, v]) => (
-              <View key={c} style={styles.catRow}>
-                <View style={styles.catRowLeft}>
-                  <Text style={styles.catName}>{c || '未設定'}</Text>
-                  <View style={styles.catBarBg}>
-                    <View style={[styles.catBarFill, { width: `${Math.min(100, Math.round((v / maxCat) * 100))}%` as any }]} />
+            {/* ヘッダー行: タイトル + 人別トグル */}
+            <View style={styles.catCardHeaderRow}>
+              <Text style={styles.catCardTitle}>カテゴリ別</Text>
+              <TouchableOpacity
+                style={[styles.catViewToggle, catView === 'byUser' && styles.catViewToggleActive]}
+                onPress={() => setCatView((v) => v === 'total' ? 'byUser' : 'total')}
+              >
+                <Text style={[styles.catViewToggleText, catView === 'byUser' && styles.catViewToggleTextActive]}>
+                  人別
+                </Text>
+              </TouchableOpacity>
+            </View>
+
+            {catView === 'total' ? (
+              /* ── 合計ビュー ── */
+              summary.categories.map(([c, v]) => (
+                <View key={c} style={styles.catRow}>
+                  <View style={styles.catRowLeft}>
+                    <Text style={styles.catName}>{c || '未設定'}</Text>
+                    <View style={styles.catBarBg}>
+                      <View style={[styles.catBarFill, { width: `${Math.min(100, Math.round((v / maxCat) * 100))}%` as any }]} />
+                    </View>
                   </View>
+                  <Text style={styles.catAmount}>¥{v.toLocaleString()}</Text>
                 </View>
-                <Text style={styles.catAmount}>¥{v.toLocaleString()}</Text>
-              </View>
-            ))}
+              ))
+            ) : (
+              /* ── 人別ビュー ── */
+              summaryByUserCat.map(({ cat, total, users }) => {
+                const maxUser = users[0]?.[1] ?? 1;
+                return (
+                  <View key={cat} style={styles.catUserGroup}>
+                    <View style={styles.catUserGroupHeader}>
+                      <Text style={styles.catUserGroupName}>{cat}</Text>
+                      <Text style={styles.catAmount}>¥{total.toLocaleString()}</Text>
+                    </View>
+                    {users.map(([user, amt]) => (
+                      <View key={user} style={styles.catUserRow}>
+                        <Text style={styles.catUserName}>{user}</Text>
+                        <View style={styles.catBarBg}>
+                          <View style={[styles.catUserBar, { width: `${Math.round((amt / maxUser) * 100)}%` as any }]} />
+                        </View>
+                        <Text style={styles.catUserAmt}>¥{amt.toLocaleString()}</Text>
+                      </View>
+                    ))}
+                  </View>
+                );
+              })
+            )}
           </View>
         )}
 
@@ -1131,21 +1216,43 @@ const styles = StyleSheet.create({
     borderRadius: 16,
     overflow: 'hidden',
   },
-  catCardTitle: {
-    fontSize: 14,
-    fontWeight: '700',
-    color: '#333',
+  catCardHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
     paddingHorizontal: 16,
-    paddingVertical: 12,
+    paddingVertical: 10,
     borderBottomWidth: 1,
     borderBottomColor: '#f5f5f5',
   },
+  catCardTitle: { fontSize: 14, fontWeight: '700', color: '#333' },
+  catViewToggle: {
+    paddingHorizontal: 12,
+    paddingVertical: 4,
+    borderRadius: 14,
+    backgroundColor: '#f5f5f5',
+    borderWidth: 1,
+    borderColor: '#e0e0e0',
+  },
+  catViewToggleActive:     { backgroundColor: '#2e7d32', borderColor: '#2e7d32' },
+  catViewToggleText:       { fontSize: 12, color: '#666', fontWeight: '600' },
+  catViewToggleTextActive: { color: '#fff' },
+
   catRow:    { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, paddingVertical: 10, gap: 12 },
   catRowLeft: { flex: 1, gap: 4 },
   catName:   { fontSize: 13, color: '#333' },
   catBarBg:  { height: 4, backgroundColor: '#f0f0f0', borderRadius: 2 },
   catBarFill: { height: 4, backgroundColor: '#2e7d32', borderRadius: 2 },
   catAmount: { fontSize: 14, fontWeight: '600', color: '#333' },
+
+  // カテゴリ×人別
+  catUserGroup:      { borderBottomWidth: 1, borderBottomColor: '#f5f5f5', paddingBottom: 8 },
+  catUserGroupHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingHorizontal: 16, paddingTop: 10, paddingBottom: 4 },
+  catUserGroupName:  { fontSize: 13, fontWeight: '700', color: '#333' },
+  catUserRow:  { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, paddingVertical: 4, gap: 8 },
+  catUserName: { fontSize: 12, color: '#666', width: 64 },
+  catUserBar:  { height: 4, backgroundColor: '#43a047', borderRadius: 2 },
+  catUserAmt:  { fontSize: 12, fontWeight: '600', color: '#555' },
 
   // ─── 明細ヘッダー ─────────────────────────────────────────────────────────
   detailsHeader: {

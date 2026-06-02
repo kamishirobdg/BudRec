@@ -763,6 +763,65 @@ export async function getUniqueUsers(): Promise<string[]> {
   }
 }
 
+// ─── 固定費: 月初自動コピー ───────────────────────────────────────────────────
+
+/**
+ * 前月の固定費エントリを今月1日付けでコピーする。
+ * 既に source='recurring' の同一キー（店舗・カテゴリ・ユーザー・金額）が
+ * 今月に存在する場合はスキップする（二重作成防止）。
+ * @returns 作成した件数
+ */
+export async function applyRecurringEntries(): Promise<number> {
+  const currentMonth = getSheetNameFromDate();
+
+  // 前月シート名
+  const nowDate  = new Date();
+  const prevDate = new Date(nowDate.getFullYear(), nowDate.getMonth() - 1, 1);
+  const prevMonth = getSheetNameFromDate(prevDate);
+
+  // 前月シートが存在しなければスキップ
+  const client = await createClient();
+  const existing = await listSheetNames(client);
+  if (!existing.includes(prevMonth)) return 0;
+
+  // 前月の固定費エントリ
+  const prevRows      = await getRows(prevMonth);
+  const recurringRows = prevRows.filter((r) => r.recurring && !r.deleted);
+  if (recurringRows.length === 0) return 0;
+
+  // 今月の既存 recurring エントリのキーセット
+  const currentRows = await getRows(currentMonth);
+  const alreadyKeys = new Set(
+    currentRows
+      .filter((r) => r.source === 'recurring')
+      .map((r) => `${r.store}|${r.category}|${r.user}|${r.amount}`),
+  );
+
+  // 今月1日のタイムスタンプ（YYYY/MM/01 00:00:00）
+  const firstDay = `${currentMonth.replace('-', '/')}/01 00:00:00`;
+
+  let created = 0;
+  for (const entry of recurringRows) {
+    const key = `${entry.store}|${entry.category}|${entry.user}|${entry.amount}`;
+    if (alreadyKeys.has(key)) continue;
+
+    await appendRow({
+      ...entry,
+      timestamp:  firstDay,
+      source:     'recurring',
+      excluded:   false,
+      confirmed:  false,
+      deleted:    false,
+      rowIndex:   undefined,
+      sheetName:  undefined,
+    });
+    alreadyKeys.add(key); // 同一エントリが複数あっても2回作らない
+    created++;
+  }
+
+  return created;
+}
+
 /** 取り込み履歴に1件追記する */
 export async function markGmailMessageProcessed(
   messageId: string,
