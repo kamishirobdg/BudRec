@@ -8,6 +8,7 @@ import {
   Pressable,
   RefreshControl,
   StyleSheet,
+  Switch,
   Text,
   TextInput,
   TouchableOpacity,
@@ -21,7 +22,7 @@ import {
   removeCategory,
 } from '../services/CategoryService';
 import { signOut } from '../services/AuthService';
-import { getCurrentUser, setCurrentUser } from '../services/UserService';
+import { getCurrentUserRaw, setCurrentUser } from '../services/UserService';
 import {
   GmailSearchWindow,
   GMAIL_SEARCH_WINDOW_OPTIONS,
@@ -29,7 +30,9 @@ import {
   setGmailSearchWindow,
   resetSkippedNotTransactionIds,
   getSkippedNotTransactionMessageIds,
+  getUniqueUsersRaw,
 } from '../services/SheetsService';
+import * as Demo from '../services/DemoService';
 import { runGmailImport, getSkippedMessageSummaries, SkippedMessageSummary } from '../services/GmailService';
 import { useGmailProgress } from '../services/GmailProgressService';
 
@@ -51,24 +54,56 @@ export default function SettingsScreen({ onSignedOut }: Props) {
   const [skippedLoading, setSkippedLoading] = useState(false);
   const [skippedItems, setSkippedItems]     = useState<SkippedMessageSummary[]>([]);
 
+  // ─── デモモード ───
+  const [demo, setDemo]           = useState<Demo.DemoConfig>(Demo.getConfigSync);
+  const [demoUsers, setDemoUsers] = useState<string[]>([]); // 実名の一覧
+  const [aliasDraft, setAliasDraft] = useState<Record<string, string>>({});
+
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const [list, u, win] = await Promise.all([
+      const [list, u, win, cfg] = await Promise.all([
         getCategories(),
-        getCurrentUser(),
+        getCurrentUserRaw(),
         getGmailSearchWindow(),
+        Demo.loadConfig(),
       ]);
       setCategories(list);
       setUserInput(u);
       setSavedUser(u);
       setGmailWindowState(win);
+      setDemo(cfg);
+
+      // デモ表示名の対応表を作るために「シートに実在する名前」を集める
+      const sheetUsers = await getUniqueUsersRaw();
+      const names = [...new Set([u, ...sheetUsers])];
+      setDemoUsers(names);
+      setAliasDraft(
+        Object.fromEntries(names.map((n) => [n, cfg.aliases[n] ?? ''])),
+      );
     } catch (e) {
       Alert.alert('読み込み失敗', e instanceof Error ? e.message : String(e));
     } finally {
       setLoading(false);
     }
   }, []);
+
+  const patchDemo = async (patch: Partial<Demo.DemoConfig>) => {
+    try {
+      setDemo(await Demo.updateConfig(patch));
+    } catch (e) {
+      Alert.alert('保存失敗', e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  /** 表示名の入力を確定してデモ設定に保存する */
+  const commitAlias = (realName: string) => {
+    const next = { ...demo.aliases };
+    const v = (aliasDraft[realName] ?? '').trim();
+    if (v) next[realName] = v;
+    else delete next[realName];
+    patchDemo({ aliases: next });
+  };
 
   const handlePickWindow = async (v: GmailSearchWindow) => {
     setWindowPickerOpen(false);
@@ -238,6 +273,83 @@ export default function SettingsScreen({ onSignedOut }: Props) {
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={handleRefresh} />}
         ListHeaderComponent={
           <View style={styles.body}>
+            {/* デモモード */}
+            <Text style={styles.sectionLabel}>デモモード</Text>
+            <View style={styles.card}>
+              <View style={[styles.cardRow, demo.enabled && styles.cardRowBorder]}>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.cardRowLabel}>デモ表示に切り替える</Text>
+                  <Text style={styles.demoHint}>
+                    名前と金額を差し替えて表示します。ONの間の追加・編集・削除は
+                    スプレッドシートに保存されません（アプリを閉じると消えます）。
+                  </Text>
+                </View>
+                <Switch
+                  value={demo.enabled}
+                  onValueChange={(v) => patchDemo({ enabled: v })}
+                  trackColor={{ false: '#ccc', true: '#a5d6a7' }}
+                  thumbColor={demo.enabled ? '#2e7d32' : '#f4f3f4'}
+                />
+              </View>
+
+              {demo.enabled && (
+                <>
+                  <Text style={styles.demoGroupLabel}>表示名</Text>
+                  {demoUsers.map((name) => (
+                    <View key={name} style={[styles.cardRow, styles.cardRowBorder]}>
+                      <Text style={styles.demoRealName} numberOfLines={1}>{name} →</Text>
+                      <TextInput
+                        style={styles.cardInput}
+                        value={aliasDraft[name] ?? ''}
+                        onChangeText={(v) => setAliasDraft((p) => ({ ...p, [name]: v }))}
+                        onBlur={() => commitAlias(name)}
+                        onSubmitEditing={() => commitAlias(name)}
+                        placeholder={Demo.maskUser(name)}
+                        returnKeyType="done"
+                      />
+                    </View>
+                  ))}
+
+                  <Text style={styles.demoGroupLabel}>金額の倍率</Text>
+                  <View style={[styles.cardRow, styles.cardRowBorder, { flexWrap: 'wrap' }]}>
+                    {Demo.SCALE_OPTIONS.map((s) => (
+                      <TouchableOpacity
+                        key={s}
+                        style={[styles.pillBtn, demo.scale === s && styles.pillBtnActive]}
+                        onPress={() => patchDemo({ scale: s })}
+                      >
+                        <Text style={[styles.pillBtnText, demo.scale === s && styles.pillBtnTextActive]}>
+                          ×{s}
+                        </Text>
+                      </TouchableOpacity>
+                    ))}
+                  </View>
+                  <Text style={styles.demoHint}>
+                    倍率に加えて明細ごとに ±20% ずらすため、実際の金額は分かりません。
+                  </Text>
+
+                  <View style={[styles.cardRow, styles.cardRowBorder]}>
+                    <Text style={styles.cardRowLabel}>店名もぼかす</Text>
+                    <Switch
+                      value={demo.maskStore}
+                      onValueChange={(v) => patchDemo({ maskStore: v })}
+                      trackColor={{ false: '#ccc', true: '#a5d6a7' }}
+                      thumbColor={demo.maskStore ? '#2e7d32' : '#f4f3f4'}
+                    />
+                  </View>
+                  <View style={styles.cardRow}>
+                    <Text style={styles.cardRowLabel}>メモを隠す</Text>
+                    <Switch
+                      value={demo.hideMemo}
+                      onValueChange={(v) => patchDemo({ hideMemo: v })}
+                      trackColor={{ false: '#ccc', true: '#a5d6a7' }}
+                      thumbColor={demo.hideMemo ? '#2e7d32' : '#f4f3f4'}
+                    />
+                  </View>
+                </>
+              )}
+            </View>
+
             {/* ユーザー */}
             <Text style={styles.sectionLabel}>このデバイスのユーザー</Text>
             <View style={styles.card}>
@@ -456,6 +568,12 @@ const styles = StyleSheet.create({
 
   pillBtn: { backgroundColor: '#f5f5f5', borderWidth: 1, borderColor: '#e0e0e0', borderRadius: 20, paddingHorizontal: 12, paddingVertical: 6 },
   pillBtnText: { fontSize: 13, color: '#333' },
+  pillBtnActive:     { backgroundColor: '#e8f5e9', borderColor: '#2e7d32' },
+  pillBtnTextActive: { color: '#2e7d32', fontWeight: 'bold' },
+
+  demoHint:       { fontSize: 11, color: '#888', lineHeight: 16, marginTop: 2, paddingBottom: 8 },
+  demoGroupLabel: { fontSize: 11, fontWeight: '600', color: '#888', marginTop: 10 },
+  demoRealName:   { fontSize: 14, color: '#555', maxWidth: 120 },
 
   gmailRunBtn: { backgroundColor: '#2e7d32', borderRadius: 12, paddingVertical: 13, alignItems: 'center', marginVertical: 10 },
   gmailRunBtnDisabled: { backgroundColor: '#9ca3af' },

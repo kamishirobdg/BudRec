@@ -13,6 +13,18 @@ export class AuthError extends Error {
   }
 }
 
+/**
+ * 一時的にトークンを更新できなかった（通信断・Google 側の 5xx など）。
+ * リフレッシュトークンは有効なままなので、**サインアウトさせてはいけない**。
+ * 画面側は AuthError と区別して「あとで再試行」の扱いにする。
+ */
+export class TransientAuthError extends Error {
+  constructor(message = 'ネットワークエラーのため通信できませんでした') {
+    super(message);
+    this.name = 'TransientAuthError';
+  }
+}
+
 // ─── クライアントID（.env の EXPO_PUBLIC_GOOGLE_CLIENT_ID_* に設定） ─────────
 // Google Cloud Console → 認証情報 → OAuthクライアントID で取得
 // Web用: Web 動作確認 / Dev Build 両方で使用
@@ -190,9 +202,50 @@ export async function handleAuthCallback(): Promise<boolean> {
   }
 }
 
+// ─── 内部: トークン更新 ───────────────────────────────────────────────────────
+
+/**
+ * リフレッシュ中の Promise。
+ * 起動直後は「一覧の読み込み」「Gmail 取り込み」などが同時に走るため、
+ * 同じリフレッシュトークンで並行リフレッシュすると片方が失敗して
+ * サインアウト扱いになりうる。常に 1 本にまとめる。
+ */
+let inflightRefresh: Promise<string> | null = null;
+
+function refreshSingleFlight(refreshToken: string): Promise<string> {
+  if (!inflightRefresh) {
+    inflightRefresh = (async () => {
+      const { clientId } = getClientConfig();
+      const refreshed = await AuthSession.refreshAsync(
+        { clientId, refreshToken },
+        GOOGLE_DISCOVERY,
+      );
+      await saveTokens(refreshed);
+      return refreshed.accessToken;
+    })().finally(() => {
+      inflightRefresh = null;
+    });
+  }
+  return inflightRefresh;
+}
+
+/**
+ * 「リフレッシュトークンそのものが無効」＝再サインインしか手が無い失敗かどうか。
+ * 通信断や 5xx をこれと混同して消してしまうと、無用な再ログインが発生する。
+ */
+function isPermanentAuthFailure(e: unknown): boolean {
+  const code = (e as { code?: unknown } | null)?.code;
+  if (typeof code === 'string') {
+    return ['invalid_grant', 'invalid_client', 'unauthorized_client'].includes(code);
+  }
+  const msg = e instanceof Error ? e.message.toLowerCase() : '';
+  return msg.includes('invalid_grant') || msg.includes('invalid_client');
+}
+
 /**
  * 保存済みアクセストークンを返す。
  * 有効期限切れならリフレッシュを試みる。未サインインなら null。
+ * @throws TransientAuthError 通信失敗などで更新できなかった場合（サインアウト不要）
  */
 export async function getAccessToken(): Promise<string | null> {
   const [accessToken, expiresAtStr, refreshToken] = await Promise.all([
@@ -201,10 +254,10 @@ export async function getAccessToken(): Promise<string | null> {
     Storage.getItem(SECURE_STORE_KEYS.REFRESH_TOKEN),
   ]);
 
-  if (!accessToken) return null;
+  if (!accessToken && !refreshToken) return null;
 
   const expiresAt = expiresAtStr ? parseInt(expiresAtStr, 10) : 0;
-  const isExpired = Date.now() >= expiresAt - 60_000;
+  const isExpired = !accessToken || Date.now() >= expiresAt - 60_000;
   if (!isExpired) return accessToken;
 
   if (!refreshToken) {
@@ -213,15 +266,31 @@ export async function getAccessToken(): Promise<string | null> {
   }
 
   try {
-    const { clientId } = getClientConfig();
-    const refreshed = await AuthSession.refreshAsync(
-      { clientId, refreshToken },
-      GOOGLE_DISCOVERY,
-    );
-    await saveTokens(refreshed);
-    return refreshed.accessToken;
-  } catch {
+    return await refreshSingleFlight(refreshToken);
+  } catch (e) {
+    if (isPermanentAuthFailure(e)) {
+      await clearTokens();
+      return null;
+    }
+    throw new TransientAuthError();
+  }
+}
+
+/**
+ * 期限内でも API から 401 が返った場合（Google 側でトークンが失効した等）に、
+ * 強制的にアクセストークンを取り直す。
+ * @returns 新しいアクセストークン。取り直せなければ null（＝再サインインが必要）
+ */
+export async function refreshAccessTokenNow(): Promise<string | null> {
+  const refreshToken = await Storage.getItem(SECURE_STORE_KEYS.REFRESH_TOKEN);
+  if (!refreshToken) {
     await clearTokens();
+    return null;
+  }
+  try {
+    return await refreshSingleFlight(refreshToken);
+  } catch (e) {
+    if (isPermanentAuthFailure(e)) await clearTokens();
     return null;
   }
 }
@@ -240,10 +309,17 @@ export async function signOut(): Promise<void> {
   }
 }
 
-/** サインイン済みかどうかを確認する（期限切れ時はリフレッシュを試みる） */
+/**
+ * サインイン済みかどうかを確認する（期限切れ時はリフレッシュを試みる）。
+ * 通信できなかっただけの場合は、リフレッシュトークンが残っている限り
+ * サインイン済みとして扱う（オフラインでサインアウトさせない）。
+ */
 export async function isSignedIn(): Promise<boolean> {
-  const token = await getAccessToken();
-  return token !== null;
+  try {
+    return (await getAccessToken()) !== null;
+  } catch {
+    return (await Storage.getItem(SECURE_STORE_KEYS.REFRESH_TOKEN)) !== null;
+  }
 }
 
 // ─── 内部: トークン保存 / 削除 ───────────────────────────────────────────────

@@ -1,9 +1,13 @@
 # Bud-Rec 引き継ぎドキュメント
 
 > 新しいチャットセッションを開始するときは、このファイルを読ませてから作業を依頼してください。
-> 例: 「/home/user/BudRec/HANDOFF.md を読んで、状況を把握してから作業を始めて」
+> 例: 「BudRec/HANDOFF.md を読んで、状況を把握してから作業を始めて」
+>
+> 作業場所は 2 系統ある。**パスを間違えないこと。**
+> - Windows ローカル: `C:\work\BudRec`（`kakeibo/node_modules` あり → `npx tsc --noEmit` が通る）
+> - クラウドコンテナ: `/home/user/BudRec`（node_modules 無し）
 
-最終更新: 2026-07-30 / 最新コミット `d134982`
+最終更新: 2026-07-30 / 最新コミット `d134982` + ローカル未 push 分（デモモード・認証堅牢化）
 
 ---
 
@@ -103,7 +107,7 @@ Hermes エンジンでは `new Date('2026/07/30 12:00:00')` が **NaN** にな�
 
 ## 5. 実装済み機能
 
-- Google サインイン（トークンは SecureStore、期限切れ時は `AuthError` を投げて再ログインへ）
+- Google サインイン（トークンは SecureStore。下記「再ログインを減らす対策」参照）
 - レシート撮影 / ギャラリー選択 → Gemini OCR → 内容確認 → シートへ追加
 - Gmail 取込（アプリ復帰時に 5 分クールダウンで自動実行、設定画面から手動実行も可）
 - 重複警告（`DuplicateDetector`）＋「確認済み」フラグ
@@ -115,6 +119,7 @@ Hermes エンジンでは `new Date('2026/07/30 12:00:00')` が **NaN** にな�
 - 代理入力（`proxy_camera` / `proxy_manual`、一覧で緑背景＋代理バッジ）
 - **固定費の月初自動作成**（下記参照）
 - 設定: 端末ユーザー名、Gmail 連携、カテゴリ追加/削除、サインアウト
+- **デモモード**（外部にアプリを見せる用。下記参照）
 - UI デザイン刷新済み（背景 `#f2f4f7` / プライマリ `#2e7d32` / カード角丸 16–20）
 - アプリアイコン: 緑グラデーション角丸＋💰絵文字
 
@@ -127,6 +132,41 @@ Hermes エンジンでは `new Date('2026/07/30 12:00:00')` が **NaN** にな�
    - `recurring: true` は維持されるので翌月以降も連鎖する
 4. 重複防止キー = `store|category|user|amount`（当月の `source === 'recurring'` 行から構築）
 5. 作成件数 > 0 なら一覧を再読み込み
+
+### 再ログインを減らす対策（`services/AuthService.ts`）
+アプリ側は以下まで対応済み。**これでも直らない場合の本命は Google Cloud Console の
+OAuth 同意画面の公開ステータス**（「テスト」のままだとリフレッシュトークンが 7 日で失効する）。
+
+- リフレッシュは **single-flight**。起動直後は一覧読み込みと Gmail 取り込みが同時に走り、
+  同じリフレッシュトークンで並行更新して片方が失敗 → サインアウト、という事故が起きうる。
+- **一時的な失敗でトークンを消さない。** `invalid_grant` / `invalid_client` /
+  `unauthorized_client` のときだけ消す。通信断や 5xx では `TransientAuthError` を投げる
+  （`AuthError` とは別クラス。画面側はアラートだけ出してサインイン状態を維持する）。
+- `isSignedIn()` は通信できなかっただけならリフレッシュトークンの有無で判定する（オフラインで落とさない）。
+- Sheets/Gmail は **401 を 1 回だけ強制リフレッシュして再送**（`refreshAccessTokenNow()`）。
+  期限内でも Google 側で失効しているケースを拾う。
+- ネイティブの `prompt: 'consent'` は**外さないこと**。付けないと 2 回目以降の
+  サインインでリフレッシュトークンが返らず、1 時間ごとに再ログインになる。
+
+### デモモードの仕組み（`services/DemoService.ts`）
+設定画面いちばん上のスイッチで ON/OFF。設定は端末ローカル（Storage）に保存。
+
+- **マスキングは読み出しの出口だけ**でやる。`SheetsService.getRows` / `getUniqueUsers` /
+  `UserService.getCurrentUser` が返す値を差し替えるので、画面側はデモモードを知らない。
+- 名前 = 設定画面の対応表（実名 → 表示名）。未設定の名前は `ユーザーA`〜`H` に自動割当。
+- 金額 = 倍率（×0.5〜×2）＋**行内容のハッシュから決まる ±20% のジッター**。
+  同じ行はいつ見ても同じ偽金額になる（リロードで金額が動くと不自然なため）。
+  `amount` と `countedAmount` には同じ倍率を掛ける（一部計上の比率を壊さない）。
+- 店名ぼかし（既定 OFF）・メモ非表示（既定 ON）は個別スイッチ。
+- **デモ中の書き込みはスプレッドシートに一切届かない。** メモリ上のオーバーレイ
+  （追加行 + `sheetName:rowIndex` キーのパッチ）に溜め、`getRows` の最後で重ねる。
+  → 追加・編集・削除・トグルの実演はできるが実データは汚れない。アプリ再起動で消える。
+- デモ中は Gmail 取り込み・固定費の月初コピー・カテゴリ変更・設定変更を停止する
+  （固定費は「適用済み」フラグも立てないので、デモ解除後に改めて走る）。
+- 一覧の合計カード右上に小さく `DEMO` バッジが出る（付けっぱなし防止）。
+- 実名を触る画面（設定のユーザー名欄、デモ対応表）は `getCurrentUserRaw()` /
+  `getUniqueUsersRaw()` を使う。**ここを `getCurrentUser()` にすると、
+  デモ表示名を実名として保存してしまう**ので注意。
 
 **未対応**: 過去データのタイムスタンプ遡及修正（複数シートの履歴書き換えになるため見送り）。
 遡及は「前月 → 当月」の 1 世代分だけ初回起動時に自動適用される。
@@ -156,16 +196,42 @@ Google 側で「Missing required parameter: client_id / エラー400」になる
 
 ### 注意: 毎回インストールし直しが必要
 `ANDROID_KEYSTORE_BASE64` / `ANDROID_KEYSTORE_PASSWORD` / `ANDROID_KEY_ALIAS` / `ANDROID_KEY_PASSWORD`
-が未設定なので、ビルドごとに `keytool` で新しいキーストアを生成している。
+が未設定なので、ビルドごとに `keytool` で新しいキーストアを生成している（未設定のときは
+ビルドログに `::warning::` を出す）。
 → 署名が毎回変わるため、**新しい APK を入れる前に旧アプリをアンインストールする必要がある**。
+アンインストールすると SecureStore ごと消えるので **Google 再ログインも毎回発生する**。
 恒久キーストアを Secrets に入れれば解消する（ワークフロー側は既に対応済み）。
+
+### リンクを送るだけで配布したい場合（EAS internal distribution）
+`eas.json` に `preview`（`distribution: internal` / APK）と `production`（AAB）を定義済み。
+`eas build -p android --profile preview` を通すと expo.dev のインストールページ URL と QR が発行され、
+リンクを送るだけで入る。署名鍵は EAS 側が保持するので**毎回同じ署名＝上書き更新でき、
+ログイン状態も維持される**（GitHub Actions の使い捨てキーストア問題が消える）。
+
+事前に必要なもの:
+- `app.json` の `extra.eas.projectId`（コミット済み）
+- EAS 環境変数を `preview` 環境に 4 つ登録: `eas env:create --environment preview --name EXPO_PUBLIC_...`
+  （`.env` は EAS のビルドサーバーには存在しないため必須）
+
+**リポジトリは public なので、GitHub Releases に APK を置くのは避ける。**
+APK には `EXPO_PUBLIC_GEMINI_API_KEY` が埋め込まれており、誰でも取り出せてしまう。
+アクセス制御が必要なら Firebase App Distribution（テスター招待制）を使う。
 
 ### リリース（debug 不可の理由）
 `assembleDebug` は Metro 開発サーバー前提で JS をバンドルに含めないため使えない。
 必ず `assembleRelease` を使う。
 
-## 7. 開発環境の制約（このコンテナ）
+## 7. 開発環境の制約
 
+### Windows ローカル（`C:\work\BudRec`）
+- `kakeibo/node_modules` があるので **`npx tsc --noEmit` がそのまま通る（現状エラー 0 件）**。
+  型チェックはここでやるのが速い。
+- git remote は `origin` = `kamishirobdg/BudRec`。ブランチは
+  `claude/reduce-google-relogin-MCMj8`。push すると 26 分の CI ビルドが走るので、
+  push するかどうかは都度確認する。
+- コンテナ側とズレるので、作業開始前に `git fetch origin` して差分を確認する。
+
+### クラウドコンテナ（`/home/user/BudRec`）
 - **`node_modules` が未インストール**。そのため `npx tsc --noEmit` は
   `TS2307 Cannot find module 'react'` / `TS17004 JSX` / `TS2591 process` などで数百件エラーになる。
   これらは既存の環境起因であり、コードの問題ではない。自分の変更だけ確認するには:
@@ -192,7 +258,7 @@ Google 側で「Missing required parameter: client_id / エラー400」になる
 
 ### 優先度の高い改善
 - [ ] **API レートリミット対策（指数バックオフ付きリトライ）** ← 最優先。Sheets/Gmail の 429 で落ちる
-- [ ] axios にタイムアウト設定
+- [x] axios にタイムアウト設定（Sheets/Gmail ともに 30 秒）
 - [ ] React ErrorBoundary（クラッシュ時の白画面回避）
 - [ ] 書き込み失敗時のリトライキュー
 - [ ] エラー時の再試行 UI

@@ -4,8 +4,18 @@
   },
   "build": {
     "preview": {
+      "//": "内部配布用。ビルド後に expo.dev のインストールページ（URL/QR）が発行され、リンクを送るだけで入れられる。署名鍵は EAS が保管するので毎回同じ＝アンインストール不要",
+      "distribution": "internal",
+      "environment": "preview",
       "android": {
         "buildType": "apk"
+      }
+    },
+    "production": {
+      "//": "Play ストア用（AAB）。現状は未使用",
+      "environment": "production",
+      "android": {
+        "buildType": "app-bundle"
       }
     }
   }

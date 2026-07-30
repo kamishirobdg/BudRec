@@ -10,6 +10,7 @@ import CameraScreen from './screens/CameraScreen';
 import SummaryScreen from './screens/SummaryScreen';
 import { handleAuthCallback, isSignedIn } from './services/AuthService';
 import { runGmailImport } from './services/GmailService';
+import { loadConfig as loadDemoConfig } from './services/DemoService';
 
 const Tab = createBottomTabNavigator();
 
@@ -35,6 +36,8 @@ export default function App() {
 
   useEffect(() => {
     (async () => {
+      // デモモード設定を先に読む（各サービスが同期的に参照するため）
+      await loadDemoConfig();
       try {
         // Web リダイレクトからの戻りを処理（native では no-op）
         await handleAuthCallback();

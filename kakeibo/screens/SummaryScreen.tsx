@@ -42,6 +42,7 @@ import {
   setRecurringAppliedMonth,
 } from '../services/PreferencesService';
 import { AuthError } from '../services/AuthService';
+import * as Demo from '../services/DemoService';
 import SettingsScreen from './SettingsScreen';
 import PersonalModal from './PersonalModal';
 import MemoText from './MemoText';
@@ -99,6 +100,7 @@ export default function SummaryScreen({ onSignedOut }: Props) {
   const [sortKey, setSortKeyState]      = useState<SortKey>('timestamp');
   const [sortPickerOpen, setSortPickerOpen] = useState(false);
   const [catView, setCatView]           = useState<'total' | 'byUser'>('total');
+  const [demoMode, setDemoMode]         = useState(Demo.isDemoSync);
   const gmailProgress                    = useGmailProgress();
 
   // ソートキーを Storage から復元
@@ -147,7 +149,7 @@ export default function SummaryScreen({ onSignedOut }: Props) {
 
   // 範囲オプションを作る（月一覧と年一覧をシートから取得）
   const buildRangeOptions = useCallback(async () => {
-    let months: string[], years: number[];
+    let months: string[], years: string[];
     try {
       [months, years] = await Promise.all([listMonthSheetNames(), listAvailableYears()]);
     } catch (e) {
@@ -172,14 +174,16 @@ export default function SummaryScreen({ onSignedOut }: Props) {
   const loadRows = useCallback(async (range: RangeSpec) => {
     setLoading(true);
     try {
-      const [list, partial, user] = await Promise.all([
+      const [list, partial, user, demo] = await Promise.all([
         getRowsForRange(range),
         getDefaultPartialAmount(),
         getCurrentUser(),
+        Demo.isDemo(),
       ]);
       setRows(list);
       setDefaultPartial(partial);
       setCurrentUserState(user);
+      setDemoMode(demo);
     } catch (e) {
       if (e instanceof AuthError) { onSignedOut(); return; }
       Alert.alert('読み込み失敗', e instanceof Error ? e.message : String(e));
@@ -208,6 +212,12 @@ export default function SummaryScreen({ onSignedOut }: Props) {
       lastGmailFinishedRef.current = false;
     }
   }, [gmailProgress.finished, gmailProgress.result, loadRows, currentRange]);
+
+  /** 設定を閉じる。デモモードの ON/OFF を即座に反映するため再読み込みする */
+  const closeSettings = () => {
+    setSettingsOpen(false);
+    loadRows(currentRange);
+  };
 
   const handleRefresh = async () => {
     setRefreshing(true);
@@ -300,6 +310,8 @@ export default function SummaryScreen({ onSignedOut }: Props) {
   const checkAndApplyRecurring = useCallback(async () => {
     const currentMonth = getSheetNameFromDate();
     try {
+      // デモ中は実行しない。適用済みフラグも立てない（デモ解除後に改めて走らせる）
+      if (await Demo.isDemo()) return;
       const applied = await getRecurringAppliedMonth();
       if (applied === currentMonth) return;
       const count = await applyRecurringEntries();
@@ -390,6 +402,11 @@ export default function SummaryScreen({ onSignedOut }: Props) {
 
         {/* 合計カード */}
         <View style={styles.totalCard}>
+          {demoMode && (
+            <View style={styles.demoPill}>
+              <Text style={styles.demoPillText}>DEMO</Text>
+            </View>
+          )}
           <Text style={styles.totalCardLabel}>{currentRangeLabel}の支出合計</Text>
           <Text style={styles.totalCardAmount}>¥{summary.total.toLocaleString()}</Text>
           {summary.users.length > 0 && (
@@ -642,12 +659,12 @@ export default function SummaryScreen({ onSignedOut }: Props) {
       <Modal
         visible={settingsOpen}
         animationType="slide"
-        onRequestClose={() => setSettingsOpen(false)}
+        onRequestClose={() => closeSettings()}
       >
         <SafeAreaView style={{ flex: 1, backgroundColor: '#fff' }}>
           <View style={styles.modalHeader}>
             <Text style={styles.modalHeaderTitle}>設定</Text>
-            <Button title="閉じる" onPress={() => setSettingsOpen(false)} />
+            <Button title="閉じる" onPress={closeSettings} />
           </View>
           <SettingsScreen
             onSignedOut={() => {
@@ -1196,6 +1213,16 @@ const styles = StyleSheet.create({
     borderRadius: 20,
     padding: 20,
   },
+  demoPill: {
+    position: 'absolute',
+    top: 12,
+    right: 12,
+    backgroundColor: 'rgba(255,255,255,0.22)',
+    borderRadius: 8,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+  },
+  demoPillText: { fontSize: 10, fontWeight: '700', color: '#fff', letterSpacing: 1 },
   totalCardLabel:  { fontSize: 12, color: 'rgba(255,255,255,0.8)', marginBottom: 4 },
   totalCardAmount: { fontSize: 30, fontWeight: '700', color: '#fff', letterSpacing: -0.5, marginBottom: 16 },
   userPills:       { flexDirection: 'row', gap: 10 },

@@ -1,5 +1,6 @@
 import axios, { AxiosInstance } from 'axios';
-import { AuthError, getAccessToken } from './AuthService';
+import { AuthError, getAccessToken, refreshAccessTokenNow } from './AuthService';
+import * as Demo from './DemoService';
 
 // ─── スプレッドシート設定（.env の EXPO_PUBLIC_SPREADSHEET_ID に設定） ───────
 // Google Sheets の URL から取得: https://docs.google.com/spreadsheets/d/{ID}/edit
@@ -62,16 +63,36 @@ const DEFAULT_CATEGORIES: readonly string[] = [
 
 // ─── 内部: 認証付き axios インスタンスを作る ─────────────────────────────────
 
+/** ネットワークが死んでいるときに無限に待たないための上限 */
+const REQUEST_TIMEOUT_MS = 30_000;
+
 async function createClient(): Promise<AxiosInstance> {
   const token = await getAccessToken();
   if (!token) throw new AuthError();
-  return axios.create({
+  const client = axios.create({
     baseURL: `${SHEETS_API_BASE}/${SPREADSHEET_ID}`,
+    timeout: REQUEST_TIMEOUT_MS,
     headers: {
       Authorization: `Bearer ${token}`,
       'Content-Type': 'application/json',
     },
   });
+
+  // 期限内のトークンでも Google 側で失効していることがある。
+  // 401 が返ったら 1 回だけ取り直して再送し、いきなりサインアウトさせない。
+  client.interceptors.response.use(undefined, async (error) => {
+    const config = error?.config as (typeof error.config & { _authRetried?: boolean }) | undefined;
+    if (error?.response?.status !== 401 || !config || config._authRetried) throw error;
+
+    const fresh = await refreshAccessTokenNow();
+    if (!fresh) throw new AuthError();
+
+    config._authRetried = true;
+    config.headers = { ...config.headers, Authorization: `Bearer ${fresh}` };
+    return client.request(config);
+  });
+
+  return client;
 }
 
 // ─── 内部: timestamp ユーティリティ ──────────────────────────────────────────
@@ -230,9 +251,15 @@ async function ensureSheetExists(client: AxiosInstance, sheetName: string): Prom
  * シート名は timestamp の年月から自動生成され、未作成なら自動で作る。
  */
 export async function appendRow(entry: ExpenseRow): Promise<void> {
-  const client    = await createClient();
   const sheetName = sheetNameFromTimestamp(entry.timestamp);
 
+  // デモモード中はシートに書かず、メモリ上のオーバーレイにだけ積む
+  if (await Demo.isDemo()) {
+    Demo.demoAppend(entry, sheetName);
+    return;
+  }
+
+  const client = await createClient();
   await ensureSheetExists(client, sheetName);
 
   const row: (string | number)[] = [
@@ -270,18 +297,24 @@ export async function appendRow(entry: ExpenseRow): Promise<void> {
 export async function getRows(yearMonth?: string): Promise<ExpenseRow[]> {
   const client    = await createClient();
   const sheetName = yearMonth ?? getSheetNameFromDate();
+  const demo      = await Demo.isDemo();
 
   const existing = await listSheetNames(client);
-  if (!existing.includes(sheetName)) return [];
+  if (!existing.includes(sheetName)) {
+    return demo ? Demo.applyOverlay(sheetName, []) : [];
+  }
 
   const res = await client.get(
     `/values/${encodeURIComponent(sheetName)}!${MONTH_RANGE}`,
   );
 
   const values: string[][] = res.data.values ?? [];
-  if (values.length <= 1) return []; // ヘッダーのみ / 空
+  if (values.length <= 1) {
+    // ヘッダーのみ / 空
+    return demo ? Demo.applyOverlay(sheetName, []) : [];
+  }
 
-  return values
+  const rows = values
     .slice(1)
     .map((row, i) => {
       const amount = Number(row[5] ?? 0);
@@ -312,6 +345,10 @@ export async function getRows(yearMonth?: string): Promise<ExpenseRow[]> {
     })
     // 論理削除された行はアプリからは完全に見せない（復活不可）
     .filter((r) => !r.deleted);
+
+  // デモモード: 表示だけ差し替え、デモ中の追加・編集を重ねる
+  if (!demo) return rows;
+  return Demo.applyOverlay(sheetName, rows.map(Demo.maskRow));
 }
 
 /** 月次シートの一覧を新しい順に返す（'YYYY-MM' のみ、設定系シートは除外） */
@@ -360,6 +397,10 @@ export async function updateRowFlags(
   rowIndex: number,
   patch: { countedAmount: number; excluded: boolean; confirmed: boolean },
 ): Promise<void> {
+  if (await Demo.isDemo()) {
+    Demo.demoPatch(yearMonth, rowIndex, patch);
+    return;
+  }
   const client = await createClient();
   await client.put(
     `/values/${encodeURIComponent(yearMonth)}!H${rowIndex}:J${rowIndex}`,
@@ -383,6 +424,20 @@ export async function updateRow(
   rowIndex: number,
   entry: ExpenseRow,
 ): Promise<void> {
+  if (await Demo.isDemo()) {
+    Demo.demoPatch(yearMonth, rowIndex, {
+      timestamp: entry.timestamp,
+      store:     entry.store,
+      category:  entry.category,
+      amount:    entry.amount,
+      memo:      entry.memo,
+      countedAmount: entry.countedAmount > 0 ? entry.countedAmount : entry.amount,
+      excluded:  entry.excluded,
+      confirmed: entry.confirmed,
+      recurring: entry.recurring,
+    });
+    return;
+  }
   const client = await createClient();
   const row: (string | number)[] = [
     entry.timestamp,
@@ -414,6 +469,10 @@ export async function markRowDeleted(
   yearMonth: string,
   rowIndex: number,
 ): Promise<void> {
+  if (await Demo.isDemo()) {
+    Demo.demoPatch(yearMonth, rowIndex, { deleted: true });
+    return;
+  }
   const client = await createClient();
   await client.put(
     `/values/${encodeURIComponent(yearMonth)}!L${rowIndex}`,
@@ -428,6 +487,10 @@ export async function updateRecurringFlag(
   rowIndex: number,
   recurring: boolean,
 ): Promise<void> {
+  if (await Demo.isDemo()) {
+    Demo.demoPatch(yearMonth, rowIndex, { recurring });
+    return;
+  }
   const client = await createClient();
   await client.put(
     `/values/${encodeURIComponent(yearMonth)}!K${rowIndex}`,
@@ -478,6 +541,7 @@ export async function getCategories(): Promise<string[]> {
 export async function addCategory(name: string): Promise<void> {
   const trimmed = name.trim();
   if (!trimmed) throw new Error('カテゴリ名が空です');
+  if (await Demo.isDemo()) throw new Demo.DemoModeError('デモモード中はカテゴリを変更できません');
 
   const client = await createClient();
   await ensureSettingsSheet(client);
@@ -499,6 +563,8 @@ export async function addCategory(name: string): Promise<void> {
 
 /** カテゴリを削除（該当行の値だけ消し、行は詰めない＝シンプル実装） */
 export async function removeCategory(name: string): Promise<void> {
+  if (await Demo.isDemo()) throw new Demo.DemoModeError('デモモード中はカテゴリを変更できません');
+
   const client = await createClient();
   const current = await getCategories();
   const remaining = current.filter((c) => c !== name);
@@ -615,6 +681,8 @@ async function upsertConfigValue(
 
 /** Gmail 検索ウィンドウを更新 */
 export async function setGmailSearchWindow(v: GmailSearchWindow): Promise<void> {
+  if (await Demo.isDemo()) throw new Demo.DemoModeError('デモモード中は設定を変更できません');
+
   const client = await createClient();
   await upsertConfigValue(client, CONFIG_KEY_GMAIL_SEARCH_WINDOW, v);
 }
@@ -717,6 +785,8 @@ export async function getSkippedNotTransactionMessageIds(): Promise<{ id: string
  * @returns 書き換えた件数
  */
 export async function resetSkippedNotTransactionIds(): Promise<number> {
+  if (await Demo.isDemo()) throw new Demo.DemoModeError('デモモード中は再取り込みできません');
+
   const client = await createClient();
   await ensureGmailProcessedSheet(client);
 
@@ -745,8 +815,12 @@ export async function resetSkippedNotTransactionIds(): Promise<number> {
   return data.length;
 }
 
-/** 直近シートに存在するユーザー名一覧を返す。代理入力対象の選択に使用 */
-export async function getUniqueUsers(): Promise<string[]> {
+/**
+ * 直近シートに存在するユーザー名一覧を返す（実際にシートに入っている名前）。
+ * デモモードでもマスクしないので、表示用途には getUniqueUsers() を使うこと。
+ * デモモードの表示名対応表を作るための入力として使う。
+ */
+export async function getUniqueUsersRaw(): Promise<string[]> {
   const sheetName = getSheetNameFromDate();
   const client = await createClient();
   try {
@@ -763,6 +837,13 @@ export async function getUniqueUsers(): Promise<string[]> {
   }
 }
 
+/** 直近シートに存在するユーザー名一覧を返す。代理入力対象の選択に使用 */
+export async function getUniqueUsers(): Promise<string[]> {
+  const users = await getUniqueUsersRaw();
+  if (!(await Demo.isDemo())) return users;
+  return [...new Set(users.map(Demo.maskUser))];
+}
+
 // ─── 固定費: 月初自動コピー ───────────────────────────────────────────────────
 
 /**
@@ -772,6 +853,8 @@ export async function getUniqueUsers(): Promise<string[]> {
  * @returns 作成した件数
  */
 export async function applyRecurringEntries(): Promise<number> {
+  if (await Demo.isDemo()) return 0; // デモ中に実データを増やさない
+
   const currentMonth = getSheetNameFromDate();
 
   // 前月シート名
@@ -827,6 +910,8 @@ export async function markGmailMessageProcessed(
   messageId: string,
   result: string,
 ): Promise<void> {
+  if (await Demo.isDemo()) return; // デモ中は Gmail 取り込み自体を止めてある
+
   const client = await createClient();
   await ensureGmailProcessedSheet(client);
 
