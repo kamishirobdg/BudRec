@@ -226,8 +226,7 @@ Google 側で「Missing required parameter: client_id / エラー400」になる
 
 ### 注意: 毎回インストールし直しが必要
 `ANDROID_KEYSTORE_BASE64` / `ANDROID_KEYSTORE_PASSWORD` / `ANDROID_KEY_ALIAS` / `ANDROID_KEY_PASSWORD`
-が未設定なので、ビルドごとに `keytool` で新しいキーストアを生成している（未設定のときは
-ビルドログに `::warning::` を出す）。
+が未設定なので、ビルドごとに `keytool` で新しいキーストアを生成している。
 → 署名が毎回変わるため、**新しい APK を入れる前に旧アプリをアンインストールする必要がある**。
 アンインストールすると SecureStore ごと消えるので **Google 再ログインも毎回発生する**。
 恒久キーストアを Secrets に入れれば解消する（ワークフロー側は既に対応済み）。
@@ -259,6 +258,10 @@ APK には `EXPO_PUBLIC_GEMINI_API_KEY` が埋め込まれており、誰でも�
 - git remote は `origin` = `kamishirobdg/BudRec`。ブランチは
   `claude/reduce-google-relogin-MCMj8`。push すると 26 分の CI ビルドが走るので、
   push するかどうかは都度確認する。
+- **`.github/workflows/` を含むコミットは push できない**（保存されている PAT に
+  `workflow` スコープが無く `refusing to allow a Personal Access Token to create or
+  update workflow` で弾かれる）。ワークフローを直したいときは GitHub の Web UI で
+  編集するか、PAT に `workflow` スコープを付け直すこと。
 - コンテナ側とズレるので、作業開始前に `git fetch origin` して差分を確認する。
 
 ### クラウドコンテナ（`/home/user/BudRec`）
