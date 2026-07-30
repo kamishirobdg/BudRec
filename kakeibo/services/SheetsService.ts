@@ -295,26 +295,33 @@ export async function appendRow(entry: ExpenseRow): Promise<void> {
  * @returns ExpenseRow の配列（ヘッダー行は除外）。シートが存在しなければ空配列。
  */
 export async function getRows(yearMonth?: string): Promise<ExpenseRow[]> {
+  const sheetName = yearMonth ?? getSheetNameFromDate();
+  const rows      = await getRowsRaw(sheetName);
+
+  // デモモード: 表示だけ差し替え、デモ中の追加・編集を重ねる
+  if (!(await Demo.isDemo())) return rows;
+  return Demo.applyOverlay(sheetName, Demo.maskRows(rows));
+}
+
+/**
+ * 指定月のデータを全件取得する（**デモモードでもマスクしない生データ**）。
+ * デモモードの設定画面のように、実際の値を見せる必要がある箇所だけで使う。
+ */
+export async function getRowsRaw(yearMonth?: string): Promise<ExpenseRow[]> {
   const client    = await createClient();
   const sheetName = yearMonth ?? getSheetNameFromDate();
-  const demo      = await Demo.isDemo();
 
   const existing = await listSheetNames(client);
-  if (!existing.includes(sheetName)) {
-    return demo ? Demo.applyOverlay(sheetName, []) : [];
-  }
+  if (!existing.includes(sheetName)) return [];
 
   const res = await client.get(
     `/values/${encodeURIComponent(sheetName)}!${MONTH_RANGE}`,
   );
 
   const values: string[][] = res.data.values ?? [];
-  if (values.length <= 1) {
-    // ヘッダーのみ / 空
-    return demo ? Demo.applyOverlay(sheetName, []) : [];
-  }
+  if (values.length <= 1) return []; // ヘッダーのみ / 空
 
-  const rows = values
+  return values
     .slice(1)
     .map((row, i) => {
       const amount = Number(row[5] ?? 0);
@@ -345,10 +352,6 @@ export async function getRows(yearMonth?: string): Promise<ExpenseRow[]> {
     })
     // 論理削除された行はアプリからは完全に見せない（復活不可）
     .filter((r) => !r.deleted);
-
-  // デモモード: 表示だけ差し替え、デモ中の追加・編集を重ねる
-  if (!demo) return rows;
-  return Demo.applyOverlay(sheetName, rows.map(Demo.maskRow));
 }
 
 /** 月次シートの一覧を新しい順に返す（'YYYY-MM' のみ、設定系シートは除外） */

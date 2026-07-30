@@ -31,6 +31,7 @@ import {
   resetSkippedNotTransactionIds,
   getSkippedNotTransactionMessageIds,
   getUniqueUsersRaw,
+  getRowsRaw,
 } from '../services/SheetsService';
 import * as Demo from '../services/DemoService';
 import { runGmailImport, getSkippedMessageSummaries, SkippedMessageSummary } from '../services/GmailService';
@@ -58,6 +59,9 @@ export default function SettingsScreen({ onSignedOut }: Props) {
   const [demo, setDemo]           = useState<Demo.DemoConfig>(Demo.getConfigSync);
   const [demoUsers, setDemoUsers] = useState<string[]>([]); // 実名の一覧
   const [aliasDraft, setAliasDraft] = useState<Record<string, string>>({});
+  /** 当月の実際のカテゴリ別合計（マスク前）。[カテゴリ, 金額] の降順 */
+  const [catActual, setCatActual] = useState<[string, number][]>([]);
+  const [catDraft, setCatDraft]   = useState<Record<string, string>>({});
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -81,6 +85,9 @@ export default function SettingsScreen({ onSignedOut }: Props) {
       setAliasDraft(
         Object.fromEntries(names.map((n) => [n, cfg.aliases[n] ?? ''])),
       );
+
+      // カテゴリ別合計の編集はデモON時のみ必要（余計な通信を増やさない）
+      if (cfg.enabled) await loadCategoryTotals(cfg);
     } catch (e) {
       Alert.alert('読み込み失敗', e instanceof Error ? e.message : String(e));
     } finally {
@@ -88,12 +95,45 @@ export default function SettingsScreen({ onSignedOut }: Props) {
     }
   }, []);
 
+  /** 当月の実データからカテゴリ別合計を作る（画面のカテゴリ別カードと同じ定義） */
+  const loadCategoryTotals = async (cfg: Demo.DemoConfig) => {
+    const rows = await getRowsRaw();
+    const m = new Map<string, number>();
+    for (const r of rows) {
+      if (r.excluded) continue;
+      const key = Demo.catKey(r.category);
+      m.set(key, (m.get(key) ?? 0) + r.countedAmount);
+    }
+    const list = [...m.entries()].sort((a, b) => b[1] - a[1]);
+    setCatActual(list);
+    setCatDraft(
+      Object.fromEntries(
+        list.map(([k]) => [k, cfg.categoryTotals[k] ? String(cfg.categoryTotals[k]) : '']),
+      ),
+    );
+  };
+
   const patchDemo = async (patch: Partial<Demo.DemoConfig>) => {
     try {
-      setDemo(await Demo.updateConfig(patch));
+      const next = await Demo.updateConfig(patch);
+      setDemo(next);
+      // ON にした直後は実データのカテゴリ別合計を取りに行く
+      if (patch.enabled === true && catActual.length === 0) {
+        await loadCategoryTotals(next);
+      }
     } catch (e) {
       Alert.alert('保存失敗', e instanceof Error ? e.message : String(e));
     }
+  };
+
+  /** カテゴリ別合計の入力を確定する。空欄・0 なら指定なし（倍率のみ）に戻す */
+  const commitCatTotal = (category: string) => {
+    const raw = (catDraft[category] ?? '').replace(/[^\d]/g, '');
+    const n   = Number(raw);
+    const next = { ...demo.categoryTotals };
+    if (raw && Number.isFinite(n) && n > 0) next[category] = n;
+    else delete next[category];
+    patchDemo({ categoryTotals: next });
   };
 
   /** 表示名の入力を確定してデモ設定に保存する */
@@ -310,7 +350,35 @@ export default function SettingsScreen({ onSignedOut }: Props) {
                     </View>
                   ))}
 
-                  <Text style={styles.demoGroupLabel}>金額の倍率</Text>
+                  <Text style={styles.demoGroupLabel}>カテゴリ別の合計金額（当月）</Text>
+                  {catActual.length === 0 ? (
+                    <Text style={styles.demoHint}>当月のデータがありません</Text>
+                  ) : (
+                    <>
+                      {catActual.map(([cat, actual]) => (
+                        <View key={cat} style={[styles.cardRow, styles.cardRowBorder]}>
+                          <Text style={styles.demoRealName} numberOfLines={1}>{cat}</Text>
+                          <Text style={styles.demoActualAmount}>¥{actual.toLocaleString()} →</Text>
+                          <TextInput
+                            style={[styles.cardInput, { textAlign: 'right' }]}
+                            value={catDraft[cat] ?? ''}
+                            onChangeText={(v) => setCatDraft((p) => ({ ...p, [cat]: v }))}
+                            onBlur={() => commitCatTotal(cat)}
+                            onSubmitEditing={() => commitCatTotal(cat)}
+                            placeholder="指定なし"
+                            keyboardType="number-pad"
+                            returnKeyType="done"
+                          />
+                        </View>
+                      ))}
+                      <Text style={styles.demoHint}>
+                        金額を入れたカテゴリは、その月の合計がその値になるよう明細を比例配分します。
+                        空欄なら下の倍率が使われます。
+                      </Text>
+                    </>
+                  )}
+
+                  <Text style={styles.demoGroupLabel}>金額の倍率（合計未指定のカテゴリ）</Text>
                   <View style={[styles.cardRow, styles.cardRowBorder, { flexWrap: 'wrap' }]}>
                     {Demo.SCALE_OPTIONS.map((s) => (
                       <TouchableOpacity
@@ -574,6 +642,7 @@ const styles = StyleSheet.create({
   demoHint:       { fontSize: 11, color: '#888', lineHeight: 16, marginTop: 2, paddingBottom: 8 },
   demoGroupLabel: { fontSize: 11, fontWeight: '600', color: '#888', marginTop: 10 },
   demoRealName:   { fontSize: 14, color: '#555', maxWidth: 120 },
+  demoActualAmount: { fontSize: 12, color: '#999' },
 
   gmailRunBtn: { backgroundColor: '#2e7d32', borderRadius: 12, paddingVertical: 13, alignItems: 'center', marginVertical: 10 },
   gmailRunBtnDisabled: { backgroundColor: '#9ca3af' },

@@ -28,6 +28,13 @@ export interface DemoConfig {
   aliases:   Record<string, string>;
   /** 金額倍率。これに ±20% の行ごとジッターが乗る */
   scale:     number;
+  /**
+   * カテゴリ表示名 → デモで見せたい合計金額。
+   * 指定したカテゴリは倍率・ジッターを無視し、**その月の合計がこの値になるよう
+   * 明細を比例配分**する（合計の定義は画面のカテゴリ別カードと同じ＝除外行を含めない
+   * countedAmount の合計）。空カテゴリのキーは '未設定'。
+   */
+  categoryTotals: Record<string, number>;
   /** 店名も架空の名前に差し替える */
   maskStore: boolean;
   /** メモを隠す（個人的なメモや金額の書き込みが残るため既定 ON） */
@@ -37,11 +44,12 @@ export interface DemoConfig {
 const KEY_CONFIG = 'demo_config';
 
 const DEFAULT_CONFIG: DemoConfig = {
-  enabled:   false,
-  aliases:   {},
-  scale:     1,
-  maskStore: false,
-  hideMemo:  true,
+  enabled:        false,
+  aliases:        {},
+  scale:          1,
+  categoryTotals: {},
+  maskStore:      false,
+  hideMemo:       true,
 };
 
 export const SCALE_OPTIONS: readonly number[] = [0.5, 0.8, 1, 1.5, 2];
@@ -61,7 +69,8 @@ export async function loadConfig(): Promise<DemoConfig> {
       config = {
         ...DEFAULT_CONFIG,
         ...parsed,
-        aliases: parsed.aliases ?? {},
+        aliases:        parsed.aliases ?? {},
+        categoryTotals: parsed.categoryTotals ?? {},
       };
     }
   } catch {
@@ -140,12 +149,16 @@ function scaleAmount(value: number, ratio: number): number {
   return Math.max(10, Math.round((value * ratio) / 10) * 10);
 }
 
+/** カテゴリの照合キー。画面表示（空欄は '未設定'）と揃える */
+export function catKey(category: string): string {
+  return category || '未設定';
+}
+
 /**
  * 1 行を表示用に差し替える。
  * amount と countedAmount には同じ倍率を掛ける（一部計上の比率を壊さないため）。
  */
-export function maskRow(row: ExpenseRow): ExpenseRow {
-  const ratio = rowRatio(row);
+function maskRowWith(row: ExpenseRow, ratio: number): ExpenseRow {
   return {
     ...row,
     user:          maskUser(row.user),
@@ -154,6 +167,64 @@ export function maskRow(row: ExpenseRow): ExpenseRow {
     amount:        scaleAmount(row.amount, ratio),
     countedAmount: scaleAmount(row.countedAmount, ratio),
   };
+}
+
+/**
+ * 1 シート分の行をまとめて表示用に差し替える。
+ *
+ * カテゴリ別の合計金額が指定されているカテゴリは、倍率ではなく
+ * 「指定合計 ÷ 実合計」で比例配分する。行単位では丸め誤差が出るので、
+ * 最後にカテゴリ内で一番大きい行に差を寄せて合計を指定値ぴったりに合わせる。
+ */
+export function maskRows(rows: ExpenseRow[]): ExpenseRow[] {
+  const targets = config.categoryTotals;
+
+  // 目標が指定されたカテゴリの実合計（除外行は集計に入れない）
+  const actual = new Map<string, number>();
+  for (const r of rows) {
+    if (r.excluded) continue;
+    const key = catKey(r.category);
+    if (!(targets[key] > 0)) continue;
+    actual.set(key, (actual.get(key) ?? 0) + r.countedAmount);
+  }
+
+  const out = rows.map((r) => {
+    const key    = catKey(r.category);
+    const target = targets[key];
+    if (!(target > 0)) return maskRowWith(r, rowRatio(r));
+    const act = actual.get(key) ?? 0;
+    // 集計対象の行が無いカテゴリは配分できないのでそのまま
+    return maskRowWith(r, act > 0 ? target / act : 1);
+  });
+
+  // 丸め誤差の吸収
+  for (const [key, target] of Object.entries(targets)) {
+    if (!(target > 0) || (actual.get(key) ?? 0) <= 0) continue;
+
+    const idx: number[] = [];
+    out.forEach((r, i) => {
+      if (catKey(r.category) === key && !r.excluded) idx.push(i);
+    });
+    if (idx.length === 0) continue;
+
+    const sum  = idx.reduce((s, i) => s + out[i].countedAmount, 0);
+    const diff = Math.round(target) - sum;
+    if (diff === 0) continue;
+
+    let big = idx[0];
+    for (const i of idx) if (out[i].countedAmount > out[big].countedAmount) big = i;
+
+    const b = out[big];
+    const nextCounted = Math.max(10, b.countedAmount + diff);
+    out[big] = {
+      ...b,
+      countedAmount: nextCounted,
+      // 一部計上でない行（amount === countedAmount）は表示金額も揃える
+      amount: b.amount === b.countedAmount ? nextCounted : b.amount,
+    };
+  }
+
+  return out;
 }
 
 // ─── 書き込みオーバーレイ（メモリのみ） ───────────────────────────────────────

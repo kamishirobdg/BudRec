@@ -101,6 +101,8 @@ export default function SummaryScreen({ onSignedOut }: Props) {
   const [sortPickerOpen, setSortPickerOpen] = useState(false);
   const [catView, setCatView]           = useState<'total' | 'byUser'>('total');
   const [demoMode, setDemoMode]         = useState(Demo.isDemoSync);
+  // カテゴリ別カードで選択中のカテゴリ（表示名。null なら絞り込みなし）
+  const [catFilter, setCatFilter]       = useState<string | null>(null);
   const gmailProgress                    = useGmailProgress();
 
   // ソートキーを Storage から復元
@@ -343,6 +345,19 @@ export default function SummaryScreen({ onSignedOut }: Props) {
     return sorted;
   }, [rows, currentUser, sortKey]);
 
+  /** カテゴリ表示名（空カテゴリは '未設定' に寄せる。絞り込みの照合キー） */
+  const catLabel = (c: string) => c || '未設定';
+
+  // カテゴリ別カードで選択中のカテゴリだけに絞った明細
+  const visibleRows = useMemo(
+    () => (catFilter === null ? myRows : myRows.filter((r) => catLabel(r.category) === catFilter)),
+    [myRows, catFilter],
+  );
+
+  const toggleCatFilter = (label: string) => {
+    setCatFilter((prev) => (prev === label ? null : label));
+  };
+
   // 重複判定は全ユーザーの行を対象にする（夫婦間で同じ買い物を二人とも記録した
   // ケースも検出するため）。表示は myRows だが、key で照合するので問題ない。
   const warningKeys = useMemo(() => detectDuplicateWarnings(rows), [rows]);
@@ -439,27 +454,49 @@ export default function SummaryScreen({ onSignedOut }: Props) {
 
             {catView === 'total' ? (
               /* ── 合計ビュー ── */
-              summary.categories.map(([c, v]) => (
-                <View key={c} style={styles.catRow}>
-                  <View style={styles.catRowLeft}>
-                    <Text style={styles.catName}>{c || '未設定'}</Text>
-                    <View style={styles.catBarBg}>
-                      <View style={[styles.catBarFill, { width: `${Math.min(100, Math.round((v / maxCat) * 100))}%` as any }]} />
+              summary.categories.map(([c, v]) => {
+                const label = catLabel(c);
+                const selected = catFilter === label;
+                return (
+                  <TouchableOpacity
+                    key={c}
+                    style={[styles.catRow, selected && styles.catRowSelected]}
+                    onPress={() => toggleCatFilter(label)}
+                    activeOpacity={0.6}
+                  >
+                    <View style={styles.catRowLeft}>
+                      <Text style={[styles.catName, selected && styles.catNameSelected]}>
+                        {label}
+                      </Text>
+                      <View style={styles.catBarBg}>
+                        <View style={[styles.catBarFill, { width: `${Math.min(100, Math.round((v / maxCat) * 100))}%` as any }]} />
+                      </View>
                     </View>
-                  </View>
-                  <Text style={styles.catAmount}>¥{v.toLocaleString()}</Text>
-                </View>
-              ))
+                    <Text style={[styles.catAmount, selected && styles.catNameSelected]}>
+                      ¥{v.toLocaleString()}
+                    </Text>
+                  </TouchableOpacity>
+                );
+              })
             ) : (
               /* ── 人別ビュー ── */
               summaryByUserCat.map(({ cat, total, users }) => {
                 const maxUser = users[0]?.[1] ?? 1;
+                const selected = catFilter === cat;
                 return (
-                  <View key={cat} style={styles.catUserGroup}>
-                    <View style={styles.catUserGroupHeader}>
-                      <Text style={styles.catUserGroupName}>{cat}</Text>
-                      <Text style={styles.catAmount}>¥{total.toLocaleString()}</Text>
-                    </View>
+                  <View key={cat} style={[styles.catUserGroup, selected && styles.catRowSelected]}>
+                    <TouchableOpacity
+                      style={styles.catUserGroupHeader}
+                      onPress={() => toggleCatFilter(cat)}
+                      activeOpacity={0.6}
+                    >
+                      <Text style={[styles.catUserGroupName, selected && styles.catNameSelected]}>
+                        {cat}
+                      </Text>
+                      <Text style={[styles.catAmount, selected && styles.catNameSelected]}>
+                        ¥{total.toLocaleString()}
+                      </Text>
+                    </TouchableOpacity>
                     {users.map(([user, amt]) => (
                       <View key={user} style={styles.catUserRow}>
                         <Text style={styles.catUserName}>{user}</Text>
@@ -481,6 +518,15 @@ export default function SummaryScreen({ onSignedOut }: Props) {
           <Text style={styles.detailsHeaderText}>
             明細 — <Text style={styles.detailsHeaderUser}>{currentUser || '自分'}</Text>
           </Text>
+          {catFilter !== null && (
+            <TouchableOpacity
+              style={styles.filterChip}
+              onPress={() => setCatFilter(null)}
+              activeOpacity={0.7}
+            >
+              <Text style={styles.filterChipText}>{catFilter} ✕</Text>
+            </TouchableOpacity>
+          )}
         </View>
       </View>
     );
@@ -626,12 +672,14 @@ export default function SummaryScreen({ onSignedOut }: Props) {
       )}
 
       <FlatList
-        data={myRows}
+        data={visibleRows}
         keyExtractor={(r) => `${r.sheetName ?? ''}:${r.rowIndex ?? r.timestamp}`}
         renderItem={renderItem}
         ListHeaderComponent={renderHeader}
         ListEmptyComponent={
-          <Text style={styles.empty}>データがありません</Text>
+          <Text style={styles.empty}>
+            {catFilter === null ? 'データがありません' : `${catFilter} の明細はありません`}
+          </Text>
         }
         refreshControl={
           <RefreshControl refreshing={refreshing} onRefresh={handleRefresh} />
@@ -1267,6 +1315,8 @@ const styles = StyleSheet.create({
 
   catRow:    { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, paddingVertical: 10, gap: 12 },
   catRowLeft: { flex: 1, gap: 4 },
+  catRowSelected: { backgroundColor: '#e8f5e9' },
+  catNameSelected: { color: '#2e7d32', fontWeight: '700' },
   catName:   { fontSize: 13, color: '#333' },
   catBarBg:  { height: 4, backgroundColor: '#f0f0f0', borderRadius: 2 },
   catBarFill: { height: 4, backgroundColor: '#2e7d32', borderRadius: 2 },
@@ -1292,9 +1342,22 @@ const styles = StyleSheet.create({
     borderTopRightRadius: 16,
     borderBottomWidth: 1,
     borderBottomColor: '#f0f0f0',
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 8,
   },
   detailsHeaderText: { fontSize: 14, fontWeight: '700', color: '#333' },
   detailsHeaderUser: { color: '#2e7d32' },
+  filterChip: {
+    backgroundColor: '#e8f5e9',
+    borderWidth: 1,
+    borderColor: '#2e7d32',
+    borderRadius: 14,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+  },
+  filterChipText: { fontSize: 12, color: '#2e7d32', fontWeight: '600' },
 
   // ─── 明細カード ───────────────────────────────────────────────────────────
   entry: {
