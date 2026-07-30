@@ -109,6 +109,7 @@ Hermes エンジンでは `new Date('2026/07/30 12:00:00')` が **NaN** にな�
 
 - Google サインイン（トークンは SecureStore。下記「再ログインを減らす対策」参照）
 - レシート撮影 / ギャラリー選択 → Gemini OCR → 内容確認 → シートへ追加
+  （**モデル名は固定せず実行時に解決する**。下記参照）
 - Gmail 取込（アプリ復帰時に 5 分クールダウンで自動実行、設定画面から手動実行も可）
 - 重複警告（`DuplicateDetector`）＋「確認済み」フラグ
 - 一覧画面: 期間切替（月/年/全期間）・並び替え（日時/金額/カテゴリ）
@@ -135,6 +136,25 @@ Hermes エンジンでは `new Date('2026/07/30 12:00:00')` が **NaN** にな�
    - `recurring: true` は維持されるので翌月以降も連鎖する
 4. 重複防止キー = `store|category|user|amount`（当月の `source === 'recurring'` 行から構築）
 5. 作成件数 > 0 なら一覧を再読み込み
+
+### Gemini モデルの動的解決（`providers/geminiModels.ts`）
+モデル名をコードに固定すると、提供終了・無料枠 0・リージョン非対応になった瞬間に壊れる。
+そのため ListModels で**そのキーで今使えるモデル**を取得して選ぶ。
+
+- 優先順: `gemini-flash-lite-latest` → `gemini-flash-latest` → `gemini-2.5-flash-lite` →
+  `gemini-2.5-flash`。先頭 2 つは Google が中身を差し替えるエイリアスなので世代交代に自動追従する。
+- 優先リストが全滅しても、一覧から `flash-lite` → `flash` → `pro` の順、
+  同種別なら**名前の降順（新しい世代優先）**で自動選択する。
+  image / tts / audio / embedding / robotics / computer-use / deep-research / omni は除外。
+- 解決結果は端末に 24 時間キャッシュ（OCR のたびに一覧を引かない）。
+- 呼び出しが **429（無料枠切れ）/ 404（モデル無し）** で落ちたら、そのモデルを除外して
+  選び直し、**最大 3 モデルまで**試す。それ以外のエラーは即座に投げる。
+
+**2026-07-30 実測（このキー）**: `gemini-flash-lite-latest` / `gemini-flash-latest` /
+`gemini-2.5-flash` / `gemini-3.5-flash-lite` は 200。**`gemini-2.0-flash` と
+`gemini-2.0-flash-lite` は 429 RESOURCE_EXHAUSTED**（モデルは存在する。無料枠が 0）。
+`gemini-2.5-flash` も存命。つまり他プロジェクトで言われた「2.5 が提供終了」は誤りで、
+実体は**クォータ切れ**。モデル名を新しくするだけでなく、429 で別モデルに逃げる作りが要る。
 
 ### 再ログインを減らす対策（`services/AuthService.ts`）
 アプリ側は以下まで対応済み。**これでも直らない場合の本命は Google Cloud Console の
