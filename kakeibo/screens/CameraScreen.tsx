@@ -25,6 +25,7 @@ import * as Notifications from 'expo-notifications';
 import { useNavigation } from '@react-navigation/native';
 import * as CategoryService from '../services/CategoryService';
 import { appendRow, ExpenseRow, getUniqueUsers } from '../services/SheetsService';
+import { QueuedWriteError } from '../services/WriteQueueService';
 import { AuthError } from '../services/AuthService';
 import { getCurrentUser } from '../services/UserService';
 import { getProvider } from '../providers';
@@ -154,8 +155,15 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
       confirmed:     false,
       recurring:     false,
     };
-    await appendRow(row);
-    return `記録しました\n${data.store}  ¥${data.amount.toLocaleString()}\n${data.category} · ${timestamp}`;
+    const detail = `${data.store}  ¥${data.amount.toLocaleString()}\n${data.category} · ${timestamp}`;
+    try {
+      await appendRow(row);
+    } catch (e) {
+      // 通信できないだけなら端末に退避済み。OCR をやり直させる必要はない
+      if (!(e instanceof QueuedWriteError)) throw e;
+      return `未送信で保存しました（通信が戻ったら自動送信）\n${detail}`;
+    }
+    return `記録しました\n${detail}`;
   };
 
   /** 2 回失敗時のダイアログ（再試行 / 手動入力 / 諦める） */
@@ -343,11 +351,18 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
   const handleManualSave = async (entry: ExpenseRow) => {
     if (!manualTarget) return;
     try {
-      await appendRow(entry);
+      const detail = `${entry.store}  ¥${entry.amount.toLocaleString()}`;
+      let message = `手動入力を記録しました\n${detail}`;
+      try {
+        await appendRow(entry);
+      } catch (e) {
+        if (!(e instanceof QueuedWriteError)) throw e;
+        message = `未送信で保存しました（通信が戻ったら自動送信）\n${detail}`;
+      }
       ReceiptQueue.deleteReceipt(manualTarget);
       setManualTarget(null);
       refreshPending();
-      onSuccess(`手動入力を記録しました\n${entry.store}  ¥${entry.amount.toLocaleString()}`);
+      onSuccess(message);
       navigation.navigate('Summary' as never);
     } catch (e) {
       if (e instanceof AuthError) {

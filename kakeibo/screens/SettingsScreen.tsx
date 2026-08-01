@@ -32,7 +32,9 @@ import {
   getSkippedNotTransactionMessageIds,
   getUniqueUsersRaw,
   getRowsRaw,
+  flushWriteQueue,
 } from '../services/SheetsService';
+import * as WriteQueue from '../services/WriteQueueService';
 import * as Demo from '../services/DemoService';
 import { runGmailImport, getSkippedMessageSummaries, SkippedMessageSummary } from '../services/GmailService';
 import { useGmailProgress } from '../services/GmailProgressService';
@@ -54,6 +56,10 @@ export default function SettingsScreen({ onSignedOut }: Props) {
   const [skippedOpen, setSkippedOpen]       = useState(false);
   const [skippedLoading, setSkippedLoading] = useState(false);
   const [skippedItems, setSkippedItems]     = useState<SkippedMessageSummary[]>([]);
+
+  // ─── 未送信の書き込み ───
+  const queuedWrites            = WriteQueue.useWriteQueue();
+  const [flushing, setFlushing] = useState(false);
 
   // ─── デモモード ───
   const [demo, setDemo]           = useState<Demo.DemoConfig>(Demo.getConfigSync);
@@ -159,6 +165,48 @@ export default function SettingsScreen({ onSignedOut }: Props) {
   const handleRunGmailImport = () => {
     if (gmailProgress.running) return;
     runGmailImport();
+  };
+
+  // ─── 未送信の書き込み ───
+
+  const handleFlushQueue = async () => {
+    if (flushing) return;
+    setFlushing(true);
+    try {
+      const { sent, remaining } = await flushWriteQueue();
+      Alert.alert(
+        '送信結果',
+        remaining === 0
+          ? `${sent} 件すべて送信しました。`
+          : `送信 ${sent} 件 / 未送信 ${remaining} 件。通信状況を確認してもう一度お試しください。`,
+      );
+    } catch (e) {
+      Alert.alert('送信失敗', e instanceof Error ? e.message : String(e));
+    } finally {
+      setFlushing(false);
+    }
+  };
+
+  const handleDiscardOne = (item: WriteQueue.QueuedWrite) => {
+    Alert.alert(
+      'この変更を破棄しますか？',
+      `${WriteQueue.describeOp(item.op)}\nスプレッドシートには反映されません。取り消せません。`,
+      [
+        { text: 'キャンセル', style: 'cancel' },
+        { text: '破棄', style: 'destructive', onPress: () => WriteQueue.discard(item.id) },
+      ],
+    );
+  };
+
+  const handleDiscardAllQueued = () => {
+    Alert.alert(
+      'すべて破棄しますか？',
+      `${queuedWrites.length} 件の未送信の変更を捨てます。スプレッドシートには反映されません。取り消せません。`,
+      [
+        { text: 'キャンセル', style: 'cancel' },
+        { text: 'すべて破棄', style: 'destructive', onPress: () => WriteQueue.clear() },
+      ],
+    );
   };
 
   const handleOpenSkipped = async () => {
@@ -475,6 +523,46 @@ export default function SettingsScreen({ onSignedOut }: Props) {
               )}
             </View>
 
+            {/* 未送信の書き込み（溜まっているときだけ出す） */}
+            {queuedWrites.length > 0 && (
+              <>
+                <Text style={styles.sectionLabel}>未送信の変更（{queuedWrites.length} 件）</Text>
+                <View style={styles.card}>
+                  <Text style={styles.queueHint}>
+                    通信できずに端末へ保存した変更です。送信できるまでスプレッドシートには反映されません。
+                  </Text>
+                  {queuedWrites.map((q) => (
+                    <View key={q.id} style={[styles.cardRow, styles.cardRowBorder]}>
+                      <View style={styles.queueItemBody}>
+                        <Text style={styles.queueOpText}>{WriteQueue.describeOp(q.op)}</Text>
+                        <Text style={styles.queueMetaText}>
+                          {q.queuedAt} · {q.permanent ? '送信不可' : `${q.attempts} 回失敗`} · {q.lastError}
+                        </Text>
+                      </View>
+                      <TouchableOpacity
+                        style={styles.queueDiscardBtn}
+                        onPress={() => handleDiscardOne(q)}
+                      >
+                        <Text style={styles.queueDiscardBtnText}>破棄</Text>
+                      </TouchableOpacity>
+                    </View>
+                  ))}
+                  <TouchableOpacity
+                    style={[styles.gmailRunBtn, flushing && styles.gmailRunBtnDisabled]}
+                    onPress={handleFlushQueue}
+                    disabled={flushing}
+                  >
+                    <Text style={styles.gmailRunBtnText}>
+                      {flushing ? '送信中...' : '今すぐ送信'}
+                    </Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity style={styles.queueClearBtn} onPress={handleDiscardAllQueued}>
+                    <Text style={styles.queueClearBtnText}>すべて破棄</Text>
+                  </TouchableOpacity>
+                </View>
+              </>
+            )}
+
             {/* カテゴリ */}
             <Text style={styles.sectionLabel}>カテゴリ</Text>
             <View style={[styles.card, { paddingBottom: 8 }]}>
@@ -654,6 +742,15 @@ const styles = StyleSheet.create({
   resetSkippedBtn:      { flex: 1, borderWidth: 1, borderColor: '#d97706', borderRadius: 10, paddingVertical: 10, alignItems: 'center' },
   resetSkippedBtnText:  { color: '#d97706', fontSize: 13, fontWeight: '600' },
   gmailResultText: { fontSize: 12, color: '#888', marginBottom: 10 },
+
+  queueHint: { fontSize: 12, color: '#6b7280', lineHeight: 18, paddingTop: 8, paddingBottom: 4 },
+  queueItemBody: { flex: 1 },
+  queueOpText: { fontSize: 14, color: '#1a1a1a' },
+  queueMetaText: { fontSize: 11, color: '#9ca3af', marginTop: 2 },
+  queueDiscardBtn: { borderWidth: 1, borderColor: '#ef4444', borderRadius: 10, paddingHorizontal: 12, paddingVertical: 6 },
+  queueDiscardBtnText: { color: '#ef4444', fontSize: 12, fontWeight: '600' },
+  queueClearBtn: { alignItems: 'center', paddingVertical: 10, marginBottom: 6 },
+  queueClearBtnText: { color: '#ef4444', fontSize: 13, fontWeight: '600' },
 
   categoryItem: {
     flexDirection: 'row',

@@ -1,7 +1,13 @@
 import axios, { AxiosInstance } from 'axios';
-import { AuthError, getAccessToken, refreshAccessTokenNow } from './AuthService';
+import {
+  AuthError,
+  TransientAuthError,
+  getAccessToken,
+  refreshAccessTokenNow,
+} from './AuthService';
 import { attachRetryInterceptor } from './httpRetry';
 import * as Demo from './DemoService';
+import * as WriteQueue from './WriteQueueService';
 
 // ─── スプレッドシート設定（.env の EXPO_PUBLIC_SPREADSHEET_ID に設定） ───────
 // Google Sheets の URL から取得: https://docs.google.com/spreadsheets/d/{ID}/edit
@@ -335,25 +341,11 @@ async function ensureSheetExists(client: AxiosInstance, sheetName: string): Prom
   }
 }
 
-// ─── 公開 API ─────────────────────────────────────────────────────────────────
+// ─── 書き込みの実行と退避 ─────────────────────────────────────────────────────
 
-/**
- * 家計簿エントリを 1 行追記する。
- * シート名は timestamp の年月から自動生成され、未作成なら自動で作る。
- */
-export async function appendRow(entry: ExpenseRow): Promise<void> {
-  const sheetName = sheetNameFromTimestamp(entry.timestamp);
-
-  // デモモード中はシートに書かず、メモリ上のオーバーレイにだけ積む
-  if (await Demo.isDemo()) {
-    Demo.demoAppend(entry, sheetName);
-    return;
-  }
-
-  const client = await createClient();
-  await ensureSheetExists(client, sheetName);
-
-  const row: (string | number)[] = [
+/** ExpenseRow をシートの 1 行（A:L）に変換する */
+function toSheetRow(entry: ExpenseRow): (string | number)[] {
+  return [
     entry.timestamp,
     entry.source,
     entry.user,
@@ -367,17 +359,157 @@ export async function appendRow(entry: ExpenseRow): Promise<void> {
     entry.recurring ? 'TRUE' : 'FALSE',
     entry.deleted   ? 'TRUE' : 'FALSE',
   ];
+}
 
-  await client.post(
-    `/values/${encodeURIComponent(sheetName)}!${MONTH_RANGE}:append`,
-    { values: [row] },
-    {
-      params: {
-        valueInputOption:    'RAW',
-        insertDataOption:    'INSERT_ROWS',
-      },
-    },
-  );
+/**
+ * 1 操作をスプレッドシートへ送る。
+ * 初回の書き込みと、キューからの再送の両方がここを通る。
+ */
+async function execWrite(op: WriteQueue.WriteOp): Promise<void> {
+  const client = await createClient();
+
+  switch (op.kind) {
+    case 'append': {
+      const sheetName = sheetNameFromTimestamp(op.entry.timestamp);
+      await ensureSheetExists(client, sheetName);
+      await client.post(
+        `/values/${encodeURIComponent(sheetName)}!${MONTH_RANGE}:append`,
+        { values: [toSheetRow(op.entry)] },
+        { params: { valueInputOption: 'RAW', insertDataOption: 'INSERT_ROWS' } },
+      );
+      return;
+    }
+    case 'updateRow':
+      await client.put(
+        `/values/${encodeURIComponent(op.sheetName)}!A${op.rowIndex}:L${op.rowIndex}`,
+        { values: [toSheetRow(op.entry)] },
+        { params: { valueInputOption: 'RAW' } },
+      );
+      return;
+    case 'updateFlags':
+      await client.put(
+        `/values/${encodeURIComponent(op.sheetName)}!H${op.rowIndex}:J${op.rowIndex}`,
+        {
+          values: [[
+            op.patch.countedAmount,
+            op.patch.excluded  ? 'TRUE' : 'FALSE',
+            op.patch.confirmed ? 'TRUE' : 'FALSE',
+          ]],
+        },
+        { params: { valueInputOption: 'RAW' } },
+      );
+      return;
+    case 'markDeleted':
+      await client.put(
+        `/values/${encodeURIComponent(op.sheetName)}!L${op.rowIndex}`,
+        { values: [['TRUE']] },
+        { params: { valueInputOption: 'RAW' } },
+      );
+      return;
+    case 'setRecurring':
+      await client.put(
+        `/values/${encodeURIComponent(op.sheetName)}!K${op.rowIndex}`,
+        { values: [[op.recurring ? 'TRUE' : 'FALSE']] },
+        { params: { valueInputOption: 'RAW' } },
+      );
+      return;
+  }
+}
+
+/** 後で送り直せば成功しうる失敗か（＝キューに積む価値があるか） */
+function isQueueable(e: unknown): boolean {
+  if (e instanceof Demo.DemoModeError) return false;
+  // 再サインインすれば送れる。積んでおけば次のサインイン後に自動で流れる
+  if (e instanceof AuthError || e instanceof TransientAuthError) return true;
+  if (!axios.isAxiosError(e)) return false;
+
+  const status = e.response?.status;
+  if (status === undefined) return true;   // 通信断・タイムアウト
+  return status === 429 || status >= 500;  // クォータ超過・サーバー側の障害
+}
+
+/** キュー一覧に出す短いエラー説明 */
+function describeError(e: unknown): string {
+  if (axios.isAxiosError(e)) {
+    const status = e.response?.status;
+    if (status) return `HTTP ${status}`;
+    return e.code === 'ECONNABORTED' ? 'タイムアウト' : 'ネットワークエラー';
+  }
+  return e instanceof Error ? e.message : String(e);
+}
+
+/**
+ * 書き込みを実行し、一時的な失敗なら端末のキューへ退避する。
+ *
+ * 退避したときは QueuedWriteError を投げる（＝画面側は変更を巻き戻さない）。
+ * ただし AuthError だけは元のまま投げてサインアウト処理をさせる。
+ * キューには積んであるので、再ログイン後に自動で送られる。
+ */
+async function writeOrQueue(op: WriteQueue.WriteOp): Promise<void> {
+  try {
+    await execWrite(op);
+  } catch (e) {
+    if (!isQueueable(e)) throw e;
+    const reason = describeError(e);
+    WriteQueue.enqueue(op, reason);
+    if (e instanceof AuthError) throw e;
+    throw new WriteQueue.QueuedWriteError(reason);
+  }
+}
+
+export interface FlushResult {
+  sent:      number;
+  remaining: number;
+}
+
+let flushInflight: Promise<FlushResult> | null = null;
+
+/**
+ * 端末に溜まった未送信の書き込みを古い順に送る。
+ * 1 件でも失敗したらそこで止める（同じ行に対する操作の順序を崩さないため）。
+ */
+export async function flushWriteQueue(): Promise<FlushResult> {
+  if (flushInflight) return flushInflight;
+
+  flushInflight = (async () => {
+    // デモ中に実データへ書き込まない（デモを抜けてから送る）
+    if (await Demo.isDemo()) return { sent: 0, remaining: WriteQueue.count() };
+
+    let sent = 0;
+    for (const item of WriteQueue.list()) {
+      if (item.permanent) continue; // 送り直しても直らないと分かっているものは飛ばす
+      try {
+        await execWrite(item.op);
+        WriteQueue.remove(item.id);
+        sent++;
+      } catch (e) {
+        WriteQueue.markAttempt(item.id, describeError(e), !isQueueable(e));
+        break;
+      }
+    }
+    if (sent > 0) console.log(`[WriteQueue] ${sent}件を送信した`);
+    return { sent, remaining: WriteQueue.count() };
+  })().finally(() => {
+    flushInflight = null;
+  });
+
+  return flushInflight;
+}
+
+// ─── 公開 API ─────────────────────────────────────────────────────────────────
+
+/**
+ * 家計簿エントリを 1 行追記する。
+ * シート名は timestamp の年月から自動生成され、未作成なら自動で作る。
+ * 通信できなかった場合は端末に退避して QueuedWriteError を投げる。
+ */
+export async function appendRow(entry: ExpenseRow): Promise<void> {
+  // デモモード中はシートに書かず、メモリ上のオーバーレイにだけ積む
+  if (await Demo.isDemo()) {
+    Demo.demoAppend(entry, sheetNameFromTimestamp(entry.timestamp));
+    return;
+  }
+  await writeOrQueue({ kind: 'append', entry });
 }
 
 /**
@@ -496,18 +628,7 @@ export async function updateRowFlags(
     Demo.demoPatch(yearMonth, rowIndex, patch);
     return;
   }
-  const client = await createClient();
-  await client.put(
-    `/values/${encodeURIComponent(yearMonth)}!H${rowIndex}:J${rowIndex}`,
-    {
-      values: [[
-        patch.countedAmount,
-        patch.excluded ? 'TRUE' : 'FALSE',
-        patch.confirmed ? 'TRUE' : 'FALSE',
-      ]],
-    },
-    { params: { valueInputOption: 'RAW' } },
-  );
+  await writeOrQueue({ kind: 'updateFlags', sheetName: yearMonth, rowIndex, patch });
 }
 
 /**
@@ -533,26 +654,7 @@ export async function updateRow(
     });
     return;
   }
-  const client = await createClient();
-  const row: (string | number)[] = [
-    entry.timestamp,
-    entry.source,
-    entry.user,
-    entry.store,
-    entry.category,
-    entry.amount,
-    entry.memo,
-    entry.countedAmount > 0 ? entry.countedAmount : entry.amount,
-    entry.excluded  ? 'TRUE' : 'FALSE',
-    entry.confirmed ? 'TRUE' : 'FALSE',
-    entry.recurring ? 'TRUE' : 'FALSE',
-    entry.deleted   ? 'TRUE' : 'FALSE',
-  ];
-  await client.put(
-    `/values/${encodeURIComponent(yearMonth)}!A${rowIndex}:L${rowIndex}`,
-    { values: [row] },
-    { params: { valueInputOption: 'RAW' } },
-  );
+  await writeOrQueue({ kind: 'updateRow', sheetName: yearMonth, rowIndex, entry });
 }
 
 /**
@@ -568,12 +670,7 @@ export async function markRowDeleted(
     Demo.demoPatch(yearMonth, rowIndex, { deleted: true });
     return;
   }
-  const client = await createClient();
-  await client.put(
-    `/values/${encodeURIComponent(yearMonth)}!L${rowIndex}`,
-    { values: [['TRUE']] },
-    { params: { valueInputOption: 'RAW' } },
-  );
+  await writeOrQueue({ kind: 'markDeleted', sheetName: yearMonth, rowIndex });
 }
 
 /** 指定行の recurring フラグ（K列）のみ更新する */
@@ -586,12 +683,7 @@ export async function updateRecurringFlag(
     Demo.demoPatch(yearMonth, rowIndex, { recurring });
     return;
   }
-  const client = await createClient();
-  await client.put(
-    `/values/${encodeURIComponent(yearMonth)}!K${rowIndex}`,
-    { values: [[recurring ? 'TRUE' : 'FALSE']] },
-    { params: { valueInputOption: 'RAW' } },
-  );
+  await writeOrQueue({ kind: 'setRecurring', sheetName: yearMonth, rowIndex, recurring });
 }
 
 // ─── カテゴリ管理 ─────────────────────────────────────────────────────────────
@@ -966,16 +1058,23 @@ export async function applyRecurringEntries(): Promise<number> {
     const key = `${entry.store}|${entry.category}|${entry.user}|${entry.amount}`;
     if (alreadyKeys.has(key)) continue;
 
-    await appendRow({
-      ...entry,
-      timestamp:  firstDay,
-      source:     'recurring',
-      excluded:   false,
-      confirmed:  false,
-      deleted:    false,
-      rowIndex:   undefined,
-      sheetName:  undefined,
-    });
+    try {
+      await appendRow({
+        ...entry,
+        timestamp:  firstDay,
+        source:     'recurring',
+        excluded:   false,
+        confirmed:  false,
+        deleted:    false,
+        rowIndex:   undefined,
+        sheetName:  undefined,
+      });
+    } catch (e) {
+      // 通信できず端末に退避された場合も「作成済み」として進める。
+      // ここで止めると、呼び出し側が適用済みフラグを立てられず、
+      // 次回起動時にキュー内の未送信ぶんと二重に作ってしまう
+      if (!(e instanceof WriteQueue.QueuedWriteError)) throw e;
+    }
     alreadyKeys.add(key); // 同一エントリが複数あっても2回作らない
     created++;
   }

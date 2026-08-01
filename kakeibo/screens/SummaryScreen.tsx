@@ -29,7 +29,9 @@ import {
   updateRowFlags,
   updateRecurringFlag,
   applyRecurringEntries,
+  flushWriteQueue,
 } from '../services/SheetsService';
+import { QueuedWriteError, useWriteQueue } from '../services/WriteQueueService';
 import * as CategoryService from '../services/CategoryService';
 import { getCurrentUser } from '../services/UserService';
 import { detectDuplicateWarnings } from '../services/DuplicateDetector';
@@ -104,6 +106,9 @@ export default function SummaryScreen({ onSignedOut }: Props) {
   // カテゴリ別カードで選択中のカテゴリ（表示名。null なら絞り込みなし）
   const [catFilter, setCatFilter]       = useState<string | null>(null);
   const gmailProgress                    = useGmailProgress();
+  // 送れずに端末へ退避した書き込み（バナーに件数を出す）
+  const queuedWrites                     = useWriteQueue();
+  const [flushing, setFlushing]          = useState(false);
 
   // ソートキーを Storage から復元
   useEffect(() => {
@@ -227,6 +232,35 @@ export default function SummaryScreen({ onSignedOut }: Props) {
     setRefreshing(false);
   };
 
+  /** 未送信バナーのタップ: 溜まっている書き込みを今すぐ送る */
+  const handleFlushQueue = async () => {
+    if (flushing) return;
+    setFlushing(true);
+    try {
+      const { remaining } = await flushWriteQueue();
+      if (remaining > 0) {
+        Alert.alert(
+          'まだ送信できません',
+          `${remaining} 件が未送信のままです。通信状況を確認してから、もう一度お試しください。`,
+        );
+      }
+    } catch (e) {
+      if (e instanceof AuthError) { onSignedOut(); return; }
+      Alert.alert('送信失敗', e instanceof Error ? e.message : String(e));
+    } finally {
+      setFlushing(false);
+    }
+  };
+
+  // 未送信が片付いたら一覧を取り直す（追加行の行番号はサーバー側で決まるため）。
+  // App 側の自動送信で片付いた場合もここで拾える
+  const prevQueueCount = useRef(queuedWrites.length);
+  useEffect(() => {
+    const prev = prevQueueCount.current;
+    prevQueueCount.current = queuedWrites.length;
+    if (prev > 0 && queuedWrites.length === 0) loadRows(currentRange);
+  }, [queuedWrites.length, loadRows, currentRange]);
+
   /** 行をローカルで更新しつつスプレッドシートにも反映 */
   const persistRow = async (
     row: ExpenseRow,
@@ -244,6 +278,8 @@ export default function SummaryScreen({ onSignedOut }: Props) {
       await updateRowFlags(row.sheetName, row.rowIndex, next);
     } catch (e) {
       if (e instanceof AuthError) { onSignedOut(); return; }
+      // 端末に退避できた変更は巻き戻さない（未送信バナーで気づける）
+      if (e instanceof QueuedWriteError) return;
       Alert.alert('更新失敗', e instanceof Error ? e.message : String(e));
       loadRows(currentRange);
     }
@@ -288,6 +324,7 @@ export default function SummaryScreen({ onSignedOut }: Props) {
       await updateRecurringFlag(row.sheetName, row.rowIndex, next);
     } catch (e) {
       if (e instanceof AuthError) { onSignedOut(); return; }
+      if (e instanceof QueuedWriteError) return;
       Alert.alert('更新失敗', e instanceof Error ? e.message : String(e));
       loadRows(currentRange);
     }
@@ -597,18 +634,22 @@ export default function SummaryScreen({ onSignedOut }: Props) {
     if (!updated.sheetName || updated.rowIndex === undefined) return;
     try {
       await updateRow(updated.sheetName, updated.rowIndex, updated);
-      setRows((prev) =>
-        prev.map((r) =>
-          r.sheetName === updated.sheetName && r.rowIndex === updated.rowIndex
-            ? updated
-            : r,
-        ),
-      );
-      setEditTarget(null);
     } catch (e) {
       if (e instanceof AuthError) { onSignedOut(); return; }
-      Alert.alert('保存失敗', e instanceof Error ? e.message : String(e));
+      // 端末に退避できたなら画面上は保存できたものとして扱う
+      if (!(e instanceof QueuedWriteError)) {
+        Alert.alert('保存失敗', e instanceof Error ? e.message : String(e));
+        return;
+      }
     }
+    setRows((prev) =>
+      prev.map((r) =>
+        r.sheetName === updated.sheetName && r.rowIndex === updated.rowIndex
+          ? updated
+          : r,
+      ),
+    );
+    setEditTarget(null);
   };
 
   const handleDeleteEdit = (target: ExpenseRow) => {
@@ -624,17 +665,20 @@ export default function SummaryScreen({ onSignedOut }: Props) {
           onPress: async () => {
             try {
               await markRowDeleted(target.sheetName!, target.rowIndex!);
-              setRows((prev) =>
-                prev.filter(
-                  (r) =>
-                    !(r.sheetName === target.sheetName && r.rowIndex === target.rowIndex),
-                ),
-              );
-              setEditTarget(null);
             } catch (e) {
               if (e instanceof AuthError) { onSignedOut(); return; }
-              Alert.alert('削除失敗', e instanceof Error ? e.message : String(e));
+              if (!(e instanceof QueuedWriteError)) {
+                Alert.alert('削除失敗', e instanceof Error ? e.message : String(e));
+                return;
+              }
             }
+            setRows((prev) =>
+              prev.filter(
+                (r) =>
+                  !(r.sheetName === target.sheetName && r.rowIndex === target.rowIndex),
+              ),
+            );
+            setEditTarget(null);
           },
         },
       ],
@@ -669,6 +713,22 @@ export default function SummaryScreen({ onSignedOut }: Props) {
                 : `Gmail ${gmailProgress.phase}`}
           </Text>
         </View>
+      )}
+
+      {/* デモ中は送信しないのでバナーも出さない（見せている画面に出すと紛らわしい） */}
+      {!demoMode && queuedWrites.length > 0 && (
+        <TouchableOpacity
+          style={styles.queueBanner}
+          onPress={handleFlushQueue}
+          disabled={flushing}
+        >
+          {flushing && <ActivityIndicator color="#fff" size="small" />}
+          <Text style={styles.queueBannerText}>
+            {flushing
+              ? '未送信の変更を送信中...'
+              : `未送信の変更が ${queuedWrites.length} 件（この一覧には未反映・タップで送信）`}
+          </Text>
+        </TouchableOpacity>
       )}
 
       <FlatList
@@ -1503,4 +1563,13 @@ const styles = StyleSheet.create({
   },
   gmailBannerDone: { backgroundColor: '#16a34a' },
   gmailBannerText: { color: '#fff', fontSize: 13, fontWeight: 'bold', flexShrink: 1 },
+  queueBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    backgroundColor: '#b45309',
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+  },
+  queueBannerText: { color: '#fff', fontSize: 13, fontWeight: 'bold', flexShrink: 1 },
 });

@@ -11,6 +11,7 @@ import SummaryScreen from './screens/SummaryScreen';
 import ErrorBoundary from './components/ErrorBoundary';
 import { handleAuthCallback, isSignedIn } from './services/AuthService';
 import { runGmailImport } from './services/GmailService';
+import { flushWriteQueue } from './services/SheetsService';
 import { loadConfig as loadDemoConfig } from './services/DemoService';
 
 const Tab = createBottomTabNavigator();
@@ -72,9 +73,20 @@ function AppContent() {
     });
   };
 
+  /**
+   * 通信が戻ったであろうタイミングでの同期。
+   * 未送信の書き込みを先に片付けてから Gmail 取り込みを走らせる
+   * （逆順だと取り込みのリクエストで枠を使い切って未送信が残りやすい）。
+   */
+  const syncPending = () => {
+    flushWriteQueue()
+      .catch((e) => console.warn('[App] 未送信の書き込みを送れなかった:', e))
+      .finally(() => maybeRunGmailImport());
+  };
+
   // サインイン直後に実行
   useEffect(() => {
-    if (signedIn) maybeRunGmailImport();
+    if (signedIn) syncPending();
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [signedIn]);
 
@@ -88,7 +100,7 @@ function AppContent() {
         setSignedIn(false);
         return;
       }
-      maybeRunGmailImport();
+      syncPending();
     });
     return () => sub.remove();
   // eslint-disable-next-line react-hooks/exhaustive-deps
