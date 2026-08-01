@@ -8,6 +8,7 @@ import { Ionicons } from '@expo/vector-icons';
 import HomeScreen from './screens/HomeScreen';
 import CameraScreen from './screens/CameraScreen';
 import SummaryScreen from './screens/SummaryScreen';
+import ErrorBoundary from './components/ErrorBoundary';
 import { handleAuthCallback, isSignedIn } from './services/AuthService';
 import { runGmailImport } from './services/GmailService';
 import { loadConfig as loadDemoConfig } from './services/DemoService';
@@ -15,6 +16,15 @@ import { loadConfig as loadDemoConfig } from './services/DemoService';
 const Tab = createBottomTabNavigator();
 
 export default function App() {
+  return (
+    <ErrorBoundary>
+      <AppContent />
+    </ErrorBoundary>
+  );
+}
+
+/** アプリ本体。描画中に落ちたら外側の ErrorBoundary が受け止める */
+function AppContent() {
   const [signedIn, setSignedIn] = useState(false);
   const [checking, setChecking] = useState(true);
   const lastGmailRunRef = useRef(0);
@@ -110,11 +120,14 @@ export default function App() {
               }}
             >
               {() => (
-                <CameraScreen
-                  onSignedOut={() => setSignedIn(false)}
-                  onStatusChange={setOcrStatus}
-                  onSuccess={setOcrToast}
-                />
+                // タブ単位でも囲む。片方の画面が落ちてももう片方は使えるようにする
+                <ErrorBoundary>
+                  <CameraScreen
+                    onSignedOut={() => setSignedIn(false)}
+                    onStatusChange={setOcrStatus}
+                    onSuccess={setOcrToast}
+                  />
+                </ErrorBoundary>
               )}
             </Tab.Screen>
             <Tab.Screen
@@ -126,7 +139,11 @@ export default function App() {
                 ),
               }}
             >
-              {() => <SummaryScreen onSignedOut={() => setSignedIn(false)} />}
+              {() => (
+                <ErrorBoundary>
+                  <SummaryScreen onSignedOut={() => setSignedIn(false)} />
+                </ErrorBoundary>
+              )}
             </Tab.Screen>
           </Tab.Navigator>
         </NavigationContainer>
