@@ -1,5 +1,6 @@
 import axios, { AxiosInstance } from 'axios';
 import { AuthError, getAccessToken, refreshAccessTokenNow } from './AuthService';
+import { attachRetryInterceptor } from './httpRetry';
 import * as Demo from './DemoService';
 
 // ─── スプレッドシート設定（.env の EXPO_PUBLIC_SPREADSHEET_ID に設定） ───────
@@ -92,7 +93,39 @@ async function createClient(): Promise<AxiosInstance> {
     return client.request(config);
   });
 
+  // 429 / 5xx / 通信断の再送。401 の再認証より後に登録する（401 を先に処理させる）
+  attachRetryInterceptor(client);
+
   return client;
+}
+
+/**
+ * 同時に投げる Sheets リクエストの上限。
+ * 全期間表示は月シートの数だけ読み出しが走るので、そのまま並列にすると 429 を招く。
+ */
+const FETCH_CONCURRENCY = 4;
+
+/** items を最大 limit 並列で処理する。結果の順序は入力と揃える */
+async function mapLimited<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let cursor = 0;
+
+  const worker = async () => {
+    for (;;) {
+      const i = cursor++;
+      if (i >= items.length) return;
+      results[i] = await fn(items[i]);
+    }
+  };
+
+  await Promise.all(
+    Array.from({ length: Math.min(limit, items.length) }, worker),
+  );
+  return results;
 }
 
 // ─── 内部: timestamp ユーティリティ ──────────────────────────────────────────
@@ -151,11 +184,49 @@ function sheetNameFromTimestamp(timestamp: string): string {
 
 // ─── 内部: シートの存在確認 / 作成 ───────────────────────────────────────────
 
-/** スプレッドシート内の全シート名を取得 */
-async function listSheetNames(client: AxiosInstance): Promise<string[]> {
+/**
+ * シート名一覧の短命キャッシュ。
+ * 全期間表示は月シートの数だけ getRows が走り、その 1 回ごとに「そのシートが
+ * 存在するか」の問い合わせが発生するため、読み出し用途に限りごく短時間だけ使い回す。
+ * シートを追加したら invalidateSheetNames() で必ず捨てること。
+ */
+const SHEET_NAMES_TTL_MS = 15_000;
+let sheetNamesCache: { names: string[]; at: number } | null = null;
+let sheetNamesInflight: Promise<string[]> | null = null;
+
+function invalidateSheetNames(): void {
+  sheetNamesCache = null;
+}
+
+/**
+ * スプレッドシート内の全シート名を取得。
+ * @param allowCache 直近の取得結果を使い回してよいなら true（読み出し専用の判定に使う）。
+ *                   シートを作る前の存在確認では **必ず false**（古い一覧で二重作成しないため）。
+ */
+async function listSheetNames(
+  client: AxiosInstance,
+  allowCache = false,
+): Promise<string[]> {
+  if (allowCache) {
+    if (sheetNamesCache && Date.now() - sheetNamesCache.at < SHEET_NAMES_TTL_MS) {
+      return sheetNamesCache.names;
+    }
+    // 並列に呼ばれても実際のリクエストは 1 本にまとめる
+    if (sheetNamesInflight) return sheetNamesInflight;
+    sheetNamesInflight = fetchSheetNames(client).finally(() => {
+      sheetNamesInflight = null;
+    });
+    return sheetNamesInflight;
+  }
+  return fetchSheetNames(client);
+}
+
+async function fetchSheetNames(client: AxiosInstance): Promise<string[]> {
   const res = await client.get('', { params: { fields: 'sheets.properties.title' } });
   const sheets = res.data.sheets ?? [];
-  return sheets.map((s: { properties: { title: string } }) => s.properties.title);
+  const names = sheets.map((s: { properties: { title: string } }) => s.properties.title);
+  sheetNamesCache = { names, at: Date.now() };
+  return names;
 }
 
 /** YYYY/MM/DD... のタイムスタンプの年月を targetYearMonth (YYYY-MM) に差し替える */
@@ -221,15 +292,35 @@ async function copyRecurringRowsToNewMonth(
   }
 }
 
+/**
+ * シートが無ければ作る。**作成した場合のみ true** を返す。
+ *
+ * 存在確認にキャッシュを使う（1 行追記するたびに全シート名を引くとリクエスト数が
+ * 倍になり 429 を招くため）。取りこぼし——他端末が直前に作った場合など——は
+ * addSheet が「既に存在する」で失敗するので、そこで一覧を取り直して吸収する。
+ */
+async function ensureSheet(client: AxiosInstance, sheetName: string): Promise<boolean> {
+  const existing = await listSheetNames(client, true);
+  if (existing.includes(sheetName)) return false;
+
+  try {
+    await client.post(':batchUpdate', {
+      requests: [{ addSheet: { properties: { title: sheetName } } }],
+    });
+  } catch (e) {
+    invalidateSheetNames();
+    const fresh = await listSheetNames(client);
+    if (fresh.includes(sheetName)) return false; // 競合しただけ。作成済みなので続行してよい
+    throw e;
+  }
+
+  invalidateSheetNames();
+  return true;
+}
+
 /** シートが無ければ新規作成しヘッダー行を書き込む。固定費行も自動コピー */
 async function ensureSheetExists(client: AxiosInstance, sheetName: string): Promise<void> {
-  const existing = await listSheetNames(client);
-  if (existing.includes(sheetName)) return;
-
-  // シート追加
-  await client.post(':batchUpdate', {
-    requests: [{ addSheet: { properties: { title: sheetName } } }],
-  });
+  if (!(await ensureSheet(client, sheetName))) return;
 
   // ヘッダー行書き込み
   await client.put(
@@ -240,7 +331,7 @@ async function ensureSheetExists(client: AxiosInstance, sheetName: string): Prom
 
   // 前月の固定費行をコピー（月次シートのみ対象）
   if (/^\d{4}-\d{2}$/.test(sheetName)) {
-    await copyRecurringRowsToNewMonth(client, sheetName, existing);
+    await copyRecurringRowsToNewMonth(client, sheetName, await listSheetNames(client, true));
   }
 }
 
@@ -311,7 +402,7 @@ export async function getRowsRaw(yearMonth?: string): Promise<ExpenseRow[]> {
   const client    = await createClient();
   const sheetName = yearMonth ?? getSheetNameFromDate();
 
-  const existing = await listSheetNames(client);
+  const existing = await listSheetNames(client, true);
   if (!existing.includes(sheetName)) return [];
 
   const res = await client.get(
@@ -357,7 +448,7 @@ export async function getRowsRaw(yearMonth?: string): Promise<ExpenseRow[]> {
 /** 月次シートの一覧を新しい順に返す（'YYYY-MM' のみ、設定系シートは除外） */
 export async function listMonthSheetNames(): Promise<string[]> {
   const client = await createClient();
-  const all = await listSheetNames(client);
+  const all = await listSheetNames(client, true);
   return all
     .filter((n) => /^\d{4}-\d{2}$/.test(n))
     .sort((a, b) => (a < b ? 1 : -1));
@@ -386,7 +477,8 @@ export async function getRowsForRange(spec: RangeSpec): Promise<ExpenseRow[]> {
     spec.type === 'year'
       ? months.filter((m) => m.startsWith(`${spec.year}-`))
       : months;
-  const results = await Promise.all(targets.map((m) => getRows(m)));
+  // 全期間表示ではシート数ぶん読み出しが走るので、同時実行数を絞って 429 を避ける
+  const results = await mapLimited(targets, FETCH_CONCURRENCY, (m) => getRows(m));
   return results.flat();
 }
 
@@ -506,12 +598,7 @@ export async function updateRecurringFlag(
 
 /** _settings シートが無ければ作成しデフォルトカテゴリを書き込む */
 async function ensureSettingsSheet(client: AxiosInstance): Promise<void> {
-  const existing = await listSheetNames(client);
-  if (existing.includes(SETTINGS_SHEET)) return;
-
-  await client.post(':batchUpdate', {
-    requests: [{ addSheet: { properties: { title: SETTINGS_SHEET } } }],
-  });
+  if (!(await ensureSheet(client, SETTINGS_SHEET))) return;
 
   await client.put(
     `/values/${encodeURIComponent(SETTINGS_SHEET)}!A1`,
@@ -592,12 +679,8 @@ export async function removeCategory(name: string): Promise<void> {
 
 /** _config シートが無ければ作成しデフォルト値を書き込む */
 async function ensureConfigSheet(client: AxiosInstance): Promise<void> {
-  const existing = await listSheetNames(client);
-  if (existing.includes(CONFIG_SHEET)) return;
+  if (!(await ensureSheet(client, CONFIG_SHEET))) return;
 
-  await client.post(':batchUpdate', {
-    requests: [{ addSheet: { properties: { title: CONFIG_SHEET } } }],
-  });
   await client.put(
     `/values/${encodeURIComponent(CONFIG_SHEET)}!A1`,
     {
@@ -699,12 +782,8 @@ export interface GmailFilter {
 
 /** _gmail_filters シートが無ければヘッダーのみ作成する */
 async function ensureGmailFiltersSheet(client: AxiosInstance): Promise<void> {
-  const existing = await listSheetNames(client);
-  if (existing.includes(GMAIL_FILTERS_SHEET)) return;
+  if (!(await ensureSheet(client, GMAIL_FILTERS_SHEET))) return;
 
-  await client.post(':batchUpdate', {
-    requests: [{ addSheet: { properties: { title: GMAIL_FILTERS_SHEET } } }],
-  });
   await client.put(
     `/values/${encodeURIComponent(GMAIL_FILTERS_SHEET)}!A1`,
     { values: [['from', 'subject']] },
@@ -714,12 +793,8 @@ async function ensureGmailFiltersSheet(client: AxiosInstance): Promise<void> {
 
 /** _gmail_processed シートが無ければヘッダーのみ作成する */
 async function ensureGmailProcessedSheet(client: AxiosInstance): Promise<void> {
-  const existing = await listSheetNames(client);
-  if (existing.includes(GMAIL_PROCESSED_SHEET)) return;
+  if (!(await ensureSheet(client, GMAIL_PROCESSED_SHEET))) return;
 
-  await client.post(':batchUpdate', {
-    requests: [{ addSheet: { properties: { title: GMAIL_PROCESSED_SHEET } } }],
-  });
   await client.put(
     `/values/${encodeURIComponent(GMAIL_PROCESSED_SHEET)}!A1`,
     { values: [['message_id', 'processed_at', 'result']] },
@@ -867,7 +942,7 @@ export async function applyRecurringEntries(): Promise<number> {
 
   // 前月シートが存在しなければスキップ
   const client = await createClient();
-  const existing = await listSheetNames(client);
+  const existing = await listSheetNames(client, true);
   if (!existing.includes(prevMonth)) return 0;
 
   // 前月の固定費エントリ

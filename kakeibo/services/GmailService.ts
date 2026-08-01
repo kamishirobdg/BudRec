@@ -14,6 +14,7 @@
 
 import axios from 'axios';
 import { AuthError, getAccessToken, refreshAccessTokenNow } from './AuthService';
+import { withRetry } from './httpRetry';
 import {
   appendRow,
   ExpenseRow,
@@ -264,15 +265,22 @@ async function gmailGet<T>(path: string, params?: object): Promise<T> {
       timeout: 30_000,
     });
 
-  try {
-    return (await send(token)).data;
-  } catch (e) {
-    // 期限内でも失効していることがあるので、401 は 1 回だけ取り直して再送する
-    if (!axios.isAxiosError(e) || e.response?.status !== 401) throw e;
-    const fresh = await refreshAccessTokenNow();
-    if (!fresh) throw new AuthError();
-    return (await send(fresh)).data;
-  }
+  // Gmail は取り込み中に大量の GET を投げるので 429 を受けやすい。
+  // GET は何度投げても副作用が無いため、通信断・タイムアウトでも再送してよい
+  return withRetry(
+    async () => {
+      try {
+        return (await send(token)).data;
+      } catch (e) {
+        // 期限内でも失効していることがあるので、401 は 1 回だけ取り直して再送する
+        if (!axios.isAxiosError(e) || e.response?.status !== 401) throw e;
+        const fresh = await refreshAccessTokenNow();
+        if (!fresh) throw new AuthError();
+        return (await send(fresh)).data;
+      }
+    },
+    { idempotent: true, label: `GET ${path}` },
+  );
 }
 
 async function searchMessages(query: string, maxResults: number): Promise<GmailMessageRef[]> {
