@@ -4,6 +4,7 @@ import {
   ReceiptData,
   buildReceiptPrompt,
   buildEmailPrompt,
+  parseReceiptList,
   parseReceiptResponse,
 } from './AIProvider';
 import {
@@ -25,24 +26,27 @@ const endpointFor = (model: string) =>
 export const geminiProvider: AIProvider = {
   name: 'gemini',
 
-  async extractReceipt(imageBase64: string, categories: string[]): Promise<ReceiptData> {
+  async extractReceipts(imageBase64: string, categories: string[]): Promise<ReceiptData[]> {
     const prompt = buildReceiptPrompt(categories);
     const parts = [
       { text: prompt },
       { inline_data: { mime_type: 'image/jpeg', data: imageBase64 } },
     ];
-    return callGemini(parts);
+    return parseReceiptList(await callGemini(parts));
   },
 
   async extractEmail(emailText: string, categories: string[]): Promise<ReceiptData> {
     const prompt = buildEmailPrompt(categories);
     const parts = [{ text: `${prompt}\n\n--- メール本文 ---\n${emailText}` }];
-    return callGemini(parts);
+    return parseReceiptResponse(await callGemini(parts));
   },
 };
 
-/** Gemini API 呼び出し共通処理。parts はモデルに渡すコンテンツ配列。 */
-async function callGemini(parts: object[]): Promise<ReceiptData> {
+/**
+ * Gemini API 呼び出し共通処理。parts はモデルに渡すコンテンツ配列。
+ * 戻り値はモデルの生テキスト（パースは呼び出し側で行う。画像は複数件、メールは 1 件）。
+ */
+async function callGemini(parts: object[]): Promise<string> {
   if (!GEMINI_API_KEY || GEMINI_API_KEY.startsWith('YOUR_')) {
     throw new Error('GEMINI_API_KEY が未設定です');
   }
@@ -75,7 +79,7 @@ async function callGemini(parts: object[]): Promise<ReceiptData> {
   throw toReadableError(lastError ?? new Error('Gemini の呼び出しに失敗しました'));
 }
 
-async function postToModel(model: string, parts: object[]): Promise<ReceiptData> {
+async function postToModel(model: string, parts: object[]): Promise<string> {
   const res = await axios.post(
     endpointFor(model),
     {
@@ -95,7 +99,7 @@ async function postToModel(model: string, parts: object[]): Promise<ReceiptData>
   const text: string = res.data?.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
   if (!text) throw new Error('Gemini から空の応答が返されました');
 
-  return parseReceiptResponse(text);
+  return text;
 }
 
 /** API のエラー本文をそのままユーザーに見せられる形にする */

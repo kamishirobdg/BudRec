@@ -24,10 +24,11 @@ export interface AIProvider {
 
   /**
    * レシート画像から構造化データを抽出する。
+   * **1 枚の画像に複数のレシートが並べて写っている場合は、その枚数ぶん返す。**
    * @param imageBase64 画像の base64 文字列（data: プレフィックス無し）
    * @param categories  選択肢となるカテゴリ一覧。モデルはこの中から1つ選ぶ。
    */
-  extractReceipt(imageBase64: string, categories: string[]): Promise<ReceiptData>;
+  extractReceipts(imageBase64: string, categories: string[]): Promise<ReceiptData[]>;
 
   /**
    * メール本文（プレーンテキスト）から取引情報を抽出する。
@@ -39,9 +40,17 @@ export interface AIProvider {
 /** プロバイダー共通のプロンプト生成 */
 export function buildReceiptPrompt(categories: string[]): string {
   const list = categories.map((c) => `- ${c}`).join('\n');
-  return `あなたはレシートOCRアシスタントです。画像のレシートから以下の情報を抽出し、JSONのみを返してください。説明文・コードブロック記号・前後のテキストは一切不要です。
+  return `あなたはレシートOCRアシスタントです。画像に写っているレシートを**すべて**読み取り、JSONのみを返してください。説明文・コードブロック記号・前後のテキストは一切不要です。
 
-抽出する項目:
+【複数レシートの扱い】
+1 枚の画像に複数のレシートを並べて撮影することがあります。その場合はレシートごとに
+1 オブジェクトを作り、receipts 配列に並べてください。1 枚しか写っていなければ要素は 1 つです。
+- 1 枚のレシート = 1 オブジェクト。勝手に分割したり、複数枚を合算したりしない。
+- 長いレシートが折れ曲がって写っている場合や、明細が 2 段に見える場合も 1 件として扱う。
+- 合計金額が読み取れないレシートは受け取らない（推測で埋めず、その要素ごと省く）。
+- レシート以外のもの（手書きメモ・紙の切れ端・背景）は無視する。
+
+各レシートで抽出する項目:
 - store: 店名
 - amount: 合計金額（数値、円記号やカンマ無し）
 - date: 日付（YYYY-MM-DD 形式）。レシートに無ければ空文字。
@@ -52,8 +61,8 @@ export function buildReceiptPrompt(categories: string[]): string {
 カテゴリ候補:
 ${list}
 
-出力例:
-{"store":"セブンイレブン","amount":1280,"date":"2026-04-07","time":"18:42","category":"食費","items":[{"name":"おにぎり","price":150}]}`;
+出力例（レシート 2 枚が写っている画像）:
+{"receipts":[{"store":"セブンイレブン","amount":1280,"date":"2026-04-07","time":"18:42","category":"食費","items":[{"name":"おにぎり","price":150}]},{"store":"マツモトキヨシ","amount":3480,"date":"2026-04-07","time":"19:05","category":"日用品","items":[]}]}`;
 }
 
 /** メール本文用プロンプト（取引でない場合は amount=0 を返させる） */
@@ -98,29 +107,50 @@ ${list}
 {"store":"","amount":0,"date":"","category":"その他","items":[]}`;
 }
 
-/** モデルの返答 JSON を ReceiptData にパース */
-export function parseReceiptResponse(raw: string, fallbackCategory = 'その他'): ReceiptData {
-  // モデルがコードブロックで返してきた場合に備えて剥がす
+/** モデルの返答を JSON として読む（コードブロックで返された場合に備えて剥がす） */
+function parseJson(raw: string): any {
   const cleaned = raw
     .trim()
     .replace(/^```(?:json)?\s*/i, '')
     .replace(/\s*```$/i, '')
     .trim();
 
-  let parsed: any;
   try {
-    parsed = JSON.parse(cleaned);
+    return JSON.parse(cleaned);
   } catch (e) {
     throw new Error(`AI 応答の JSON パースに失敗: ${cleaned.slice(0, 200)}`);
   }
+}
 
+/** 1 件ぶんの JSON オブジェクトを ReceiptData に変換 */
+function toReceiptData(parsed: any, raw: string, fallbackCategory: string): ReceiptData {
   return {
-    store:    String(parsed.store ?? ''),
-    amount:   Number(parsed.amount ?? 0),
-    category: String(parsed.category ?? fallbackCategory),
-    date:     String(parsed.date ?? ''),
-    time:     parsed.time ? String(parsed.time) : undefined,
-    items:    Array.isArray(parsed.items) ? parsed.items : undefined,
+    store:    String(parsed?.store ?? ''),
+    amount:   Number(parsed?.amount ?? 0),
+    category: String(parsed?.category ?? fallbackCategory),
+    date:     String(parsed?.date ?? ''),
+    time:     parsed?.time ? String(parsed.time) : undefined,
+    items:    Array.isArray(parsed?.items) ? parsed.items : undefined,
     raw,
   };
+}
+
+/** モデルの返答 JSON を ReceiptData にパース（メール用・常に 1 件） */
+export function parseReceiptResponse(raw: string, fallbackCategory = 'その他'): ReceiptData {
+  return toReceiptData(parseJson(raw), raw, fallbackCategory);
+}
+
+/**
+ * レシート画像の返答をパースする。
+ * モデルが指示した形を崩すことがあるので、次のいずれも受け付ける:
+ *   `{"receipts":[...]}` / `[...]` / `{"store":...}`（1 件だけを裸で返した場合）
+ */
+export function parseReceiptList(raw: string, fallbackCategory = 'その他'): ReceiptData[] {
+  const parsed = parseJson(raw);
+  const list: any[] =
+    Array.isArray(parsed)              ? parsed :
+    Array.isArray(parsed?.receipts)    ? parsed.receipts :
+    parsed && typeof parsed === 'object' ? [parsed] :
+    [];
+  return list.map((r) => toReceiptData(r, raw, fallbackCategory));
 }

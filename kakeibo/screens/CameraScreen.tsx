@@ -29,6 +29,7 @@ import { QueuedWriteError } from '../services/WriteQueueService';
 import { AuthError } from '../services/AuthService';
 import { getCurrentUser } from '../services/UserService';
 import { getProvider } from '../providers';
+import type { ReceiptData } from '../providers';
 import * as ReceiptQueue from '../services/ReceiptQueueService';
 
 // 通知ハンドラ: フォアグラウンド時もバナーとリストに表示する。
@@ -129,41 +130,70 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
     });
   }, [navigation, proxyMode, proxyUser, handleProxyToggle]);
 
-  /** OCR → スプレッドシート書き込み。成功時は通知メッセージを返す。例外は投げるのみ */
+  /**
+   * OCR → スプレッドシート書き込み。成功時は通知メッセージを返す。例外は投げるのみ。
+   * **1 枚の画像に複数のレシートが写っていれば、その枚数ぶん行を追加する。**
+   */
   const runOcrAndSave = async (base64: string): Promise<string> => {
     setStatusMsg('OCR解析中...');
     onStatusChange('OCR解析中...');
     const categories = await CategoryService.getCategories();
     const provider = getProvider();
-    const data = await provider.extractReceipt(base64, categories);
+    const receipts = await provider.extractReceipts(base64, categories);
 
-    setStatusMsg('書き込み中...');
-    onStatusChange('スプレッドシートに書き込み中...');
-    const timestamp = formatTimestamp(data.date, data.time);
-    const user = proxyMode ? proxyUser : await getCurrentUser();
+    // 金額を読めなかったものは捨てる（0 円の行を作らない）
+    const valid = receipts.filter((r) => r.amount > 0);
+    if (valid.length === 0) throw new Error('レシートを読み取れませんでした');
+
+    setStatusMsg(valid.length > 1 ? `書き込み中... (${valid.length}件)` : '書き込み中...');
+    onStatusChange(
+      valid.length > 1
+        ? `スプレッドシートに書き込み中... (${valid.length}件)`
+        : 'スプレッドシートに書き込み中...',
+    );
+
+    const user   = proxyMode ? proxyUser : await getCurrentUser();
     const source = proxyMode ? 'proxy_camera' : 'camera';
-    const row: ExpenseRow = {
-      timestamp,
-      source,
-      user,
-      store:         data.store,
-      category:      data.category,
-      amount:        data.amount,
-      memo:          summarizeItems(data.items),
-      countedAmount: data.amount,
-      excluded:      false,
-      confirmed:     false,
-      recurring:     false,
-    };
-    const detail = `${data.store}  ¥${data.amount.toLocaleString()}\n${data.category} · ${timestamp}`;
-    try {
-      await appendRow(row);
-    } catch (e) {
-      // 通信できないだけなら端末に退避済み。OCR をやり直させる必要はない
-      if (!(e instanceof QueuedWriteError)) throw e;
-      return `未送信で保存しました（通信が戻ったら自動送信）\n${detail}`;
+
+    const saved: SavedReceipt[] = [];
+    let queued = 0;
+    let failed = 0;
+
+    for (const data of valid) {
+      const timestamp = formatTimestamp(data.date, data.time);
+      const row: ExpenseRow = {
+        timestamp,
+        source,
+        user,
+        store:         data.store,
+        category:      data.category,
+        amount:        data.amount,
+        memo:          summarizeItems(data.items),
+        countedAmount: data.amount,
+        excluded:      false,
+        confirmed:     false,
+        recurring:     false,
+      };
+      try {
+        await appendRow(row);
+        saved.push({ data, timestamp });
+      } catch (e) {
+        // 通信できないだけなら端末に退避済み。OCR をやり直させる必要はない
+        if (e instanceof QueuedWriteError) {
+          saved.push({ data, timestamp });
+          queued++;
+          continue;
+        }
+        // 再サインインが必要なら残りも全部失敗するので即中断する
+        if (e instanceof AuthError) throw e;
+        // 1 件の失敗で他のレシートまで巻き添えにしない。件数だけ伝える
+        console.error('[Receipt] 1件の書き込みに失敗:', e);
+        failed++;
+      }
     }
-    return `記録しました\n${detail}`;
+
+    if (saved.length === 0) throw new Error('スプレッドシートに書き込めませんでした');
+    return buildSaveMessage(saved, queued, failed);
   };
 
   /** 2 回失敗時のダイアログ（再試行 / 手動入力 / 諦める） */
@@ -744,6 +774,39 @@ function ManualEntryModal({
 /**
  * レシートから抽出した日付・時刻で 'YYYY/MM/DD HH:MM:SS' 形式の timestamp を作る。
  */
+/** 書き込みに成功した（または端末に退避した）1 件 */
+interface SavedReceipt {
+  data:      ReceiptData;
+  timestamp: string;
+}
+
+/**
+ * 保存結果をトーストの文面にする。
+ * 1 件なら従来どおり日時・カテゴリまで見せ、複数なら店名と金額を並べる。
+ */
+function buildSaveMessage(saved: SavedReceipt[], queued: number, failed: number): string {
+  const notes: string[] = [];
+  if (failed > 0) notes.push(`${failed}件は書き込めませんでした`);
+
+  if (saved.length === 1) {
+    const { data, timestamp } = saved[0];
+    return [
+      queued > 0 ? '未送信で保存しました（通信が戻ったら自動送信）' : '記録しました',
+      `${data.store || '(店名なし)'}  ¥${data.amount.toLocaleString()}`,
+      `${data.category} · ${timestamp}`,
+      ...notes,
+    ].join('\n');
+  }
+
+  const lines = saved
+    .slice(0, 3)
+    .map((s) => `${s.data.store || '(店名なし)'}  ¥${s.data.amount.toLocaleString()}`);
+  if (saved.length > 3) lines.push(`ほか ${saved.length - 3} 件`);
+  if (queued > 0) notes.unshift(`うち ${queued} 件は未送信（通信が戻ったら自動送信）`);
+
+  return [`${saved.length}件を記録しました`, ...lines, ...notes].join('\n');
+}
+
 function formatTimestamp(receiptDate: string, receiptTime?: string): string {
   const now = new Date();
   const datePart = /^\d{4}-\d{2}-\d{2}$/.test(receiptDate)
