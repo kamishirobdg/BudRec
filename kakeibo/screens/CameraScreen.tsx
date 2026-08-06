@@ -31,6 +31,8 @@ import { getCurrentUser } from '../services/UserService';
 import { getProvider } from '../providers';
 import type { ReceiptData } from '../providers';
 import * as ReceiptQueue from '../services/ReceiptQueueService';
+import * as LastBatch from '../services/LastBatchService';
+import ReceiptReviewModal from './ReceiptReviewModal';
 
 // 通知ハンドラ: フォアグラウンド時もバナーとリストに表示する。
 // タブ切替・バックグラウンド移行時に OCR 処理の進捗と結果を見せるため。
@@ -50,6 +52,13 @@ interface Props {
   onSuccess:      (msg: string) => void;
 }
 
+/** 保存前に確認してもらう読み取り結果 */
+interface ReviewTarget {
+  /** 元のレシート画像。保存するか捨てるまで pending に残す */
+  uri:  string;
+  rows: ExpenseRow[];
+}
+
 export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }: Props) {
   const navigation = useNavigation();
   const [permission, requestPermission] = useCameraPermissions();
@@ -62,6 +71,21 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
   const [pendingUris, setPendingUris] = useState<string[]>([]);
   // 手動入力モーダルの対象レシート
   const [manualTarget, setManualTarget] = useState<string | null>(null);
+
+  // 複数レシートを読み取ったときの確認対象（まだ書き込んでいない）
+  const [review, setReview]         = useState<ReviewTarget | null>(null);
+  const [reviewBusy, setReviewBusy] = useState(false);
+  // 一括処理のループから同期的に見たいので ref にも持つ
+  const reviewRef = useRef<ReviewTarget | null>(null);
+
+  const openReview = (target: ReviewTarget) => {
+    reviewRef.current = target;
+    setReview(target);
+  };
+  const closeReview = () => {
+    reviewRef.current = null;
+    setReview(null);
+  };
 
   // 代理入力モード
   const [proxyMode, setProxyMode] = useState(false);
@@ -131,56 +155,29 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
   }, [navigation, proxyMode, proxyUser, handleProxyToggle]);
 
   /**
-   * OCR → スプレッドシート書き込み。成功時は通知メッセージを返す。例外は投げるのみ。
-   * **1 枚の画像に複数のレシートが写っていれば、その枚数ぶん行を追加する。**
+   * 行をスプレッドシートに書き込む。1 件でも入れば成功として扱い、結果メッセージを返す。
+   * 全滅したときだけ例外を投げる。
    */
-  const runOcrAndSave = async (base64: string): Promise<string> => {
-    setStatusMsg('OCR解析中...');
-    onStatusChange('OCR解析中...');
-    const categories = await CategoryService.getCategories();
-    const provider = getProvider();
-    const receipts = await provider.extractReceipts(base64, categories);
-
-    // 金額を読めなかったものは捨てる（0 円の行を作らない）
-    const valid = receipts.filter((r) => r.amount > 0);
-    if (valid.length === 0) throw new Error('レシートを読み取れませんでした');
-
-    setStatusMsg(valid.length > 1 ? `書き込み中... (${valid.length}件)` : '書き込み中...');
+  const saveRows = async (rows: ExpenseRow[]): Promise<string> => {
+    setStatusMsg(rows.length > 1 ? `書き込み中... (${rows.length}件)` : '書き込み中...');
     onStatusChange(
-      valid.length > 1
-        ? `スプレッドシートに書き込み中... (${valid.length}件)`
+      rows.length > 1
+        ? `スプレッドシートに書き込み中... (${rows.length}件)`
         : 'スプレッドシートに書き込み中...',
     );
 
-    const user   = proxyMode ? proxyUser : await getCurrentUser();
-    const source = proxyMode ? 'proxy_camera' : 'camera';
-
-    const saved: SavedReceipt[] = [];
+    const saved: ExpenseRow[] = [];
     let queued = 0;
     let failed = 0;
 
-    for (const data of valid) {
-      const timestamp = formatTimestamp(data.date, data.time);
-      const row: ExpenseRow = {
-        timestamp,
-        source,
-        user,
-        store:         data.store,
-        category:      data.category,
-        amount:        data.amount,
-        memo:          summarizeItems(data.items),
-        countedAmount: data.amount,
-        excluded:      false,
-        confirmed:     false,
-        recurring:     false,
-      };
+    for (const row of rows) {
       try {
         await appendRow(row);
-        saved.push({ data, timestamp });
+        saved.push(row);
       } catch (e) {
         // 通信できないだけなら端末に退避済み。OCR をやり直させる必要はない
         if (e instanceof QueuedWriteError) {
-          saved.push({ data, timestamp });
+          saved.push(row);
           queued++;
           continue;
         }
@@ -193,7 +190,36 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
     }
 
     if (saved.length === 0) throw new Error('スプレッドシートに書き込めませんでした');
+    // 一覧の「前回の登録」から後で見直せるようにする
+    LastBatch.saveLastBatch(saved);
     return buildSaveMessage(saved, queued, failed);
+  };
+
+  /**
+   * OCR して行を組み立てる。
+   * - 1 件だけならそのまま書き込み、通知メッセージを返す
+   * - **複数件なら確認モーダルを開いて null を返す**（誤読が起きやすいので保存前に見せる）
+   */
+  const attemptReceipt = async (base64: string, uri: string): Promise<string | null> => {
+    setStatusMsg('OCR解析中...');
+    onStatusChange('OCR解析中...');
+    const categories = await CategoryService.getCategories();
+    const provider = getProvider();
+    const receipts = await provider.extractReceipts(base64, categories);
+
+    // 金額を読めなかったものは捨てる（0 円の行を作らない）
+    const valid = receipts.filter((r) => r.amount > 0);
+    if (valid.length === 0) throw new Error('レシートを読み取れませんでした');
+
+    const user   = proxyMode ? proxyUser : await getCurrentUser();
+    const source = proxyMode ? 'proxy_camera' : 'camera';
+    const rows   = valid.map((data) => toExpenseRow(data, user, source));
+
+    if (rows.length > 1) {
+      openReview({ uri, rows });
+      return null;
+    }
+    return saveRows(rows);
   };
 
   /** 2 回失敗時のダイアログ（再試行 / 手動入力 / 諦める） */
@@ -247,7 +273,8 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
       }
 
       try {
-        const msg = await runOcrAndSave(base64);
+        const msg = await attemptReceipt(base64, uri);
+        if (msg === null) return; // 確認モーダル待ち。画像はモーダル側で片付ける
         ReceiptQueue.deleteReceipt(uri);
         refreshPending();
         onSuccess(msg);
@@ -262,7 +289,8 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
       onStatusChange('OCR再試行中...');
       await new Promise((r) => setTimeout(r, 1000));
       try {
-        const msg = await runOcrAndSave(base64);
+        const msg = await attemptReceipt(base64, uri);
+        if (msg === null) return;
         ReceiptQueue.deleteReceipt(uri);
         refreshPending();
         onSuccess(msg);
@@ -343,6 +371,8 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
       // 途中で失敗 → 3択ダイアログが出るのでそこで止まる。
       // ダイアログ閉じた後は refreshPending で次の件がバナーに残るのでユーザーが再開できる
       await processReceipt(uri);
+      // 確認モーダルが開いたら残りは進めない（次の結果で上書きしてしまうため）
+      if (reviewRef.current) break;
     }
   };
 
@@ -379,18 +409,52 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
     );
   };
 
+  /** 読み取り結果の確認モーダルで「登録する」 */
+  const handleReviewCommit = async (kept: ExpenseRow[]) => {
+    if (!review) return;
+
+    // 全部「登録しない」＝このレシートは要らない。画像ごと片付ける
+    if (kept.length === 0) {
+      ReceiptQueue.deleteReceipt(review.uri);
+      closeReview();
+      refreshPending();
+      return;
+    }
+
+    setReviewBusy(true);
+    try {
+      const msg = await saveRows(kept);
+      ReceiptQueue.deleteReceipt(review.uri);
+      closeReview();
+      refreshPending();
+      onSuccess(msg);
+      navigation.navigate('Summary' as never);
+    } catch (e) {
+      if (e instanceof AuthError) {
+        Alert.alert('再サインインが必要です', 'セッションが期限切れです。再度サインインしてください。', [
+          { text: 'OK', onPress: onSignedOut },
+        ]);
+        return;
+      }
+      Alert.alert('保存失敗', e instanceof Error ? e.message : String(e));
+    } finally {
+      setReviewBusy(false);
+      setStatusMsg('');
+      onStatusChange('');
+    }
+  };
+
+  /** 確認モーダルを閉じる（保存しない）。画像は残すので後から再処理できる */
+  const handleReviewClose = () => {
+    closeReview();
+    refreshPending();
+  };
+
   /** 手動入力モーダルから保存 */
   const handleManualSave = async (entry: ExpenseRow) => {
     if (!manualTarget) return;
     try {
-      const detail = `${entry.store}  ¥${entry.amount.toLocaleString()}`;
-      let message = `手動入力を記録しました\n${detail}`;
-      try {
-        await appendRow(entry);
-      } catch (e) {
-        if (!(e instanceof QueuedWriteError)) throw e;
-        message = `未送信で保存しました（通信が戻ったら自動送信）\n${detail}`;
-      }
+      const message = await saveRows([entry]);
       ReceiptQueue.deleteReceipt(manualTarget);
       setManualTarget(null);
       refreshPending();
@@ -404,6 +468,10 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
         return;
       }
       Alert.alert('保存失敗', e instanceof Error ? e.message : String(e));
+    } finally {
+      // saveRows が出した進捗バナーを消す
+      setStatusMsg('');
+      onStatusChange('');
     }
   };
 
@@ -489,6 +557,17 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
         onClose={() => setManualTarget(null)}
         onSave={handleManualSave}
         proxyUser={proxyMode ? proxyUser : undefined}
+      />
+
+      {/* 複数レシートを読み取ったときの確認・編集 */}
+      <ReceiptReviewModal
+        visible={review !== null}
+        title="読み取り結果の確認"
+        rows={review?.rows ?? []}
+        mode="confirm"
+        busy={reviewBusy}
+        onClose={handleReviewClose}
+        onCommit={handleReviewCommit}
       />
     </View>
   );
@@ -773,33 +852,44 @@ function ManualEntryModal({
 
 // ─── utils ───────────────────────────────────────────────────────────────────
 
-/** 書き込みに成功した（または端末に退避した）1 件 */
-interface SavedReceipt {
-  data:      ReceiptData;
-  timestamp: string;
+/** OCR 結果 1 件を書き込み用の行に変換する */
+function toExpenseRow(data: ReceiptData, user: string, source: string): ExpenseRow {
+  return {
+    timestamp:     formatTimestamp(data.date, data.time),
+    source,
+    user,
+    store:         data.store,
+    category:      data.category,
+    amount:        data.amount,
+    memo:          summarizeItems(data.items),
+    countedAmount: data.amount,
+    excluded:      false,
+    confirmed:     false,
+    recurring:     false,
+  };
 }
 
 /**
  * 保存結果をトーストの文面にする。
- * 1 件なら従来どおり日時・カテゴリまで見せ、複数なら店名と金額を並べる。
+ * 1 件なら日時・カテゴリまで見せ、複数なら店名と金額を並べる。
  */
-function buildSaveMessage(saved: SavedReceipt[], queued: number, failed: number): string {
+function buildSaveMessage(saved: ExpenseRow[], queued: number, failed: number): string {
   const notes: string[] = [];
   if (failed > 0) notes.push(`${failed}件は書き込めませんでした`);
 
   if (saved.length === 1) {
-    const { data, timestamp } = saved[0];
+    const r = saved[0];
     return [
       queued > 0 ? '未送信で保存しました（通信が戻ったら自動送信）' : '記録しました',
-      `${data.store || '(店名なし)'}  ¥${data.amount.toLocaleString()}`,
-      `${data.category} · ${timestamp}`,
+      `${r.store || '(店名なし)'}  ¥${r.amount.toLocaleString()}`,
+      `${r.category} · ${r.timestamp}`,
       ...notes,
     ].join('\n');
   }
 
   const lines = saved
     .slice(0, 3)
-    .map((s) => `${s.data.store || '(店名なし)'}  ¥${s.data.amount.toLocaleString()}`);
+    .map((r) => `${r.store || '(店名なし)'}  ¥${r.amount.toLocaleString()}`);
   if (saved.length > 3) lines.push(`ほか ${saved.length - 3} 件`);
   if (queued > 0) notes.unshift(`うち ${queued} 件は未送信（通信が戻ったら自動送信）`);
 

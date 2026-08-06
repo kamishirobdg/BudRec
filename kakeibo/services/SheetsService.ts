@@ -181,7 +181,7 @@ export function getSheetNameFromDate(date: Date = new Date()): string {
  * 'YYYY/MM/DD ...' または 'YYYY-MM-DD ...' を正規表現で直接パースする。
  * new Date() に頼ると Hermes でスラッシュ区切りが NaN になるため使わない。
  */
-function sheetNameFromTimestamp(timestamp: string): string {
+export function sheetNameFromTimestamp(timestamp: string): string {
   const match = timestamp.match(/^(\d{4})[\/\-](\d{2})/);
   if (match) return `${match[1]}-${match[2]}`;
   // フォールバック: ISO 形式など

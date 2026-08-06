@@ -20,6 +20,7 @@ import {
   ExpenseRow,
   RangeSpec,
   getDefaultPartialAmount,
+  getRows,
   getRowsForRange,
   getSheetNameFromDate,
   listAvailableYears,
@@ -45,11 +46,23 @@ import {
 } from '../services/PreferencesService';
 import { AuthError } from '../services/AuthService';
 import * as Demo from '../services/DemoService';
+import * as LastBatch from '../services/LastBatchService';
 import SettingsScreen from './SettingsScreen';
 import PersonalModal from './PersonalModal';
+import ReceiptReviewModal from './ReceiptReviewModal';
 import MemoText from './MemoText';
 
 // ─── UI helpers ──────────────────────────────────────────────────────────────
+
+/** 編集前後で実質同じ行か（触られていない行を書き戻さないため） */
+function isSameEntry(a: ExpenseRow, b: ExpenseRow): boolean {
+  return a.timestamp === b.timestamp
+    && a.store === b.store
+    && a.category === b.category
+    && a.amount === b.amount
+    && a.memo === b.memo
+    && a.countedAmount === b.countedAmount;
+}
 
 function sourceLabel(s: string): string {
   if (s === 'camera' || s === 'proxy_camera') return 'カメラ';
@@ -109,6 +122,9 @@ export default function SummaryScreen({ onSignedOut }: Props) {
   // 送れずに端末へ退避した書き込み（バナーに件数を出す）
   const queuedWrites                     = useWriteQueue();
   const [flushing, setFlushing]          = useState(false);
+  // 「前回の登録」で開く確認・編集モーダル
+  const [lastBatchRows, setLastBatchRows] = useState<ExpenseRow[] | null>(null);
+  const [lastBatchBusy, setLastBatchBusy] = useState(false);
 
   // ソートキーを Storage から復元
   useEffect(() => {
@@ -249,6 +265,81 @@ export default function SummaryScreen({ onSignedOut }: Props) {
       Alert.alert('送信失敗', e instanceof Error ? e.message : String(e));
     } finally {
       setFlushing(false);
+    }
+  };
+
+  /**
+   * 「前回の登録」: この端末から最後に入れた行をシートから探して確認・編集モーダルで開く。
+   * 表示中の期間とは関係なく、登録した月のシートを直接読む。
+   */
+  const handleOpenLastBatch = async () => {
+    if (lastBatchBusy) return;
+    const keys = LastBatch.getLastBatch();
+    if (keys.length === 0) {
+      Alert.alert('前回の登録', 'この端末から登録した記録がまだありません。');
+      return;
+    }
+
+    setLastBatchBusy(true);
+    try {
+      const sheets = [...new Set(keys.map((k) => k.sheetName))];
+      const lists  = await Promise.all(sheets.map((s) => getRows(s)));
+      const found  = LastBatch.pickBatchRows(lists.flat(), keys);
+      if (found.length === 0) {
+        Alert.alert('前回の登録', '該当する明細が見つかりませんでした。削除されたか、内容が変更された可能性があります。');
+        return;
+      }
+      setLastBatchRows(found);
+    } catch (e) {
+      if (e instanceof AuthError) { onSignedOut(); return; }
+      Alert.alert('読み込み失敗', e instanceof Error ? e.message : String(e));
+    } finally {
+      setLastBatchBusy(false);
+    }
+  };
+
+  /** 「前回の登録」モーダルの保存。触られた行だけ書き戻す */
+  const handleLastBatchCommit = async (kept: ExpenseRow[], removed: ExpenseRow[]) => {
+    setLastBatchBusy(true);
+    let changed = 0;
+
+    try {
+      for (const row of kept) {
+        if (!row.sheetName || row.rowIndex === undefined) continue;
+        const before = lastBatchRows?.find(
+          (r) => r.sheetName === row.sheetName && r.rowIndex === row.rowIndex,
+        );
+        if (before && isSameEntry(before, row)) continue; // 触っていない行は送らない
+        try {
+          await updateRow(row.sheetName, row.rowIndex, row);
+          changed++;
+        } catch (e) {
+          if (!(e instanceof QueuedWriteError)) throw e;
+          changed++; // 端末に退避済み。未送信バナーで気づける
+        }
+      }
+
+      for (const row of removed) {
+        if (!row.sheetName || row.rowIndex === undefined) continue;
+        try {
+          await markRowDeleted(row.sheetName, row.rowIndex);
+          changed++;
+        } catch (e) {
+          if (!(e instanceof QueuedWriteError)) throw e;
+          changed++;
+        }
+      }
+
+      // 次に開いたときも同じ行を引けるよう、編集後の内容でキーを取り直す
+      if (kept.length > 0) LastBatch.saveLastBatch(kept);
+
+      setLastBatchRows(null);
+      if (changed > 0) loadRows(currentRange);
+    } catch (e) {
+      if (e instanceof AuthError) { onSignedOut(); return; }
+      Alert.alert('保存失敗', e instanceof Error ? e.message : String(e));
+    } finally {
+      setLastBatchBusy(false);
     }
   };
 
@@ -555,15 +646,28 @@ export default function SummaryScreen({ onSignedOut }: Props) {
           <Text style={styles.detailsHeaderText}>
             明細 — <Text style={styles.detailsHeaderUser}>{currentUser || '自分'}</Text>
           </Text>
-          {catFilter !== null && (
-            <TouchableOpacity
-              style={styles.filterChip}
-              onPress={() => setCatFilter(null)}
-              activeOpacity={0.7}
-            >
-              <Text style={styles.filterChipText}>{catFilter} ✕</Text>
-            </TouchableOpacity>
-          )}
+          <View style={styles.detailsHeaderRight}>
+            {catFilter !== null && (
+              <TouchableOpacity
+                style={styles.filterChip}
+                onPress={() => setCatFilter(null)}
+                activeOpacity={0.7}
+              >
+                <Text style={styles.filterChipText}>{catFilter} ✕</Text>
+              </TouchableOpacity>
+            )}
+            {/* デモ中は実データを触らせない */}
+            {!demoMode && (
+              <TouchableOpacity
+                style={styles.lastBatchBtn}
+                onPress={handleOpenLastBatch}
+                disabled={lastBatchBusy}
+                activeOpacity={0.7}
+              >
+                <Text style={styles.lastBatchBtnText}>前回の登録</Text>
+              </TouchableOpacity>
+            )}
+          </View>
         </View>
       </View>
     );
@@ -793,6 +897,17 @@ export default function SummaryScreen({ onSignedOut }: Props) {
       <PersonalModal
         visible={personalOpen}
         onClose={() => setPersonalOpen(false)}
+      />
+
+      {/* 直近に登録した明細をまとめて見直す */}
+      <ReceiptReviewModal
+        visible={lastBatchRows !== null}
+        title="前回の登録"
+        rows={lastBatchRows ?? []}
+        mode="edit"
+        busy={lastBatchBusy}
+        onClose={() => setLastBatchRows(null)}
+        onCommit={handleLastBatchCommit}
       />
     </SafeAreaView>
   );
@@ -1409,6 +1524,15 @@ const styles = StyleSheet.create({
   },
   detailsHeaderText: { fontSize: 14, fontWeight: '700', color: '#333' },
   detailsHeaderUser: { color: '#2e7d32' },
+  detailsHeaderRight: { flexDirection: 'row', alignItems: 'center', gap: 8, flexShrink: 1 },
+  lastBatchBtn: {
+    borderWidth: 1,
+    borderColor: '#2e7d32',
+    borderRadius: 14,
+    paddingHorizontal: 12,
+    paddingVertical: 5,
+  },
+  lastBatchBtnText: { color: '#2e7d32', fontSize: 12, fontWeight: '600' },
   filterChip: {
     backgroundColor: '#e8f5e9',
     borderWidth: 1,
