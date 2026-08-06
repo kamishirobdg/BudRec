@@ -292,7 +292,9 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
     try {
       const photo = await cameraRef.current.takePictureAsync({
         base64:  true,
-        quality: 0.6,
+        // レシートの小さい文字が JPEG 圧縮で潰れると誤読になる。
+        // 複数枚を 1 枚に収めた場合は特に効くので、多少サイズが増えても品質を優先する
+        quality: 0.85,
         skipProcessing: true,
         shutterSound: false,
       });
@@ -316,7 +318,7 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
     const result = await ImagePicker.launchImageLibraryAsync({
       mediaTypes: ['images'],
       base64: true,
-      quality: 0.8,
+      quality: 0.9,
       allowsMultipleSelection: false,
     });
 
@@ -771,9 +773,6 @@ function ManualEntryModal({
 
 // ─── utils ───────────────────────────────────────────────────────────────────
 
-/**
- * レシートから抽出した日付・時刻で 'YYYY/MM/DD HH:MM:SS' 形式の timestamp を作る。
- */
 /** 書き込みに成功した（または端末に退避した）1 件 */
 interface SavedReceipt {
   data:      ReceiptData;
@@ -807,10 +806,21 @@ function buildSaveMessage(saved: SavedReceipt[], queued: number, failed: number)
   return [`${saved.length}件を記録しました`, ...lines, ...notes].join('\n');
 }
 
+/**
+ * レシートの日付として受け入れる過去の幅（日）。
+ * これより古いものは年の誤読とみなす。
+ */
+const MAX_PAST_DAYS = 400;
+
+/**
+ * レシートから抽出した日付・時刻で 'YYYY/MM/DD HH:MM:SS' 形式の timestamp を作る。
+ * 日付は AIProvider 側で YYYY-MM-DD に正規化済み。ここでは採用してよい値かだけ見る。
+ */
 function formatTimestamp(receiptDate: string, receiptTime?: string): string {
   const now = new Date();
-  const datePart = /^\d{4}-\d{2}-\d{2}$/.test(receiptDate)
-    ? receiptDate.replace(/-/g, '/')
+  const accepted = acceptableDate(receiptDate, now);
+  const datePart = accepted
+    ? accepted.replace(/-/g, '/')
     : `${now.getFullYear()}/${pad(now.getMonth() + 1)}/${pad(now.getDate())}`;
   let timePart: string;
   if (receiptTime && /^\d{1,2}:\d{2}(:\d{2})?$/.test(receiptTime)) {
@@ -820,6 +830,32 @@ function formatTimestamp(receiptDate: string, receiptTime?: string): string {
     timePart = `${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
   }
   return `${datePart} ${timePart}`;
+}
+
+/**
+ * 読み取った日付を採用してよいか。駄目なら null（＝撮影日を使う）。
+ *
+ * 未来日は有効期限や次回来店期限を購入日と取り違えたケース、極端に古い日付は年の
+ * 誤読が多い。そのまま書くと別の月シートに入って一覧から消えたように見えるので、
+ * 撮影日に寄せる方が事故が小さい。
+ */
+function acceptableDate(date: string, now: Date): string | null {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return null;
+
+  const [y, m, d] = date.split('-').map(Number);
+  const parsed  = new Date(y, m - 1, d).getTime();
+  const today   = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  const diffDay = (parsed - today) / 86_400_000;
+
+  if (diffDay > 1) { // 時差ぶんだけ 1 日は許容する
+    console.warn('[OCR] 未来の日付だったので撮影日を使う:', date);
+    return null;
+  }
+  if (diffDay < -MAX_PAST_DAYS) {
+    console.warn('[OCR] 古すぎる日付だったので撮影日を使う:', date);
+    return null;
+  }
+  return date;
 }
 
 function pad(n: number): string {

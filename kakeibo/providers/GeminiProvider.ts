@@ -1,6 +1,8 @@
 import axios from 'axios';
 import {
   AIProvider,
+  EMAIL_RECEIPT_SCHEMA,
+  RECEIPT_LIST_SCHEMA,
   ReceiptData,
   buildReceiptPrompt,
   buildEmailPrompt,
@@ -32,24 +34,48 @@ export const geminiProvider: AIProvider = {
       { text: prompt },
       { inline_data: { mime_type: 'image/jpeg', data: imageBase64 } },
     ];
-    return parseReceiptList(await callGemini(parts));
+    const raw = await callGemini(parts, RECEIPT_LIST_SCHEMA, { highRes: true });
+    return parseReceiptList(raw);
   },
 
   async extractEmail(emailText: string, categories: string[]): Promise<ReceiptData> {
     const prompt = buildEmailPrompt(categories);
     const parts = [{ text: `${prompt}\n\n--- メール本文 ---\n${emailText}` }];
-    return parseReceiptResponse(await callGemini(parts));
+    // テキストだけなので解像度指定は要らない
+    const raw = await callGemini(parts, EMAIL_RECEIPT_SCHEMA, { highRes: false });
+    return parseReceiptResponse(raw);
   },
 };
 
 /**
  * Gemini API 呼び出し共通処理。parts はモデルに渡すコンテンツ配列。
  * 戻り値はモデルの生テキスト（パースは呼び出し側で行う。画像は複数件、メールは 1 件）。
+ *
+ * @param schema  responseSchema に渡す出力スキーマ。形式崩れと項目欠落を防ぐ
+ * @param opts.highRes 画像を高解像度で処理させる（小さい文字・複数レシート対策）
  */
-async function callGemini(parts: object[]): Promise<string> {
+async function callGemini(
+  parts: object[],
+  schema: object,
+  opts: { highRes: boolean },
+): Promise<string> {
   if (!GEMINI_API_KEY || GEMINI_API_KEY.startsWith('YOUR_')) {
     throw new Error('GEMINI_API_KEY が未設定です');
   }
+
+  // 高解像度指定に対応しないモデルに当たったら false に落として以降は既定解像度で通す
+  let highRes = opts.highRes;
+
+  const send = async (model: string): Promise<string> => {
+    try {
+      return await postToModel(model, parts, schema, highRes);
+    } catch (e) {
+      if (!highRes || !isUnsupportedConfigError(e)) throw e;
+      console.warn(`[Gemini] ${model} は mediaResolution 非対応。既定の解像度で再試行します`);
+      highRes = false;
+      return postToModel(model, parts, schema, false);
+    }
+  };
 
   // 無料枠切れ（429）やモデル消滅（404）のときは、そのモデルを外して選び直す。
   // 世代が古いモデルは無料枠が枯れていることがあるので、最大 3 モデルまで試す。
@@ -67,7 +93,7 @@ async function callGemini(parts: object[]): Promise<string> {
     tried.push(model);
 
     try {
-      return await postToModel(model, parts);
+      return await send(model);
     } catch (e) {
       lastError = e;
       if (!shouldTryAnotherModel(e)) throw toReadableError(e);
@@ -79,7 +105,12 @@ async function callGemini(parts: object[]): Promise<string> {
   throw toReadableError(lastError ?? new Error('Gemini の呼び出しに失敗しました'));
 }
 
-async function postToModel(model: string, parts: object[]): Promise<string> {
+async function postToModel(
+  model: string,
+  parts: object[],
+  schema: object,
+  highRes: boolean,
+): Promise<string> {
   const res = await axios.post(
     endpointFor(model),
     {
@@ -87,6 +118,11 @@ async function postToModel(model: string, parts: object[]): Promise<string> {
       generationConfig: {
         temperature:      0.1,
         responseMimeType: 'application/json',
+        // 出力の形を固定する。パース失敗と項目の欠落が消える
+        responseSchema:   schema,
+        // レシートの小さい文字を落とさないよう解像度を上げる。
+        // 複数枚を 1 枚に収めた画像では、既定のままだと縮小されて読めない
+        ...(highRes ? { mediaResolution: 'MEDIA_RESOLUTION_HIGH' } : {}),
       },
     },
     {
@@ -100,6 +136,18 @@ async function postToModel(model: string, parts: object[]): Promise<string> {
   if (!text) throw new Error('Gemini から空の応答が返されました');
 
   return text;
+}
+
+/**
+ * generationConfig のフィールドに対応していないモデルだったか。
+ * mediaResolution は比較的新しいので、古い世代のモデルに当たると 400 で弾かれる。
+ */
+function isUnsupportedConfigError(e: unknown): boolean {
+  if (!axios.isAxiosError(e) || e.response?.status !== 400) return false;
+  const msg = String((e.response?.data as any)?.error?.message ?? '').toLowerCase();
+  return msg.includes('mediaresolution')
+    || msg.includes('media_resolution')
+    || msg.includes('unknown name');
 }
 
 /** API のエラー本文をそのままユーザーに見せられる形にする */

@@ -12,7 +12,7 @@ export interface ReceiptData {
   store:    string;
   amount:   number;
   category: string;       // categories から選ばれた値（または「その他」）
-  date:     string;       // YYYY-MM-DD（取得できなければ空文字）
+  date:     string;       // YYYY-MM-DD に正規化済み（読み取れなければ空文字）
   time?:    string;       // HH:MM（取得できなければ undefined / 空文字）
   items?:   ReceiptItem[];
   raw:      string;       // モデルの生レスポンス（デバッグ用）
@@ -53,8 +53,12 @@ export function buildReceiptPrompt(categories: string[]): string {
 各レシートで抽出する項目:
 - store: 店名
 - amount: 合計金額（数値、円記号やカンマ無し）
-- date: 日付（YYYY-MM-DD 形式）。レシートに無ければ空文字。
-- time: 時刻（HH:MM 形式、24時間表記）。レシートに無ければ空文字。
+- date: レシートに印字された**購入日**を YYYY-MM-DD 形式で。
+  - 有効期限・ポイント有効期限・次回来店期限・キャンペーン期間を購入日と取り違えない
+  - 和暦（令和8年4月7日 / R8.4.7）は西暦に直す
+  - 年が印字されていない場合は月日だけ（MM-DD）を返してよい。年を推測で補わない
+  - どこにも日付が無ければ空文字
+- time: レシートに印字された**購入時刻**を HH:MM 形式（24時間表記）で。無ければ空文字。推測しない。
 - category: 以下のリストから最も適切な1つを選ぶ。該当が無ければ「その他」。
 - items: 購入品の配列（任意、{name, price} の形式）
 
@@ -107,6 +111,118 @@ ${list}
 {"store":"","amount":0,"date":"","category":"その他","items":[]}`;
 }
 
+// ─── 出力スキーマ（Gemini の responseSchema にそのまま渡せる形） ─────────────
+// 形式が保証されるとパース失敗と項目欠落が消える。値の正しさは保証されないので、
+// 日付の妥当性は normalizeDateString と呼び出し側のチェックで担保する。
+
+const RECEIPT_PROPERTIES = {
+  store:    { type: 'STRING' },
+  amount:   { type: 'NUMBER' },
+  date:     { type: 'STRING' },
+  time:     { type: 'STRING' },
+  category: { type: 'STRING' },
+  items: {
+    type: 'ARRAY',
+    items: {
+      type: 'OBJECT',
+      properties: {
+        name:  { type: 'STRING' },
+        price: { type: 'NUMBER' },
+      },
+      required: ['name', 'price'],
+    },
+  },
+} as const;
+
+const RECEIPT_REQUIRED = ['store', 'amount', 'date', 'category'];
+
+/** レシート画像用（複数枚ぶんを receipts 配列で受ける） */
+export const RECEIPT_LIST_SCHEMA = {
+  type: 'OBJECT',
+  properties: {
+    receipts: {
+      type: 'ARRAY',
+      items: {
+        type: 'OBJECT',
+        properties: RECEIPT_PROPERTIES,
+        required: RECEIPT_REQUIRED,
+        propertyOrdering: ['store', 'amount', 'date', 'time', 'category', 'items'],
+      },
+    },
+  },
+  required: ['receipts'],
+};
+
+/** メール本文用（常に 1 件） */
+export const EMAIL_RECEIPT_SCHEMA = {
+  type: 'OBJECT',
+  properties: RECEIPT_PROPERTIES,
+  required: RECEIPT_REQUIRED,
+  propertyOrdering: ['store', 'amount', 'date', 'time', 'category', 'items'],
+};
+
+// ─── 日付の正規化 ────────────────────────────────────────────────────────────
+
+function pad2(n: number): string {
+  return String(n).padStart(2, '0');
+}
+
+/** 実在する日付か（2026-13-45 のような値をここで落とす） */
+function isValidYmd(y: number, m: number, d: number): boolean {
+  if (!Number.isInteger(y) || !Number.isInteger(m) || !Number.isInteger(d)) return false;
+  if (y < 2000 || y > 2100) return false;
+  if (m < 1 || m > 12) return false;
+  // 数値引数の Date は Hermes でも安全（文字列パースだけが壊れる）
+  return d >= 1 && d <= new Date(y, m, 0).getDate();
+}
+
+function buildYmd(y: number, m: number, d: number): string {
+  return isValidYmd(y, m, d) ? `${y}-${pad2(m)}-${pad2(d)}` : '';
+}
+
+function ymdOf(date: Date): string {
+  return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}`;
+}
+
+/**
+ * モデルが返した日付表記を YYYY-MM-DD に揃える。解釈できなければ空文字。
+ *
+ * 指示した形式を外して返してくることがあり、厳密一致で弾くとレシートの日付が
+ * 黙って撮影日に化ける（実際にこれが起きていた）。ゼロ埋め無し・区切り違い・
+ * 和暦・年の省略を受け付ける。**存在しない日付はここで空文字にする。**
+ */
+export function normalizeDateString(raw: string, today: Date = new Date()): string {
+  const s = String(raw ?? '').trim();
+  if (!s) return '';
+
+  // 令和8年4月7日 / R8.4.7 / 令和 8-04-07
+  const wareki = s.match(/(?:令和|reiwa|R)\s*(\d{1,2})\s*[年.\-/]\s*(\d{1,2})\s*[月.\-/]\s*(\d{1,2})/i);
+  if (wareki) {
+    return buildYmd(2018 + Number(wareki[1]), Number(wareki[2]), Number(wareki[3]));
+  }
+
+  // 2026-04-07 / 2026/4/7 / 2026.4.7 / 2026年4月7日
+  const ymd = s.match(/(\d{4})\s*[-/.年]\s*(\d{1,2})\s*[-/.月]\s*(\d{1,2})/);
+  if (ymd) return buildYmd(Number(ymd[1]), Number(ymd[2]), Number(ymd[3]));
+
+  // 26-04-07（2 桁年）
+  const short = s.match(/^(\d{2})\s*[-/.]\s*(\d{1,2})\s*[-/.]\s*(\d{1,2})/);
+  if (short) return buildYmd(2000 + Number(short[1]), Number(short[2]), Number(short[3]));
+
+  // 04-07 / 4月7日（年が印字されていないレシート）→ 今年。未来になるなら前年と解釈する
+  const md = s.match(/^(\d{1,2})\s*[-/.月]\s*(\d{1,2})/);
+  if (md) {
+    const m = Number(md[1]);
+    const d = Number(md[2]);
+    const thisYear = buildYmd(today.getFullYear(), m, d);
+    if (!thisYear) return '';
+    // YYYY-MM-DD は辞書順＝時系列順なので文字列比較でよい
+    return thisYear > ymdOf(today) ? buildYmd(today.getFullYear() - 1, m, d) : thisYear;
+  }
+
+  return '';
+}
+
 /** モデルの返答を JSON として読む（コードブロックで返された場合に備えて剥がす） */
 function parseJson(raw: string): any {
   const cleaned = raw
@@ -124,11 +240,16 @@ function parseJson(raw: string): any {
 
 /** 1 件ぶんの JSON オブジェクトを ReceiptData に変換 */
 function toReceiptData(parsed: any, raw: string, fallbackCategory: string): ReceiptData {
+  const rawDate = String(parsed?.date ?? '');
+  const date    = normalizeDateString(rawDate);
+  if (rawDate && !date) {
+    console.warn('[OCR] 日付として解釈できなかったので撮影日を使う:', rawDate);
+  }
   return {
     store:    String(parsed?.store ?? ''),
     amount:   Number(parsed?.amount ?? 0),
     category: String(parsed?.category ?? fallbackCategory),
-    date:     String(parsed?.date ?? ''),
+    date,
     time:     parsed?.time ? String(parsed.time) : undefined,
     items:    Array.isArray(parsed?.items) ? parsed.items : undefined,
     raw,
