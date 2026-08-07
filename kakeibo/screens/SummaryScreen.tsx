@@ -34,6 +34,7 @@ import {
   flushWriteQueue,
 } from '../services/SheetsService';
 import { QueuedWriteError, useWriteQueue } from '../services/WriteQueueService';
+import * as RowsCache from '../services/RowsCacheService';
 import * as CategoryService from '../services/CategoryService';
 import { getCurrentUser } from '../services/UserService';
 import { detectDuplicateWarnings } from '../services/DuplicateDetector';
@@ -94,6 +95,9 @@ function formatTimestamp(ts: string): string {
   return m ? `${m[1]}/${m[2]} ${m[3]}` : ts;
 }
 
+/** 一覧の初期表示件数・追加読み込み単位（全期間表示など件数が多いレンジで一気に描画しないため） */
+const PAGE_SIZE = 50;
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 interface Props {
@@ -111,6 +115,8 @@ export default function SummaryScreen({ onSignedOut }: Props) {
   const [rows, setRows]                     = useState<ExpenseRow[]>([]);
   const [loading, setLoading]               = useState(false);
   const [loadError, setLoadError]           = useState<string | null>(null);
+  // 通信できず端末内キャッシュを表示しているときの案内文（null なら最新データ）
+  const [offlineNotice, setOfflineNotice]   = useState<string | null>(null);
   const [refreshing, setRefreshing]         = useState(false);
   const [defaultPartial, setDefaultPartial] = useState(1000);
   const [currentUser, setCurrentUserState]  = useState<string>('');
@@ -128,6 +134,8 @@ export default function SummaryScreen({ onSignedOut }: Props) {
   const [demoMode, setDemoMode]         = useState(Demo.isDemoSync);
   // カテゴリ別カードで選択中のカテゴリ（表示名。null なら絞り込みなし）
   const [catFilter, setCatFilter]       = useState<string | null>(null);
+  // 店舗名・メモの検索（空なら絞り込みなし）
+  const [searchText, setSearchText]     = useState('');
   const gmailProgress                    = useGmailProgress();
   // 送れずに端末へ退避した書き込み（バナーに件数を出す）
   const queuedWrites                     = useWriteQueue();
@@ -206,23 +214,39 @@ export default function SummaryScreen({ onSignedOut }: Props) {
 
   const loadRows = useCallback(async (range: RangeSpec) => {
     setLoading(true);
+    // ユーザー名・デモ設定は端末ローカル読み出しのみ（通信不要）。
+    // Sheets 側が落ちていてもここは常に反映しておく（オフラインキャッシュの絞り込みに使うため）
     try {
-      const [list, partial, user, demo] = await Promise.all([
+      const [user, demo] = await Promise.all([getCurrentUser(), Demo.isDemo()]);
+      setCurrentUserState(user);
+      setDemoMode(demo);
+    } catch (e) {
+      console.error('[SummaryScreen] ローカル設定の読み込み失敗:', e);
+    }
+    try {
+      const [list, partial] = await Promise.all([
         getRowsForRange(range),
         getDefaultPartialAmount(),
-        getCurrentUser(),
-        Demo.isDemo(),
       ]);
       setRows(list);
       setDefaultPartial(partial);
-      setCurrentUserState(user);
-      setDemoMode(demo);
       setLoadError(null);
+      setOfflineNotice(null);
+      RowsCache.save(range, list);
     } catch (e) {
       if (e instanceof AuthError) { onSignedOut(); return; }
       const message = e instanceof Error ? e.message : String(e);
-      setLoadError(message);
-      Alert.alert('読み込み失敗', message);
+      // 通信できなくても、この範囲を過去に開いたことがあれば端末内キャッシュを出す
+      const cached = RowsCache.get(range);
+      if (cached) {
+        setRows(cached.rows);
+        setLoadError(null);
+        setOfflineNotice(`通信できないため ${formatTimestamp(cached.savedAt)} 時点のデータを表示中`);
+      } else {
+        setLoadError(message);
+        setOfflineNotice(null);
+        Alert.alert('読み込み失敗', message);
+      }
     } finally {
       setLoading(false);
     }
@@ -489,11 +513,22 @@ export default function SummaryScreen({ onSignedOut }: Props) {
   /** カテゴリ表示名（空カテゴリは '未設定' に寄せる。絞り込みの照合キー） */
   const catLabel = (c: string) => c || '未設定';
 
-  // カテゴリ別カードで選択中のカテゴリだけに絞った明細
-  const visibleRows = useMemo(
-    () => (catFilter === null ? myRows : myRows.filter((r) => catLabel(r.category) === catFilter)),
-    [myRows, catFilter],
+  // 検索クエリ（店舗名・メモを対象、大小文字を区別しない）
+  const searchQuery = useMemo(() => searchText.trim().toLowerCase(), [searchText]);
+  const matchesSearch = useCallback(
+    (r: ExpenseRow) =>
+      searchQuery === '' ||
+      r.store.toLowerCase().includes(searchQuery) ||
+      r.memo.toLowerCase().includes(searchQuery),
+    [searchQuery],
   );
+
+  // カテゴリ別カードで選択中のカテゴリ・検索語で絞った明細
+  const visibleRows = useMemo(() => {
+    let list = catFilter === null ? myRows : myRows.filter((r) => catLabel(r.category) === catFilter);
+    if (searchQuery !== '') list = list.filter(matchesSearch);
+    return list;
+  }, [myRows, catFilter, searchQuery, matchesSearch]);
 
   // 未送信キューに溜まっている追加行（送信されるまでシートに存在せず rows には出てこない）。
   // 表示中の範囲・自分の行に絞って一覧の先頭に重ねる
@@ -513,15 +548,32 @@ export default function SummaryScreen({ onSignedOut }: Props) {
       if (entry.user !== currentUser && !isProxyEntry(entry)) continue;
       if (!matchesRange(entry.timestamp)) continue;
       if (catFilter !== null && catLabel(entry.category) !== catFilter) continue;
+      if (searchQuery !== '' && !matchesSearch(entry)) continue;
       out.push({ ...entry, pendingWriteId: q.id });
     }
     return out;
-  }, [queuedWrites, currentRange, currentUser, catFilter]);
+  }, [queuedWrites, currentRange, currentUser, catFilter, searchQuery, matchesSearch]);
 
   const displayRows = useMemo<DisplayRow[]>(
     () => [...pendingAppendRows, ...visibleRows],
     [pendingAppendRows, visibleRows],
   );
+
+  // 一覧は段階的に描画する（全期間表示など件数が多いと一気に描画すると重いため）。
+  // 範囲・絞り込み・並び替えが変わったら先頭から出し直す
+  const [visibleCount, setVisibleCount] = useState(PAGE_SIZE);
+  useEffect(() => {
+    setVisibleCount(PAGE_SIZE);
+  }, [currentRange, catFilter, searchQuery, sortKey]);
+
+  const pagedRows = useMemo(
+    () => displayRows.slice(0, visibleCount),
+    [displayRows, visibleCount],
+  );
+
+  const handleLoadMore = useCallback(() => {
+    setVisibleCount((c) => (c < displayRows.length ? c + PAGE_SIZE : c));
+  }, [displayRows.length]);
 
   const toggleCatFilter = (label: string) => {
     setCatFilter((prev) => (prev === label ? null : label));
@@ -681,6 +733,22 @@ export default function SummaryScreen({ onSignedOut }: Props) {
             )}
           </View>
         )}
+
+        {/* 検索 */}
+        <View style={styles.searchRow}>
+          <TextInput
+            style={styles.searchInput}
+            placeholder="店舗名・メモで検索"
+            value={searchText}
+            onChangeText={setSearchText}
+            returnKeyType="search"
+          />
+          {searchText.length > 0 && (
+            <TouchableOpacity onPress={() => setSearchText('')} style={styles.searchClearBtn}>
+              <Text style={styles.searchClearBtnText}>✕</Text>
+            </TouchableOpacity>
+          )}
+        </View>
 
         {/* 明細セクションヘッダー */}
         <View style={styles.detailsHeader}>
@@ -881,6 +949,19 @@ export default function SummaryScreen({ onSignedOut }: Props) {
         </TouchableOpacity>
       )}
 
+      {!!offlineNotice && (
+        <TouchableOpacity
+          style={styles.offlineBanner}
+          onPress={() => loadRows(currentRange)}
+          disabled={loading}
+        >
+          {loading && <ActivityIndicator color="#fff" size="small" />}
+          <Text style={styles.offlineBannerText}>
+            {loading ? '再取得中...' : `${offlineNotice}（タップで再取得）`}
+          </Text>
+        </TouchableOpacity>
+      )}
+
       {/* デモ中は送信しないのでバナーも出さない（見せている画面に出すと紛らわしい） */}
       {!demoMode && queuedWrites.length > 0 && (
         <TouchableOpacity
@@ -898,15 +979,31 @@ export default function SummaryScreen({ onSignedOut }: Props) {
       )}
 
       <FlatList
-        data={displayRows}
+        data={pagedRows}
         keyExtractor={(r) => (r.pendingWriteId ? `pending:${r.pendingWriteId}` : `${r.sheetName ?? ''}:${r.rowIndex ?? r.timestamp}`)}
         renderItem={renderItem}
         ListHeaderComponent={renderHeader}
         ListEmptyComponent={
           <Text style={styles.empty}>
-            {catFilter === null ? 'データがありません' : `${catFilter} の明細はありません`}
+            {searchQuery !== ''
+              ? '検索条件に一致する明細はありません'
+              : catFilter === null
+                ? 'データがありません'
+                : `${catFilter} の明細はありません`}
           </Text>
         }
+        ListFooterComponent={
+          pagedRows.length < displayRows.length ? (
+            <Text style={styles.loadMoreHint}>
+              {pagedRows.length} / {displayRows.length} 件表示中（下にスクロールでさらに表示）
+            </Text>
+          ) : null
+        }
+        onEndReached={handleLoadMore}
+        onEndReachedThreshold={0.5}
+        initialNumToRender={20}
+        maxToRenderPerBatch={20}
+        windowSize={10}
         refreshControl={
           <RefreshControl refreshing={refreshing} onRefresh={handleRefresh} />
         }
@@ -1467,6 +1564,7 @@ const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#f2f4f7' },
   center:    { flex: 1, backgroundColor: '#f2f4f7', alignItems: 'center', justifyContent: 'center' },
   empty:     { textAlign: 'center', color: '#888', marginTop: 24, marginHorizontal: 16 },
+  loadMoreHint: { textAlign: 'center', color: '#999', fontSize: 12, paddingVertical: 16 },
 
   // ─── コントロール行 ───────────────────────────────────────────────────────
   rangeRow: {
@@ -1569,6 +1667,19 @@ const styles = StyleSheet.create({
   catUserAmt:  { fontSize: 12, fontWeight: '600', color: '#555' },
 
   // ─── 明細ヘッダー ─────────────────────────────────────────────────────────
+  searchRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginTop: 16,
+    marginHorizontal: 16,
+    backgroundColor: '#fff',
+    borderRadius: 12,
+    paddingHorizontal: 12,
+  },
+  searchInput: { flex: 1, height: 40, fontSize: 14, color: '#333' },
+  searchClearBtn: { paddingHorizontal: 6, paddingVertical: 6 },
+  searchClearBtnText: { fontSize: 14, color: '#999', fontWeight: 'bold' },
+
   detailsHeader: {
     marginTop: 16,
     marginHorizontal: 16,
@@ -1767,6 +1878,15 @@ const styles = StyleSheet.create({
     paddingVertical: 8,
   },
   errorBannerText: { color: '#fff', fontSize: 13, fontWeight: 'bold', flexShrink: 1 },
+  offlineBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    backgroundColor: '#475569',
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+  },
+  offlineBannerText: { color: '#fff', fontSize: 13, fontWeight: 'bold', flexShrink: 1 },
 
   // ─── 送信待ち行 ───────────────────────────────────────────────────────────
   entryPending: { opacity: 0.65, borderStyle: 'dashed', borderWidth: 1, borderColor: '#b45309' },
