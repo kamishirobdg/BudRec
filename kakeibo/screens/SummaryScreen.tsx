@@ -23,6 +23,7 @@ import {
   getRows,
   getRowsForRange,
   getSheetNameFromDate,
+  sheetNameFromTimestamp,
   listAvailableYears,
   listMonthSheetNames,
   markRowDeleted,
@@ -53,6 +54,14 @@ import ReceiptReviewModal from './ReceiptReviewModal';
 import MemoText from './MemoText';
 
 // ─── UI helpers ──────────────────────────────────────────────────────────────
+
+/**
+ * 未送信キューの追加行を一覧に重ねて表示するための型。
+ * サーバー側の行番号がまだ無いため rowIndex/sheetName は未設定のまま。
+ */
+interface DisplayRow extends ExpenseRow {
+  pendingWriteId?: string;
+}
 
 /** 編集前後で実質同じ行か（触られていない行を書き戻さないため） */
 function isSameEntry(a: ExpenseRow, b: ExpenseRow): boolean {
@@ -101,6 +110,7 @@ export default function SummaryScreen({ onSignedOut }: Props) {
   const navigation = useNavigation();
   const [rows, setRows]                     = useState<ExpenseRow[]>([]);
   const [loading, setLoading]               = useState(false);
+  const [loadError, setLoadError]           = useState<string | null>(null);
   const [refreshing, setRefreshing]         = useState(false);
   const [defaultPartial, setDefaultPartial] = useState(1000);
   const [currentUser, setCurrentUserState]  = useState<string>('');
@@ -207,9 +217,12 @@ export default function SummaryScreen({ onSignedOut }: Props) {
       setDefaultPartial(partial);
       setCurrentUserState(user);
       setDemoMode(demo);
+      setLoadError(null);
     } catch (e) {
       if (e instanceof AuthError) { onSignedOut(); return; }
-      Alert.alert('読み込み失敗', e instanceof Error ? e.message : String(e));
+      const message = e instanceof Error ? e.message : String(e);
+      setLoadError(message);
+      Alert.alert('読み込み失敗', message);
     } finally {
       setLoading(false);
     }
@@ -482,6 +495,34 @@ export default function SummaryScreen({ onSignedOut }: Props) {
     [myRows, catFilter],
   );
 
+  // 未送信キューに溜まっている追加行（送信されるまでシートに存在せず rows には出てこない）。
+  // 表示中の範囲・自分の行に絞って一覧の先頭に重ねる
+  const pendingAppendRows = useMemo<DisplayRow[]>(() => {
+    const isProxyEntry = (r: ExpenseRow) =>
+      (r.source === 'proxy_camera' || r.source === 'proxy_manual') && r.user !== currentUser;
+    const matchesRange = (ts: string): boolean => {
+      const sheet = sheetNameFromTimestamp(ts);
+      if (currentRange.type === 'month') return sheet === currentRange.yearMonth;
+      if (currentRange.type === 'year')  return sheet.startsWith(`${currentRange.year}-`);
+      return true;
+    };
+    const out: DisplayRow[] = [];
+    for (const q of queuedWrites) {
+      if (q.op.kind !== 'append') continue;
+      const entry = q.op.entry;
+      if (entry.user !== currentUser && !isProxyEntry(entry)) continue;
+      if (!matchesRange(entry.timestamp)) continue;
+      if (catFilter !== null && catLabel(entry.category) !== catFilter) continue;
+      out.push({ ...entry, pendingWriteId: q.id });
+    }
+    return out;
+  }, [queuedWrites, currentRange, currentUser, catFilter]);
+
+  const displayRows = useMemo<DisplayRow[]>(
+    () => [...pendingAppendRows, ...visibleRows],
+    [pendingAppendRows, visibleRows],
+  );
+
   const toggleCatFilter = (label: string) => {
     setCatFilter((prev) => (prev === label ? null : label));
   };
@@ -673,17 +714,18 @@ export default function SummaryScreen({ onSignedOut }: Props) {
     );
   };
 
-  const renderItem = ({ item }: { item: ExpenseRow }) => {
+  const renderItem = ({ item }: { item: DisplayRow }) => {
+    const isPending = !!item.pendingWriteId;
     const isPartial = item.countedAmount !== item.amount;
     const struck = item.excluded ? styles.struck : undefined;
-    const key = `${item.sheetName ?? ''}:${item.rowIndex ?? ''}`;
+    const key = isPending ? `pending:${item.pendingWriteId}` : `${item.sheetName ?? ''}:${item.rowIndex ?? ''}`;
     const isExpanded = expanded.has(key);
-    const isWarned = warningKeys.has(key);
+    const isWarned = !isPending && warningKeys.has(key);
     const isProxy = item.source === 'proxy_camera' || item.source === 'proxy_manual';
     const [badgeBg, badgeColor] = sourceBadgeColors(item.source);
 
     return (
-      <View style={[styles.entry, isProxy && styles.entryProxy, item.excluded && styles.entryExcluded, isWarned && styles.entryWarned]}>
+      <View style={[styles.entry, isProxy && styles.entryProxy, item.excluded && styles.entryExcluded, isWarned && styles.entryWarned, isPending && styles.entryPending]}>
         {/* 上段: 日時・バッジ + 金額 */}
         <View style={styles.entryTop}>
           <View style={styles.entryMetaRow}>
@@ -694,6 +736,11 @@ export default function SummaryScreen({ onSignedOut }: Props) {
             {isProxy && (
               <View style={styles.proxyBadge}>
                 <Text style={styles.proxyBadgeText}>{item.user}（代理）</Text>
+              </View>
+            )}
+            {isPending && (
+              <View style={styles.pendingBadge}>
+                <Text style={styles.pendingBadgeText}>送信待ち</Text>
               </View>
             )}
           </View>
@@ -715,21 +762,23 @@ export default function SummaryScreen({ onSignedOut }: Props) {
           </TouchableOpacity>
         )}
 
-        {/* トグルチップ */}
-        <View style={styles.controls}>
-          <ToggleChip label="除外" activeLabel="除外中" checked={item.excluded} onPress={() => toggleExcluded(item)} activeColor="#ef4444" />
-          <ToggleChip label="一部計上" checked={isPartial} onPress={() => togglePartial(item)} activeColor="#f59e0b" />
-          {isPartial && (
-            <PartialAmountInput value={item.countedAmount} onCommit={(t) => commitPartialAmount(item, t)} />
-          )}
-          {isWarned && (
-            <ToggleChip label="確認済み" checked={item.confirmed} onPress={() => toggleConfirmed(item)} activeColor="#8b5cf6" />
-          )}
-          <ToggleChip label="固定費" checked={item.recurring} onPress={() => toggleRecurring(item)} activeColor="#3b82f6" />
-          <TouchableOpacity style={styles.editBtn} onPress={() => setEditTarget(item)}>
-            <Text style={styles.editBtnText}>編集</Text>
-          </TouchableOpacity>
-        </View>
+        {/* トグルチップ（送信待ちの行はまだサーバー上に無いので編集不可） */}
+        {isPending ? null : (
+          <View style={styles.controls}>
+            <ToggleChip label="除外" activeLabel="除外中" checked={item.excluded} onPress={() => toggleExcluded(item)} activeColor="#ef4444" />
+            <ToggleChip label="一部計上" checked={isPartial} onPress={() => togglePartial(item)} activeColor="#f59e0b" />
+            {isPartial && (
+              <PartialAmountInput value={item.countedAmount} onCommit={(t) => commitPartialAmount(item, t)} />
+            )}
+            {isWarned && (
+              <ToggleChip label="確認済み" checked={item.confirmed} onPress={() => toggleConfirmed(item)} activeColor="#8b5cf6" />
+            )}
+            <ToggleChip label="固定費" checked={item.recurring} onPress={() => toggleRecurring(item)} activeColor="#3b82f6" />
+            <TouchableOpacity style={styles.editBtn} onPress={() => setEditTarget(item)}>
+              <Text style={styles.editBtnText}>編集</Text>
+            </TouchableOpacity>
+          </View>
+        )}
       </View>
     );
   };
@@ -819,6 +868,19 @@ export default function SummaryScreen({ onSignedOut }: Props) {
         </View>
       )}
 
+      {!!loadError && (
+        <TouchableOpacity
+          style={styles.errorBanner}
+          onPress={() => loadRows(currentRange)}
+          disabled={loading}
+        >
+          {loading && <ActivityIndicator color="#fff" size="small" />}
+          <Text style={styles.errorBannerText}>
+            {loading ? '再試行中...' : `読み込みに失敗しました（タップで再試行）: ${loadError}`}
+          </Text>
+        </TouchableOpacity>
+      )}
+
       {/* デモ中は送信しないのでバナーも出さない（見せている画面に出すと紛らわしい） */}
       {!demoMode && queuedWrites.length > 0 && (
         <TouchableOpacity
@@ -836,8 +898,8 @@ export default function SummaryScreen({ onSignedOut }: Props) {
       )}
 
       <FlatList
-        data={visibleRows}
-        keyExtractor={(r) => `${r.sheetName ?? ''}:${r.rowIndex ?? r.timestamp}`}
+        data={displayRows}
+        keyExtractor={(r) => (r.pendingWriteId ? `pending:${r.pendingWriteId}` : `${r.sheetName ?? ''}:${r.rowIndex ?? r.timestamp}`)}
         renderItem={renderItem}
         ListHeaderComponent={renderHeader}
         ListEmptyComponent={
@@ -1696,4 +1758,23 @@ const styles = StyleSheet.create({
     paddingVertical: 8,
   },
   queueBannerText: { color: '#fff', fontSize: 13, fontWeight: 'bold', flexShrink: 1 },
+  errorBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    backgroundColor: '#dc2626',
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+  },
+  errorBannerText: { color: '#fff', fontSize: 13, fontWeight: 'bold', flexShrink: 1 },
+
+  // ─── 送信待ち行 ───────────────────────────────────────────────────────────
+  entryPending: { opacity: 0.65, borderStyle: 'dashed', borderWidth: 1, borderColor: '#b45309' },
+  pendingBadge: {
+    backgroundColor: '#fef3c7',
+    borderRadius: 8,
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+  },
+  pendingBadgeText: { fontSize: 11, fontWeight: 'bold', color: '#b45309' },
 });
