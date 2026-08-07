@@ -63,6 +63,9 @@ export default function SettingsScreen({ onSignedOut }: Props) {
 
   // ─── デモモード ───
   const [demo, setDemo]           = useState<Demo.DemoConfig>(Demo.getConfigSync);
+  // 設定内容(表示名・カテゴリ別合計など)はON/OFFを切り替えた直後だけ見せる。
+  // 画面を開いただけ・ONのまま再訪しただけでは出さない(横から見られてもデモと分からないように)
+  const [panelOpen, setPanelOpen] = useState(false);
   const [demoUsers, setDemoUsers] = useState<string[]>([]); // 実名の一覧
   const [aliasDraft, setAliasDraft] = useState<Record<string, string>>({});
   /** 当月の実際のカテゴリ別合計（マスク前）。[カテゴリ, 金額] の降順 */
@@ -362,15 +365,18 @@ export default function SettingsScreen({ onSignedOut }: Props) {
         ListHeaderComponent={
           <View style={styles.body}>
             <View style={styles.card}>
-              <View style={[styles.cardRow, styles.demoToggleRow, demo.enabled && styles.cardRowBorder]}>
+              <View style={[styles.cardRow, styles.demoToggleRow, (demo.enabled && panelOpen) && styles.cardRowBorder]}>
                 <TouchableOpacity
-                  onPress={() => patchDemo({ enabled: !demo.enabled })}
+                  onPress={() => {
+                    setPanelOpen(true);
+                    patchDemo({ enabled: !demo.enabled });
+                  }}
                   style={[styles.demoToggleBtn, demo.enabled && styles.demoToggleBtnOn]}
                   activeOpacity={0.7}
                 />
               </View>
 
-              {demo.enabled && (
+              {demo.enabled && panelOpen && (
                 <>
                   <Text style={styles.demoGroupLabel}>表示名</Text>
                   {demoUsers.map((name) => (
