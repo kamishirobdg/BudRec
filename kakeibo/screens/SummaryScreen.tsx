@@ -575,6 +575,16 @@ export default function SummaryScreen({ onSignedOut }: Props) {
     setVisibleCount((c) => (c < displayRows.length ? c + PAGE_SIZE : c));
   }, [displayRows.length]);
 
+  // スクロールを待たず、裏で少しずつ自動的に読み進めておく（スクロールのたびに
+  // 読み込みが挟まると引っかかりを感じるため、先回りして表示済みにしておく）
+  useEffect(() => {
+    if (visibleCount >= displayRows.length) return;
+    const timer = setTimeout(() => {
+      setVisibleCount((c) => Math.min(c + PAGE_SIZE, displayRows.length));
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [visibleCount, displayRows.length]);
+
   const toggleCatFilter = (label: string) => {
     setCatFilter((prev) => (prev === label ? null : label));
   };
@@ -994,9 +1004,12 @@ export default function SummaryScreen({ onSignedOut }: Props) {
         }
         ListFooterComponent={
           pagedRows.length < displayRows.length ? (
-            <Text style={styles.loadMoreHint}>
-              {pagedRows.length} / {displayRows.length} 件表示中（下にスクロールでさらに表示）
-            </Text>
+            <View style={styles.loadMoreHint}>
+              <ActivityIndicator size="small" color="#999" />
+              <Text style={styles.loadMoreHintText}>
+                {pagedRows.length} / {displayRows.length} 件表示中（読み込み中...）
+              </Text>
+            </View>
           ) : null
         }
         onEndReached={handleLoadMore}
@@ -1564,7 +1577,8 @@ const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#f2f4f7' },
   center:    { flex: 1, backgroundColor: '#f2f4f7', alignItems: 'center', justifyContent: 'center' },
   empty:     { textAlign: 'center', color: '#888', marginTop: 24, marginHorizontal: 16 },
-  loadMoreHint: { textAlign: 'center', color: '#999', fontSize: 12, paddingVertical: 16 },
+  loadMoreHint: { flexDirection: 'row', justifyContent: 'center', alignItems: 'center', gap: 8, paddingVertical: 16 },
+  loadMoreHintText: { color: '#999', fontSize: 12 },
 
   // ─── コントロール行 ───────────────────────────────────────────────────────
   rangeRow: {
