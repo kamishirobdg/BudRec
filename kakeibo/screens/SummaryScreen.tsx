@@ -746,9 +746,11 @@ export default function SummaryScreen({ onSignedOut }: Props) {
 
         {/* 検索 */}
         <View style={styles.searchRow}>
+          <Text style={styles.searchIcon}>🔍</Text>
           <TextInput
             style={styles.searchInput}
             placeholder="店舗名・メモで検索"
+            placeholderTextColor="#999"
             value={searchText}
             onChangeText={setSearchText}
             returnKeyType="search"
@@ -993,6 +995,7 @@ export default function SummaryScreen({ onSignedOut }: Props) {
         keyExtractor={(r) => (r.pendingWriteId ? `pending:${r.pendingWriteId}` : `${r.sheetName ?? ''}:${r.rowIndex ?? r.timestamp}`)}
         renderItem={renderItem}
         ListHeaderComponent={renderHeader}
+        persistentScrollbar
         ListEmptyComponent={
           <Text style={styles.empty}>
             {searchQuery !== ''
@@ -1688,8 +1691,11 @@ const styles = StyleSheet.create({
     marginHorizontal: 16,
     backgroundColor: '#fff',
     borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#e0e0e0',
     paddingHorizontal: 12,
   },
+  searchIcon: { fontSize: 14, color: '#999', marginRight: 6 },
   searchInput: { flex: 1, height: 40, fontSize: 14, color: '#333' },
   searchClearBtn: { paddingHorizontal: 6, paddingVertical: 6 },
   searchClearBtnText: { fontSize: 14, color: '#999', fontWeight: 'bold' },
