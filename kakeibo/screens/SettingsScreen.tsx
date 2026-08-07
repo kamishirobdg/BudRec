@@ -361,22 +361,12 @@ export default function SettingsScreen({ onSignedOut }: Props) {
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={handleRefresh} />}
         ListHeaderComponent={
           <View style={styles.body}>
-            {/* デモモード */}
-            <Text style={styles.sectionLabel}>デモモード</Text>
             <View style={styles.card}>
-              <View style={[styles.cardRow, demo.enabled && styles.cardRowBorder]}>
-                <View style={{ flex: 1 }}>
-                  <Text style={styles.cardRowLabel}>デモ表示に切り替える</Text>
-                  <Text style={styles.demoHint}>
-                    名前と金額を差し替えて表示します。ONの間の追加・編集・削除は
-                    スプレッドシートに保存されません（アプリを閉じると消えます）。
-                  </Text>
-                </View>
-                <Switch
-                  value={demo.enabled}
-                  onValueChange={(v) => patchDemo({ enabled: v })}
-                  trackColor={{ false: '#ccc', true: '#a5d6a7' }}
-                  thumbColor={demo.enabled ? '#2e7d32' : '#f4f3f4'}
+              <View style={[styles.cardRow, styles.demoToggleRow, demo.enabled && styles.cardRowBorder]}>
+                <TouchableOpacity
+                  onPress={() => patchDemo({ enabled: !demo.enabled })}
+                  style={[styles.demoToggleBtn, demo.enabled && styles.demoToggleBtnOn]}
+                  activeOpacity={0.7}
                 />
               </View>
 
@@ -726,6 +716,10 @@ const styles = StyleSheet.create({
   pillBtnText: { fontSize: 13, color: '#333' },
   pillBtnActive:     { backgroundColor: '#e8f5e9', borderColor: '#2e7d32' },
   pillBtnTextActive: { color: '#2e7d32', fontWeight: 'bold' },
+
+  demoToggleRow:  { justifyContent: 'flex-end' },
+  demoToggleBtn:  { width: 28, height: 28, borderRadius: 14, backgroundColor: '#ccc' },
+  demoToggleBtnOn: { backgroundColor: '#2e7d32' },
 
   demoHint:       { fontSize: 11, color: '#888', lineHeight: 16, marginTop: 2, paddingBottom: 8 },
   demoGroupLabel: { fontSize: 11, fontWeight: '600', color: '#888', marginTop: 10 },
