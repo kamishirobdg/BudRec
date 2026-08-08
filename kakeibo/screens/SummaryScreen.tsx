@@ -4,6 +4,7 @@ import {
   Alert,
   Button,
   FlatList,
+  KeyboardAvoidingView,
   Modal,
   Pressable,
   RefreshControl,
@@ -585,6 +586,52 @@ export default function SummaryScreen({ onSignedOut }: Props) {
     return () => clearTimeout(timer);
   }, [visibleCount, displayRows.length]);
 
+  // ─── フロートのスクロールボタン（スクロールバーが機種によって見えづらいため） ───
+  const flatListRef       = useRef<FlatList<DisplayRow>>(null);
+  const scrollOffsetRef   = useRef(0);
+  const contentHeightRef  = useRef(0);
+  const viewportHeightRef = useRef(0);
+  // 「最下部へ」を押した時点で全件読み込めていなければ、読み込み終わってから1回だけ着地する
+  const [jumpToEndPending, setJumpToEndPending] = useState(false);
+
+  const handleScroll = useCallback((e: { nativeEvent: { contentOffset: { y: number } } }) => {
+    scrollOffsetRef.current = e.nativeEvent.contentOffset.y;
+  }, []);
+
+  const handleListLayout = useCallback((e: { nativeEvent: { layout: { height: number } } }) => {
+    viewportHeightRef.current = e.nativeEvent.layout.height;
+  }, []);
+
+  const handleContentSizeChange = useCallback((_w: number, h: number) => {
+    contentHeightRef.current = h;
+    if (jumpToEndPending && visibleCount >= displayRows.length) {
+      setJumpToEndPending(false);
+      flatListRef.current?.scrollToEnd({ animated: true });
+    }
+  }, [jumpToEndPending, visibleCount, displayRows.length]);
+
+  const scrollToTop = useCallback(() => {
+    flatListRef.current?.scrollToOffset({ offset: 0, animated: true });
+  }, []);
+
+  /** 現在位置から全体の10%ぶんだけ上/下へ動かす。着地後の補正はしない（1回押したら1回だけ動く） */
+  const scrollByPercent = useCallback((sign: 1 | -1) => {
+    const delta     = contentHeightRef.current * 0.1 * sign;
+    const maxOffset = Math.max(0, contentHeightRef.current - viewportHeightRef.current);
+    const target    = Math.min(maxOffset, Math.max(0, scrollOffsetRef.current + delta));
+    flatListRef.current?.scrollToOffset({ offset: target, animated: true });
+  }, []);
+
+  const handleJumpToEnd = useCallback(() => {
+    if (visibleCount >= displayRows.length) {
+      flatListRef.current?.scrollToEnd({ animated: true });
+    } else {
+      // 残りを一気に読み込んでから着地する（onContentSizeChange 側で実行）
+      setJumpToEndPending(true);
+      setVisibleCount(displayRows.length);
+    }
+  }, [visibleCount, displayRows.length]);
+
   const toggleCatFilter = (label: string) => {
     setCatFilter((prev) => (prev === label ? null : label));
   };
@@ -991,11 +1038,16 @@ export default function SummaryScreen({ onSignedOut }: Props) {
       )}
 
       <FlatList
+        ref={flatListRef}
         data={pagedRows}
         keyExtractor={(r) => (r.pendingWriteId ? `pending:${r.pendingWriteId}` : `${r.sheetName ?? ''}:${r.rowIndex ?? r.timestamp}`)}
         renderItem={renderItem}
         ListHeaderComponent={renderHeader}
         persistentScrollbar
+        onScroll={handleScroll}
+        scrollEventThrottle={16}
+        onLayout={handleListLayout}
+        onContentSizeChange={handleContentSizeChange}
         ListEmptyComponent={
           <Text style={styles.empty}>
             {searchQuery !== ''
@@ -1024,6 +1076,24 @@ export default function SummaryScreen({ onSignedOut }: Props) {
           <RefreshControl refreshing={refreshing} onRefresh={handleRefresh} />
         }
       />
+
+      <View style={styles.scrollFloatTop} pointerEvents="box-none">
+        <TouchableOpacity style={styles.scrollFloatBtn} onPress={scrollToTop} activeOpacity={0.7}>
+          <Text style={styles.scrollFloatBtnText}>⤒</Text>
+        </TouchableOpacity>
+        <TouchableOpacity style={styles.scrollFloatBtn} onPress={() => scrollByPercent(-1)} activeOpacity={0.7}>
+          <Text style={styles.scrollFloatBtnText}>↑</Text>
+        </TouchableOpacity>
+      </View>
+
+      <View style={styles.scrollFloatBottom} pointerEvents="box-none">
+        <TouchableOpacity style={styles.scrollFloatBtn} onPress={() => scrollByPercent(1)} activeOpacity={0.7}>
+          <Text style={styles.scrollFloatBtnText}>↓</Text>
+        </TouchableOpacity>
+        <TouchableOpacity style={styles.scrollFloatBtn} onPress={handleJumpToEnd} activeOpacity={0.7}>
+          <Text style={styles.scrollFloatBtnText}>⤓</Text>
+        </TouchableOpacity>
+      </View>
 
       <RangePickerModal
         visible={pickerOpen}
@@ -1271,90 +1341,92 @@ function EditEntryModal({
           <Text style={styles.modalHeaderTitle}>明細編集</Text>
           <Button title="閉じる" onPress={onClose} />
         </View>
-        <ScrollView contentContainerStyle={styles.editForm}>
-          {/* 読み取り専用フィールド */}
-          <View style={styles.readOnlyGroup}>
-            <View style={styles.readOnlyRow}>
-              <Text style={styles.readOnlyLabel}>取込元</Text>
-              <View style={styles.readOnlyValueRow}>
-                {(() => { const [bg, col] = sourceBadgeColors(source); return (
-                  <View style={[styles.sourceBadge, { backgroundColor: bg }]}>
-                    <Text style={[styles.sourceBadgeText, { color: col }]}>{sourceLabel(source)}</Text>
-                  </View>
-                ); })()}
-                <Text style={styles.readOnlyNote}>変更不可</Text>
+        <KeyboardAvoidingView style={{ flex: 1 }} behavior="height">
+          <ScrollView contentContainerStyle={styles.editForm} keyboardShouldPersistTaps="handled">
+            {/* 読み取り専用フィールド */}
+            <View style={styles.readOnlyGroup}>
+              <View style={styles.readOnlyRow}>
+                <Text style={styles.readOnlyLabel}>取込元</Text>
+                <View style={styles.readOnlyValueRow}>
+                  {(() => { const [bg, col] = sourceBadgeColors(source); return (
+                    <View style={[styles.sourceBadge, { backgroundColor: bg }]}>
+                      <Text style={[styles.sourceBadgeText, { color: col }]}>{sourceLabel(source)}</Text>
+                    </View>
+                  ); })()}
+                  <Text style={styles.readOnlyNote}>変更不可</Text>
+                </View>
+              </View>
+              <View style={[styles.readOnlyRow, { borderBottomWidth: 0 }]}>
+                <Text style={styles.readOnlyLabel}>ユーザー</Text>
+                <View style={styles.readOnlyValueRow}>
+                  <Text style={styles.readOnlyValue}>{user}</Text>
+                  <Text style={styles.readOnlyNote}>変更不可</Text>
+                </View>
               </View>
             </View>
-            <View style={[styles.readOnlyRow, { borderBottomWidth: 0 }]}>
-              <Text style={styles.readOnlyLabel}>ユーザー</Text>
-              <View style={styles.readOnlyValueRow}>
-                <Text style={styles.readOnlyValue}>{user}</Text>
-                <Text style={styles.readOnlyNote}>変更不可</Text>
-              </View>
-            </View>
-          </View>
-          <Field label="日時 (YYYY-MM-DD HH:MM)" value={timestamp} onChangeText={setTimestamp} />
-          <Field label="店舗" value={store} onChangeText={setStore} />
+            <Field label="日時 (YYYY-MM-DD HH:MM)" value={timestamp} onChangeText={setTimestamp} />
+            <Field label="店舗" value={store} onChangeText={setStore} />
 
-          {/* カテゴリはプルダウン選択 */}
-          <View style={styles.fieldBox}>
-            <Text style={styles.fieldLabel}>カテゴリ</Text>
+            {/* カテゴリはプルダウン選択 */}
+            <View style={styles.fieldBox}>
+              <Text style={styles.fieldLabel}>カテゴリ</Text>
+              <TouchableOpacity
+                style={styles.pickerButton}
+                onPress={() => setCategoryPickerOpen(true)}
+              >
+                <Text style={styles.pickerButtonText}>
+                  {category || '(未選択)'} ▾
+                </Text>
+              </TouchableOpacity>
+            </View>
+
+            <Field
+              label="金額"
+              value={amount}
+              onChangeText={setAmount}
+              keyboardType="number-pad"
+            />
+            <Field
+              label="計上金額"
+              value={countedAmount}
+              onChangeText={setCountedAmount}
+              keyboardType="number-pad"
+            />
+            <Field
+              label="メモ"
+              value={memo}
+              onChangeText={setMemo}
+              multiline
+            />
+
             <TouchableOpacity
-              style={styles.pickerButton}
-              onPress={() => setCategoryPickerOpen(true)}
+              style={styles.checkbox}
+              onPress={() => setExcluded((v) => !v)}
             >
-              <Text style={styles.pickerButtonText}>
-                {category || '(未選択)'} ▾
-              </Text>
+              <View style={[styles.box, excluded && styles.boxChecked]}>
+                {excluded && <Text style={styles.boxMark}>✓</Text>}
+              </View>
+              <Text style={styles.checkboxLabel}>集計から除外</Text>
             </TouchableOpacity>
-          </View>
 
-          <Field
-            label="金額"
-            value={amount}
-            onChangeText={setAmount}
-            keyboardType="number-pad"
-          />
-          <Field
-            label="計上金額"
-            value={countedAmount}
-            onChangeText={setCountedAmount}
-            keyboardType="number-pad"
-          />
-          <Field
-            label="メモ"
-            value={memo}
-            onChangeText={setMemo}
-            multiline
-          />
+            <View style={{ height: 8 }} />
+            <TouchableOpacity style={styles.saveBtn} onPress={handleSave}>
+              <Text style={styles.saveBtnText}>保存する</Text>
+            </TouchableOpacity>
 
-          <TouchableOpacity
-            style={styles.checkbox}
-            onPress={() => setExcluded((v) => !v)}
-          >
-            <View style={[styles.box, excluded && styles.boxChecked]}>
-              {excluded && <Text style={styles.boxMark}>✓</Text>}
-            </View>
-            <Text style={styles.checkboxLabel}>集計から除外</Text>
-          </TouchableOpacity>
+            <View style={{ height: 24 }} />
+            <TouchableOpacity
+              style={styles.deleteBtn}
+              onPress={() => onDelete(target)}
+            >
+              <Text style={styles.deleteBtnText}>この明細を削除</Text>
+            </TouchableOpacity>
 
-          <View style={{ height: 8 }} />
-          <TouchableOpacity style={styles.saveBtn} onPress={handleSave}>
-            <Text style={styles.saveBtnText}>保存する</Text>
-          </TouchableOpacity>
-
-          <View style={{ height: 24 }} />
-          <TouchableOpacity
-            style={styles.deleteBtn}
-            onPress={() => onDelete(target)}
-          >
-            <Text style={styles.deleteBtnText}>この明細を削除</Text>
-          </TouchableOpacity>
-
-          <Text style={styles.editNote}>
-            ※ 日時の月を変更しても行は元のシート（{target.sheetName}）のまま残ります
-          </Text>
-        </ScrollView>
+            <Text style={styles.editNote}>
+              ※ 日時の月を変更しても行は元のシート（{target.sheetName}）のまま残ります
+            </Text>
+          </ScrollView>
+        </KeyboardAvoidingView>
       </SafeAreaView>
 
       {/* カテゴリ選択モーダル */}
@@ -1582,6 +1654,24 @@ const styles = StyleSheet.create({
   empty:     { textAlign: 'center', color: '#888', marginTop: 24, marginHorizontal: 16 },
   loadMoreHint: { flexDirection: 'row', justifyContent: 'center', alignItems: 'center', gap: 8, paddingVertical: 16 },
   loadMoreHintText: { color: '#999', fontSize: 12 },
+
+  // ─── フロートのスクロールボタン ───
+  scrollFloatTop:    { position: 'absolute', top: 10, right: 12, gap: 8 },
+  scrollFloatBottom: { position: 'absolute', bottom: 12, right: 12, gap: 8 },
+  scrollFloatBtn: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: 'rgba(46, 125, 50, 0.85)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    elevation: 4,
+    shadowColor: '#000',
+    shadowOpacity: 0.2,
+    shadowRadius: 4,
+    shadowOffset: { width: 0, height: 2 },
+  },
+  scrollFloatBtnText: { color: '#fff', fontSize: 18, fontWeight: 'bold' },
 
   // ─── コントロール行 ───────────────────────────────────────────────────────
   rangeRow: {
