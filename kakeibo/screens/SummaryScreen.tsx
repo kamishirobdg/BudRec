@@ -217,10 +217,12 @@ export default function SummaryScreen({ onSignedOut }: Props) {
     setLoading(true);
     // ユーザー名・デモ設定は端末ローカル読み出しのみ（通信不要）。
     // Sheets 側が落ちていてもここは常に反映しておく（オフラインキャッシュの絞り込みに使うため）
+    let isDemo = false;
     try {
       const [user, demo] = await Promise.all([getCurrentUser(), Demo.isDemo()]);
       setCurrentUserState(user);
       setDemoMode(demo);
+      isDemo = demo;
     } catch (e) {
       console.error('[SummaryScreen] ローカル設定の読み込み失敗:', e);
     }
@@ -233,12 +235,14 @@ export default function SummaryScreen({ onSignedOut }: Props) {
       setDefaultPartial(partial);
       setLoadError(null);
       setOfflineNotice(null);
-      RowsCache.save(range, list);
+      // デモ中の取得結果は名前・金額が偽装済みなので、実データ用キャッシュに混ぜない
+      if (!isDemo) RowsCache.save(range, list);
     } catch (e) {
       if (e instanceof AuthError) { onSignedOut(); return; }
       const message = e instanceof Error ? e.message : String(e);
-      // 通信できなくても、この範囲を過去に開いたことがあれば端末内キャッシュを出す
-      const cached = RowsCache.get(range);
+      // 通信できなくても、この範囲を過去に開いたことがあれば端末内キャッシュを出す。
+      // デモ中は「デモの偽データ」と「実データ」の取り違えを避けるため使わない
+      const cached = isDemo ? null : RowsCache.get(range);
       if (cached) {
         setRows(cached.rows);
         setLoadError(null);
@@ -532,8 +536,10 @@ export default function SummaryScreen({ onSignedOut }: Props) {
   }, [myRows, catFilter, searchQuery, matchesSearch]);
 
   // 未送信キューに溜まっている追加行（送信されるまでシートに存在せず rows には出てこない）。
-  // 表示中の範囲・自分の行に絞って一覧の先頭に重ねる
+  // 表示中の範囲・自分の行に絞って一覧の先頭に重ねる。
+  // キューの中身はマスクされていない実データなので、デモ中は出さない（未送信バナーと同様の扱い）
   const pendingAppendRows = useMemo<DisplayRow[]>(() => {
+    if (demoMode) return [];
     const isProxyEntry = (r: ExpenseRow) =>
       (r.source === 'proxy_camera' || r.source === 'proxy_manual') && r.user !== currentUser;
     const matchesRange = (ts: string): boolean => {
@@ -553,7 +559,7 @@ export default function SummaryScreen({ onSignedOut }: Props) {
       out.push({ ...entry, pendingWriteId: q.id });
     }
     return out;
-  }, [queuedWrites, currentRange, currentUser, catFilter, searchQuery, matchesSearch]);
+  }, [queuedWrites, currentRange, currentUser, catFilter, searchQuery, matchesSearch, demoMode]);
 
   const displayRows = useMemo<DisplayRow[]>(
     () => [...pendingAppendRows, ...visibleRows],
@@ -593,6 +599,11 @@ export default function SummaryScreen({ onSignedOut }: Props) {
   const viewportHeightRef = useRef(0);
   // 「最下部へ」を押した時点で全件読み込めていなければ、読み込み終わってから1回だけ着地する
   const [jumpToEndPending, setJumpToEndPending] = useState(false);
+  // 着地を待っている間に範囲・絞り込み・並び替えが変わったら、別のリストへの
+  // 意図しない自動スクロールを避けるため待機を取り消す
+  useEffect(() => {
+    setJumpToEndPending(false);
+  }, [currentRange, catFilter, searchQuery, sortKey]);
 
   const handleScroll = useCallback((e: { nativeEvent: { contentOffset: { y: number } } }) => {
     scrollOffsetRef.current = e.nativeEvent.contentOffset.y;
@@ -1043,6 +1054,7 @@ export default function SummaryScreen({ onSignedOut }: Props) {
         keyExtractor={(r) => (r.pendingWriteId ? `pending:${r.pendingWriteId}` : `${r.sheetName ?? ''}:${r.rowIndex ?? r.timestamp}`)}
         renderItem={renderItem}
         ListHeaderComponent={renderHeader}
+        contentContainerStyle={styles.listContent}
         persistentScrollbar
         onScroll={handleScroll}
         scrollEventThrottle={16}
@@ -1654,6 +1666,9 @@ const styles = StyleSheet.create({
   empty:     { textAlign: 'center', color: '#888', marginTop: 24, marginHorizontal: 16 },
   loadMoreHint: { flexDirection: 'row', justifyContent: 'center', alignItems: 'center', gap: 8, paddingVertical: 16 },
   loadMoreHintText: { color: '#999', fontSize: 12 },
+
+  // 右下フロートボタン（最下部へ/↓10%）の下に最後の明細の操作ボタンが隠れないよう余白を確保
+  listContent: { paddingBottom: 100 },
 
   // ─── フロートのスクロールボタン ───
   scrollFloatTop:    { position: 'absolute', top: 10, right: 12, gap: 8 },

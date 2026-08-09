@@ -35,6 +35,7 @@ import {
   flushWriteQueue,
 } from '../services/SheetsService';
 import * as WriteQueue from '../services/WriteQueueService';
+import * as RowsCache from '../services/RowsCacheService';
 import * as Demo from '../services/DemoService';
 import { runGmailImport, getSkippedMessageSummaries, SkippedMessageSummary } from '../services/GmailService';
 import { useGmailProgress } from '../services/GmailProgressService';
@@ -346,6 +347,9 @@ export default function SettingsScreen({ onSignedOut }: Props) {
           onPress: async () => {
             try {
               await signOut();
+              // 同じ端末で別アカウントに切り替えることがあるため、
+              // 前アカウントのデータがオフラインキャッシュとして残らないようにする
+              RowsCache.clear();
               onSignedOut();
             } catch (e) {
               Alert.alert('サインアウト失敗', e instanceof Error ? e.message : String(e));

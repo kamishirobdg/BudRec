@@ -84,3 +84,10 @@ export function get(range: RangeSpec): { rows: ExpenseRow[]; savedAt: string } |
   const entry = load().find((e) => e.key === rangeKey(range));
   return entry ? { rows: entry.rows, savedAt: entry.savedAt } : null;
 }
+
+/** 全部捨てる（サインアウト時。同じ端末で別アカウントに切り替えたときに前アカウントの
+ *  データがオフラインキャッシュとして残らないようにする） */
+export function clear(): void {
+  cache = [];
+  persist();
+}
