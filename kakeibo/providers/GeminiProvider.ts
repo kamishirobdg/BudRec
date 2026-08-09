@@ -35,7 +35,7 @@ export const geminiProvider: AIProvider = {
       { inline_data: { mime_type: 'image/jpeg', data: imageBase64 } },
     ];
     const raw = await callGemini(parts, RECEIPT_LIST_SCHEMA, { highRes: true });
-    return parseReceiptList(raw);
+    return parseReceiptList(raw, categories);
   },
 
   async extractEmail(emailText: string, categories: string[]): Promise<ReceiptData> {
@@ -43,7 +43,7 @@ export const geminiProvider: AIProvider = {
     const parts = [{ text: `${prompt}\n\n--- メール本文 ---\n${emailText}` }];
     // テキストだけなので解像度指定は要らない
     const raw = await callGemini(parts, EMAIL_RECEIPT_SCHEMA, { highRes: false });
-    return parseReceiptResponse(raw);
+    return parseReceiptResponse(raw, categories);
   },
 };
 

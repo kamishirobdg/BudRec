@@ -32,6 +32,7 @@ import { getProvider } from '../providers';
 import type { ReceiptData } from '../providers';
 import * as ReceiptQueue from '../services/ReceiptQueueService';
 import * as LastBatch from '../services/LastBatchService';
+import * as Demo from '../services/DemoService';
 import ReceiptReviewModal from './ReceiptReviewModal';
 
 // 通知ハンドラ: フォアグラウンド時もバナーとリストに表示する。
@@ -190,8 +191,11 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
     }
 
     if (saved.length === 0) throw new Error('スプレッドシートに書き込めませんでした');
-    // 一覧の「前回の登録」から後で見直せるようにする
-    LastBatch.saveLastBatch(saved);
+    // 一覧の「前回の登録」から後で見直せるようにする。
+    // デモ中は appendRow がメモリ上のオーバーレイに積むだけで実データは書かれないが、
+    // saved にはマスク前の実データ（店名・金額）が入っているため、
+    // ここに保存すると端末ファイルに実データが残ってしまう。デモ中は保存しない
+    if (!(await Demo.isDemo())) LastBatch.saveLastBatch(saved);
     return buildSaveMessage(saved, queued, failed);
   };
 
@@ -254,10 +258,13 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
   /**
    * 保存済みレシートファイルを OCR 処理する。
    * 失敗時は 1 秒待って 1 回だけ自動リトライ。それでも失敗なら 3 択ダイアログ。
+   * 戻り値は「再サインインが必要な状態で終わったか」。一括処理のループが
+   * 残り全件へ同じ AuthError を連発させないよう、ここで検知できるようにしている。
    */
-  const processReceipt = async (uri: string) => {
+  const processReceipt = async (uri: string): Promise<boolean> => {
     setBusy(true);
     setStatusMsg('OCR解析中...');
+    let authFailed = false;
     try {
       let base64: string;
       try {
@@ -269,16 +276,16 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
         );
         ReceiptQueue.deleteReceipt(uri);
         refreshPending();
-        return;
+        return false;
       }
 
       try {
         const msg = await attemptReceipt(base64, uri);
-        if (msg === null) return; // 確認モーダル待ち。画像はモーダル側で片付ける
+        if (msg === null) return false; // 確認モーダル待ち。画像はモーダル側で片付ける
         ReceiptQueue.deleteReceipt(uri);
         refreshPending();
         onSuccess(msg);
-        return;
+        return false;
       } catch (firstErr) {
         if (firstErr instanceof AuthError) throw firstErr;
         console.warn('[Receipt] OCR 1回目失敗、リトライ:', firstErr);
@@ -290,7 +297,7 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
       await new Promise((r) => setTimeout(r, 1000));
       try {
         const msg = await attemptReceipt(base64, uri);
-        if (msg === null) return;
+        if (msg === null) return false;
         ReceiptQueue.deleteReceipt(uri);
         refreshPending();
         onSuccess(msg);
@@ -301,6 +308,7 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
       }
     } catch (e) {
       if (e instanceof AuthError) {
+        authFailed = true;
         Alert.alert('再サインインが必要です', 'セッションが期限切れです。再度サインインしてください。', [
           { text: 'OK', onPress: onSignedOut },
         ]);
@@ -310,6 +318,7 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
       setStatusMsg('');
       onStatusChange('');
     }
+    return authFailed;
   };
 
   const handleShoot = async () => {
@@ -342,6 +351,8 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
 
   const handlePickImage = async () => {
     if (busy) return;
+    // ピッカーが実際に開くまでの間も連打で多重起動されないようにする（撮影ボタンと同様）
+    setBusy(true);
 
     const result = await ImagePicker.launchImageLibraryAsync({
       mediaTypes: ['images'],
@@ -350,14 +361,19 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
       allowsMultipleSelection: false,
     });
 
-    if (result.canceled || !result.assets[0]?.base64) return;
+    if (result.canceled || !result.assets[0]?.base64) {
+      setBusy(false);
+      return;
+    }
 
     try {
       const uri = ReceiptQueue.saveReceipt(result.assets[0].base64);
       refreshPending();
+      setBusy(false);
       navigation.navigate('Summary' as never);
       await processReceipt(uri);
     } catch (e) {
+      setBusy(false);
       Alert.alert('失敗', e instanceof Error ? e.message : String(e));
     }
   };
@@ -370,7 +386,10 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
     for (const uri of snapshot) {
       // 途中で失敗 → 3択ダイアログが出るのでそこで止まる。
       // ダイアログ閉じた後は refreshPending で次の件がバナーに残るのでユーザーが再開できる
-      await processReceipt(uri);
+      const authFailed = await processReceipt(uri);
+      // 再サインインが必要な状態では残りも必ず同じ理由で失敗するので、
+      // Alert を件数分積まないようここで打ち切る（残りは次回起動時の再開に任せる）
+      if (authFailed) break;
       // 確認モーダルが開いたら残りは進めない（次の結果で上書きしてしまうため）
       if (reviewRef.current) break;
     }

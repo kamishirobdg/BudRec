@@ -52,7 +52,7 @@ import * as Demo from '../services/DemoService';
 import * as LastBatch from '../services/LastBatchService';
 import SettingsScreen from './SettingsScreen';
 import PersonalModal from './PersonalModal';
-import ReceiptReviewModal from './ReceiptReviewModal';
+import ReceiptReviewModal, { normalizeTimestampInput } from './ReceiptReviewModal';
 import MemoText from './MemoText';
 
 // ─── UI helpers ──────────────────────────────────────────────────────────────
@@ -185,6 +185,14 @@ export default function SummaryScreen({ onSignedOut }: Props) {
     return { type: 'month', yearMonth: getSheetNameFromDate() };
   }, [rangeOptions, rangeKey]);
 
+  // currentRange は rangeOptions の読み込み前後で「中身は同じでもオブジェクト参照が変わる」
+  // ことがある（フォールバック値→本来の値、など）。useEffect の依存に生の currentRange を使うと
+  // 起動直後に読み込みが2回走ってしまうため、内容ベースの文字列キーを別途用意する
+  const currentRangeSignature =
+    currentRange.type === 'month' ? `month:${currentRange.yearMonth}` :
+    currentRange.type === 'year'  ? `year:${currentRange.year}` :
+    'all';
+
   const currentRangeLabel = useMemo(() => {
     return rangeOptions.find((o) => o.key === rangeKey)?.label ?? '当月';
   }, [rangeOptions, rangeKey]);
@@ -263,7 +271,9 @@ export default function SummaryScreen({ onSignedOut }: Props) {
 
   useEffect(() => {
     loadRows(currentRange);
-  }, [loadRows, currentRange]);
+    // currentRange 自体ではなく内容ベースの signature を見る（上記コメント参照）
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loadRows, currentRangeSignature]);
 
   // Gmail 取り込みが完了して imported > 0 なら一覧を再取得
   const lastGmailFinishedRef = useRef(false);
@@ -276,7 +286,8 @@ export default function SummaryScreen({ onSignedOut }: Props) {
     } else if (!gmailProgress.finished) {
       lastGmailFinishedRef.current = false;
     }
-  }, [gmailProgress.finished, gmailProgress.result, loadRows, currentRange]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [gmailProgress.finished, gmailProgress.result, loadRows, currentRangeSignature]);
 
   /** 設定を閉じる。デモモードの ON/OFF を即座に反映するため再読み込みする */
   const closeSettings = () => {
@@ -385,14 +396,19 @@ export default function SummaryScreen({ onSignedOut }: Props) {
     }
   };
 
-  // 未送信が片付いたら一覧を取り直す（追加行の行番号はサーバー側で決まるため）。
-  // App 側の自動送信で片付いた場合もここで拾える
+  // 未送信が(一部でも)片付いたら一覧を取り直す（追加行の行番号はサーバー側で決まるため）。
+  // App 側の自動送信で片付いた場合もここで拾える。
+  // 件数が0になった時だけを見ていると、部分送信（例: 3件中2件成功）の直後に
+  // 送れた分が pendingAppendRows（表示専用）からは消えるのに rows にはまだ
+  // 反映されておらず、一覧から一時的に消えたように見える問題があったため、
+  // 「減った」ことを検知するようにした
   const prevQueueCount = useRef(queuedWrites.length);
   useEffect(() => {
     const prev = prevQueueCount.current;
     prevQueueCount.current = queuedWrites.length;
-    if (prev > 0 && queuedWrites.length === 0) loadRows(currentRange);
-  }, [queuedWrites.length, loadRows, currentRange]);
+    if (queuedWrites.length < prev) loadRows(currentRange);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [queuedWrites.length, loadRows, currentRangeSignature]);
 
   /** 行をローカルで更新しつつスプレッドシートにも反映 */
   const persistRow = async (
@@ -571,7 +587,7 @@ export default function SummaryScreen({ onSignedOut }: Props) {
   const [visibleCount, setVisibleCount] = useState(PAGE_SIZE);
   useEffect(() => {
     setVisibleCount(PAGE_SIZE);
-  }, [currentRange, catFilter, searchQuery, sortKey]);
+  }, [currentRangeSignature, catFilter, searchQuery, sortKey]);
 
   const pagedRows = useMemo(
     () => displayRows.slice(0, visibleCount),
@@ -603,7 +619,7 @@ export default function SummaryScreen({ onSignedOut }: Props) {
   // 意図しない自動スクロールを避けるため待機を取り消す
   useEffect(() => {
     setJumpToEndPending(false);
-  }, [currentRange, catFilter, searchQuery, sortKey]);
+  }, [currentRangeSignature, catFilter, searchQuery, sortKey]);
 
   const handleScroll = useCallback((e: { nativeEvent: { contentOffset: { y: number } } }) => {
     scrollOffsetRef.current = e.nativeEvent.contentOffset.y;
@@ -1053,7 +1069,7 @@ export default function SummaryScreen({ onSignedOut }: Props) {
         data={pagedRows}
         keyExtractor={(r) => (r.pendingWriteId ? `pending:${r.pendingWriteId}` : `${r.sheetName ?? ''}:${r.rowIndex ?? r.timestamp}`)}
         renderItem={renderItem}
-        ListHeaderComponent={renderHeader}
+        ListHeaderComponent={renderHeader()}
         contentContainerStyle={styles.listContent}
         persistentScrollbar
         onScroll={handleScroll}
@@ -1297,9 +1313,16 @@ function EditEntryModal({
       Alert.alert('入力エラー', '金額が不正です');
       return;
     }
+    // 保存形式は 'YYYY/MM/DD HH:MM:SS'（sheetNameFromTimestamp 等が正規表現で前提にしている）。
+    // 自由入力のまま保存すると月シートの判定・重複検出が静かに壊れるため、ここで検証・正規化する
+    const normalizedTimestamp = normalizeTimestampInput(timestamp);
+    if (normalizedTimestamp === null) {
+      Alert.alert('入力エラー', '日時の形式が不正です（例: 2026-08-09 12:34）');
+      return;
+    }
     onSave({
       ...target,
-      timestamp,
+      timestamp: normalizedTimestamp,
       source,
       user,
       store,

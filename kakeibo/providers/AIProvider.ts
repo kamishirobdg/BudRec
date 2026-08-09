@@ -238,17 +238,31 @@ function parseJson(raw: string): any {
   }
 }
 
-/** 1 件ぶんの JSON オブジェクトを ReceiptData に変換 */
-function toReceiptData(parsed: any, raw: string, fallbackCategory: string): ReceiptData {
+/**
+ * 1 件ぶんの JSON オブジェクトを ReceiptData に変換。
+ * `categories` を渡した場合、モデルが返した category がその候補に無ければ空文字にする
+ * （プロンプトで候補を指定していても表記ゆれ等で候補外の文字列を返すことがあり、素通しすると
+ * 集計・絞り込みから漏れる孤立カテゴリになるため）。空文字は一覧側で「未設定」として扱われる
+ * 既存の仕組みに乗せる。fallbackCategory（既定「その他」）自体が候補一覧に無いことがあるため、
+ * ここでは代わりに使わない。
+ */
+function toReceiptData(parsed: any, raw: string, fallbackCategory: string, categories: string[]): ReceiptData {
   const rawDate = String(parsed?.date ?? '');
   const date    = normalizeDateString(rawDate);
   if (rawDate && !date) {
     console.warn('[OCR] 日付として解釈できなかったので撮影日を使う:', rawDate);
   }
+  const providedCategory = parsed?.category != null ? String(parsed.category) : null;
+  const category =
+    providedCategory === null
+      ? fallbackCategory
+      : categories.length === 0 || categories.includes(providedCategory)
+        ? providedCategory
+        : '';
   return {
     store:    String(parsed?.store ?? ''),
     amount:   Number(parsed?.amount ?? 0),
-    category: String(parsed?.category ?? fallbackCategory),
+    category,
     date,
     time:     parsed?.time ? String(parsed.time) : undefined,
     items:    Array.isArray(parsed?.items) ? parsed.items : undefined,
@@ -257,8 +271,8 @@ function toReceiptData(parsed: any, raw: string, fallbackCategory: string): Rece
 }
 
 /** モデルの返答 JSON を ReceiptData にパース（メール用・常に 1 件） */
-export function parseReceiptResponse(raw: string, fallbackCategory = 'その他'): ReceiptData {
-  return toReceiptData(parseJson(raw), raw, fallbackCategory);
+export function parseReceiptResponse(raw: string, categories: string[] = [], fallbackCategory = 'その他'): ReceiptData {
+  return toReceiptData(parseJson(raw), raw, fallbackCategory, categories);
 }
 
 /**
@@ -266,12 +280,12 @@ export function parseReceiptResponse(raw: string, fallbackCategory = 'その他'
  * モデルが指示した形を崩すことがあるので、次のいずれも受け付ける:
  *   `{"receipts":[...]}` / `[...]` / `{"store":...}`（1 件だけを裸で返した場合）
  */
-export function parseReceiptList(raw: string, fallbackCategory = 'その他'): ReceiptData[] {
+export function parseReceiptList(raw: string, categories: string[] = [], fallbackCategory = 'その他'): ReceiptData[] {
   const parsed = parseJson(raw);
   const list: any[] =
     Array.isArray(parsed)              ? parsed :
     Array.isArray(parsed?.receipts)    ? parsed.receipts :
     parsed && typeof parsed === 'object' ? [parsed] :
     [];
-  return list.map((r) => toReceiptData(r, raw, fallbackCategory));
+  return list.map((r) => toReceiptData(r, raw, fallbackCategory, categories));
 }

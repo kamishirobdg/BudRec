@@ -120,8 +120,13 @@ export async function resolveModel(
   try {
     available = await listAvailableModels(apiKey);
   } catch (e) {
-    // 一覧が引けなくても OCR 自体は試させる（古いキャッシュ → 既定値の順）
-    console.warn('[Gemini] モデル一覧の取得に失敗、既定値にフォールバック', e);
+    // 一覧が引けなくても OCR 自体は試させる（古いキャッシュ → 既定値の順）。
+    // e は axios のエラーで、リクエストの params（= APIキー）を保持したままログに出るため
+    // メッセージだけを渡す（生のエラーオブジェクトをそのまま console に渡さない）
+    console.warn(
+      '[Gemini] モデル一覧の取得に失敗、既定値にフォールバック:',
+      e instanceof Error ? e.message : String(e),
+    );
     const cached = await readCache();
     if (cached?.model && !exclude.has(cached.model)) return cached.model;
     const fallback = PREFERRED_MODELS.find((m) => !exclude.has(m));

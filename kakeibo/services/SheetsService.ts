@@ -476,6 +476,7 @@ export async function flushWriteQueue(): Promise<FlushResult> {
     if (await Demo.isDemo()) return { sent: 0, remaining: WriteQueue.count() };
 
     let sent = 0;
+    let authError: AuthError | null = null;
     for (const item of WriteQueue.list()) {
       if (item.permanent) continue; // 送り直しても直らないと分かっているものは飛ばす
       try {
@@ -484,10 +485,15 @@ export async function flushWriteQueue(): Promise<FlushResult> {
         sent++;
       } catch (e) {
         WriteQueue.markAttempt(item.id, describeError(e), !isQueueable(e));
+        // AuthError は他の一時的な失敗と違い「送り直せば直る」ものではないので、
+        // ここで握りつぶさず呼び出し元へ伝えてサインアウト処理をさせる
+        // （writeOrQueue の直接書き込み経路と同じ扱いに揃える）
+        if (e instanceof AuthError) authError = e;
         break;
       }
     }
     if (sent > 0) console.log(`[WriteQueue] ${sent}件を送信した`);
+    if (authError) throw authError;
     return { sent, remaining: WriteQueue.count() };
   })().finally(() => {
     flushInflight = null;

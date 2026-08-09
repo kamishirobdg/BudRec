@@ -21,7 +21,7 @@ import {
   refresh as refreshCategories,
   removeCategory,
 } from '../services/CategoryService';
-import { signOut } from '../services/AuthService';
+import { signOut, AuthError } from '../services/AuthService';
 import { getCurrentUserRaw, setCurrentUser } from '../services/UserService';
 import {
   GmailSearchWindow,
@@ -36,6 +36,7 @@ import {
 } from '../services/SheetsService';
 import * as WriteQueue from '../services/WriteQueueService';
 import * as RowsCache from '../services/RowsCacheService';
+import * as LastBatch from '../services/LastBatchService';
 import * as Demo from '../services/DemoService';
 import { runGmailImport, getSkippedMessageSummaries, SkippedMessageSummary } from '../services/GmailService';
 import { useGmailProgress } from '../services/GmailProgressService';
@@ -185,6 +186,7 @@ export default function SettingsScreen({ onSignedOut }: Props) {
           : `送信 ${sent} 件 / 未送信 ${remaining} 件。通信状況を確認してもう一度お試しください。`,
       );
     } catch (e) {
+      if (e instanceof AuthError) { onSignedOut(); return; }
       Alert.alert('送信失敗', e instanceof Error ? e.message : String(e));
     } finally {
       setFlushing(false);
@@ -348,8 +350,9 @@ export default function SettingsScreen({ onSignedOut }: Props) {
             try {
               await signOut();
               // 同じ端末で別アカウントに切り替えることがあるため、
-              // 前アカウントのデータがオフラインキャッシュとして残らないようにする
+              // 前アカウントのデータがオフラインキャッシュ・「前回の登録」として残らないようにする
               RowsCache.clear();
+              LastBatch.clearLastBatch();
               onSignedOut();
             } catch (e) {
               Alert.alert('サインアウト失敗', e instanceof Error ? e.message : String(e));
@@ -523,8 +526,9 @@ export default function SettingsScreen({ onSignedOut }: Props) {
               )}
             </View>
 
-            {/* 未送信の書き込み（溜まっているときだけ出す） */}
-            {queuedWrites.length > 0 && (
+            {/* 未送信の書き込み（溜まっているときだけ出す）。
+                中身は実データ（店名・金額）そのままなので、デモ中は見せない */}
+            {!demo.enabled && queuedWrites.length > 0 && (
               <>
                 <Text style={styles.sectionLabel}>未送信の変更（{queuedWrites.length} 件）</Text>
                 <View style={styles.card}>

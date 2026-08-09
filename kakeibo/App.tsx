@@ -9,7 +9,7 @@ import HomeScreen from './screens/HomeScreen';
 import CameraScreen from './screens/CameraScreen';
 import SummaryScreen from './screens/SummaryScreen';
 import ErrorBoundary from './components/ErrorBoundary';
-import { handleAuthCallback, isSignedIn } from './services/AuthService';
+import { handleAuthCallback, isSignedIn, AuthError } from './services/AuthService';
 import { runGmailImport } from './services/GmailService';
 import { flushWriteQueue } from './services/SheetsService';
 import { loadConfig as loadDemoConfig } from './services/DemoService';
@@ -80,7 +80,15 @@ function AppContent() {
    */
   const syncPending = () => {
     flushWriteQueue()
-      .catch((e) => console.warn('[App] 未送信の書き込みを送れなかった:', e))
+      .catch(async (e) => {
+        console.warn('[App] 未送信の書き込みを送れなかった:', e instanceof Error ? e.message : e);
+        // セッションが本当に切れている場合はサインアウト状態にして再ログインを促す
+        // （それ以外の一時的な失敗は WriteQueue に残ったまま次回の自動送信に任せる）
+        if (e instanceof AuthError) {
+          const ok = await isSignedIn();
+          if (!ok) setSignedIn(false);
+        }
+      })
       .finally(() => maybeRunGmailImport());
   };
 

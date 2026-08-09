@@ -21,6 +21,9 @@ export const MAX_RETRIES = 3;
 
 const BASE_DELAY_MS = 500;
 const MAX_DELAY_MS  = 8_000;
+// Retry-After はサーバー側の指定を尊重したいので、指数バックオフ用の MAX_DELAY_MS より
+// 大きい上限にする（無制限にすると極端な値で待ちっぱなしになりうるため、こちらも一応キャップする）
+const MAX_RETRY_AFTER_MS = 30_000;
 
 /** 待てば状況が変わりうる（＝サーバー側が一時的に断っている）ステータス */
 const RETRIABLE_STATUS: readonly number[] = [429, 500, 502, 503, 504];
@@ -68,7 +71,7 @@ function parseRetryAfter(value: unknown): number | null {
 export function retryDelayMs(e: unknown, attempt: number): number {
   const header     = axios.isAxiosError(e) ? e.response?.headers?.['retry-after'] : undefined;
   const fromHeader = parseRetryAfter(header);
-  if (fromHeader !== null) return Math.min(fromHeader, MAX_DELAY_MS);
+  if (fromHeader !== null) return Math.min(fromHeader, MAX_RETRY_AFTER_MS);
 
   const backoff = BASE_DELAY_MS * 2 ** attempt;
   const jitter  = Math.random() * BASE_DELAY_MS;
