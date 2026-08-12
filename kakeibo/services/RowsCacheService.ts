@@ -9,7 +9,7 @@
  * 保存場所: `<documentDirectory>/rows-cache.json`
  */
 
-import { File, Paths } from 'expo-file-system';
+import { nowLabel, readJsonArray, writeJson } from './jsonFileStore';
 import type { ExpenseRow, RangeSpec } from './SheetsService';
 
 const FILE_NAME = 'rows-cache.json';
@@ -25,42 +25,14 @@ interface CacheEntry {
 /** null = まだファイルを読んでいない */
 let cache: CacheEntry[] | null = null;
 
-function cacheFile(): File {
-  return new File(Paths.document, FILE_NAME);
-}
-
 function load(): CacheEntry[] {
   if (cache) return cache;
-  try {
-    const f = cacheFile();
-    cache = f.exists ? (JSON.parse(f.textSync()) as CacheEntry[]) : [];
-    if (!Array.isArray(cache)) cache = [];
-  } catch (e) {
-    // 壊れていても起動は止めない。溜まっていた分は諦める
-    console.error('[RowsCache] 読み込み失敗。空として扱う:', e);
-    cache = [];
-  }
+  cache = readJsonArray<CacheEntry>(FILE_NAME);
   return cache;
 }
 
 function persist(): void {
-  try {
-    const f = cacheFile();
-    if (!f.exists) f.create({ overwrite: true });
-    f.write(JSON.stringify(cache ?? []));
-  } catch (e) {
-    console.error('[RowsCache] 保存失敗:', e);
-  }
-}
-
-function pad2(n: number): string {
-  return String(n).padStart(2, '0');
-}
-
-function nowLabel(): string {
-  const d = new Date();
-  return `${d.getFullYear()}/${pad2(d.getMonth() + 1)}/${pad2(d.getDate())} ` +
-         `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
+  writeJson(FILE_NAME, cache ?? []);
 }
 
 /** 表示範囲をキャッシュのキーに変換する */

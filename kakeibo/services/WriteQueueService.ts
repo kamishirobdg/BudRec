@@ -14,7 +14,7 @@
  */
 
 import { useEffect, useState } from 'react';
-import { File, Paths } from 'expo-file-system';
+import { nowLabel, readJsonArray, writeJson } from './jsonFileStore';
 import type { ExpenseRow } from './SheetsService';
 
 /** counted_amount / excluded / confirmed のまとめ更新 */
@@ -64,47 +64,19 @@ const listeners = new Set<(items: QueuedWrite[]) => void>();
 
 // ─── 永続化 ───────────────────────────────────────────────────────────────────
 
-function queueFile(): File {
-  return new File(Paths.document, FILE_NAME);
-}
-
 function load(): QueuedWrite[] {
   if (queue) return queue;
-  try {
-    const f = queueFile();
-    queue = f.exists ? (JSON.parse(f.textSync()) as QueuedWrite[]) : [];
-    if (!Array.isArray(queue)) queue = [];
-  } catch (e) {
-    // 壊れていても起動は止めない。溜まっていた分は諦める
-    console.error('[WriteQueue] 読み込み失敗。空として扱う:', e);
-    queue = [];
-  }
+  queue = readJsonArray<QueuedWrite>(FILE_NAME);
   return queue;
 }
 
 function persist(): void {
-  try {
-    const f = queueFile();
-    if (!f.exists) f.create({ overwrite: true });
-    f.write(JSON.stringify(queue ?? []));
-  } catch (e) {
-    console.error('[WriteQueue] 保存失敗:', e);
-  }
+  writeJson(FILE_NAME, queue ?? []);
 }
 
 function publish(): void {
   const items = list();
   listeners.forEach((l) => l(items));
-}
-
-function pad2(n: number): string {
-  return String(n).padStart(2, '0');
-}
-
-function nowLabel(): string {
-  const d = new Date();
-  return `${d.getFullYear()}/${pad2(d.getMonth() + 1)}/${pad2(d.getDate())} ` +
-         `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
 }
 
 // ─── 公開 API ─────────────────────────────────────────────────────────────────

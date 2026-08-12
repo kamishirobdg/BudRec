@@ -55,6 +55,10 @@ const CONFIG_KEY_DEFAULT_PARTIAL_AMOUNT = 'default_partial_amount';
 const DEFAULT_PARTIAL_AMOUNT = 1000;
 const CONFIG_KEY_GMAIL_SEARCH_WINDOW = 'gmail_search_window';
 const DEFAULT_GMAIL_SEARCH_WINDOW: GmailSearchWindow = '60d';
+/** 固定費を月初コピー済みの月（'YYYY-MM'）。**端末ローカルではなく共有**に置く。
+ *  端末ごとに持つと、夫婦の2台が月初にほぼ同時に起動したとき両方が「まだ未適用」と
+ *  判断して同じ固定費行を2つ作ってしまうため（2026-08-12 修正） */
+const CONFIG_KEY_RECURRING_APPLIED_MONTH = 'recurring_applied_month';
 
 /** Gmail 検索ウィンドウの選択肢 */
 export type GmailSearchWindow = '30d' | '60d' | '180d' | '1y' | 'all';
@@ -1097,49 +1101,68 @@ export async function applyRecurringEntries(): Promise<number> {
   const existing = await listSheetNames(client, true);
   if (!existing.includes(prevMonth)) return 0;
 
+  // 他の端末が今月ぶんを済ませていないか、共有の _config を見る
+  const cfg = await readConfig(client);
+  if ((cfg.get(CONFIG_KEY_RECURRING_APPLIED_MONTH) ?? '').trim() === currentMonth) return 0;
+
   // 前月の固定費エントリ
   const prevRows      = await getRows(prevMonth);
   const recurringRows = prevRows.filter((r) => r.recurring && !r.deleted);
   if (recurringRows.length === 0) return 0;
 
-  // 今月の既存 recurring エントリのキーセット
-  const currentRows = await getRows(currentMonth);
-  const alreadyKeys = new Set(
-    currentRows
-      .filter((r) => r.source === 'recurring')
-      .map((r) => `${r.store}|${r.category}|${r.user}|${r.amount}`),
-  );
+  // **コピーする前に「今月はこの端末がやる」と共有側へ書いておく。**
+  // 済ませてから書くと、その間に起動したもう一方の端末も未適用と判断してしまう。
+  // 途中で失敗したら消して、次回起動時にやり直せるようにする
+  await upsertConfigValue(client, CONFIG_KEY_RECURRING_APPLIED_MONTH, currentMonth);
 
-  // 今月1日のタイムスタンプ（YYYY/MM/01 00:00:00）
-  const firstDay = `${currentMonth.replace('-', '/')}/01 00:00:00`;
+  try {
+    // 今月の既存 recurring エントリのキーセット
+    const currentRows = await getRows(currentMonth);
+    const alreadyKeys = new Set(
+      currentRows
+        .filter((r) => r.source === 'recurring')
+        .map((r) => `${r.store}|${r.category}|${r.user}|${r.amount}`),
+    );
 
-  let created = 0;
-  for (const entry of recurringRows) {
-    const key = `${entry.store}|${entry.category}|${entry.user}|${entry.amount}`;
-    if (alreadyKeys.has(key)) continue;
+    // 今月1日のタイムスタンプ（YYYY/MM/01 00:00:00）
+    const firstDay = `${currentMonth.replace('-', '/')}/01 00:00:00`;
 
-    try {
-      await appendRow({
-        ...entry,
-        timestamp:  firstDay,
-        source:     'recurring',
-        excluded:   false,
-        confirmed:  false,
-        deleted:    false,
-        rowIndex:   undefined,
-        sheetName:  undefined,
-      });
-    } catch (e) {
-      // 通信できず端末に退避された場合も「作成済み」として進める。
-      // ここで止めると、呼び出し側が適用済みフラグを立てられず、
-      // 次回起動時にキュー内の未送信ぶんと二重に作ってしまう
-      if (!(e instanceof WriteQueue.QueuedWriteError)) throw e;
+    let created = 0;
+    for (const entry of recurringRows) {
+      const key = `${entry.store}|${entry.category}|${entry.user}|${entry.amount}`;
+      if (alreadyKeys.has(key)) continue;
+
+      try {
+        await appendRow({
+          ...entry,
+          timestamp:  firstDay,
+          source:     'recurring',
+          excluded:   false,
+          confirmed:  false,
+          deleted:    false,
+          rowIndex:   undefined,
+          sheetName:  undefined,
+        });
+      } catch (e) {
+        // 通信できず端末に退避された場合も「作成済み」として進める。
+        // ここで止めると、呼び出し側が適用済みフラグを立てられず、
+        // 次回起動時にキュー内の未送信ぶんと二重に作ってしまう
+        if (!(e instanceof WriteQueue.QueuedWriteError)) throw e;
+      }
+      alreadyKeys.add(key); // 同一エントリが複数あっても2回作らない
+      created++;
     }
-    alreadyKeys.add(key); // 同一エントリが複数あっても2回作らない
-    created++;
-  }
 
-  return created;
+    return created;
+  } catch (e) {
+    // 確保だけして作れなかった状態を残さない（残すと今月ぶんが永久に作られない）
+    try {
+      await upsertConfigValue(client, CONFIG_KEY_RECURRING_APPLIED_MONTH, '');
+    } catch {
+      console.error('[Recurring] 適用済みフラグを戻せなかった。今月ぶんは手動で確認が必要');
+    }
+    throw e;
+  }
 }
 
 /** 取り込み履歴に1件追記する */

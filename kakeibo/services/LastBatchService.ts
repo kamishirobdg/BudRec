@@ -8,7 +8,7 @@
  * 保存場所: `<documentDirectory>/last-batch.json`
  */
 
-import { File, Paths } from 'expo-file-system';
+import { readJsonArray, removeFile, writeJson } from './jsonFileStore';
 import { sheetNameFromTimestamp, type ExpenseRow } from './SheetsService';
 
 /** シート上の行を特定するためのキー */
@@ -24,10 +24,6 @@ const FILE_NAME = 'last-batch.json';
 /** 1 バッチで覚えておく上限。これを超える枚数を 1 回で入れることは想定しない */
 const MAX_KEYS = 30;
 
-function batchFile(): File {
-  return new File(Paths.document, FILE_NAME);
-}
-
 /** 直近に登録した行を記録する（前のバッチは上書きする） */
 export function saveLastBatch(rows: ExpenseRow[]): void {
   const keys: LastBatchKey[] = rows.slice(0, MAX_KEYS).map((r) => ({
@@ -36,37 +32,17 @@ export function saveLastBatch(rows: ExpenseRow[]): void {
     store:     r.store,
     amount:    r.amount,
   }));
-
-  try {
-    const f = batchFile();
-    if (!f.exists) f.create({ overwrite: true });
-    f.write(JSON.stringify(keys));
-  } catch (e) {
-    // 記録できなくても登録自体は成功しているので握りつぶす
-    console.error('[LastBatch] 保存失敗:', e);
-  }
+  // 記録できなくても登録自体は成功しているので、失敗しても投げない
+  writeJson(FILE_NAME, keys);
 }
 
 /** 直近に登録した行のキー一覧（無ければ空配列） */
 export function getLastBatch(): LastBatchKey[] {
-  try {
-    const f = batchFile();
-    if (!f.exists) return [];
-    const parsed = JSON.parse(f.textSync());
-    return Array.isArray(parsed) ? parsed : [];
-  } catch (e) {
-    console.error('[LastBatch] 読み込み失敗:', e);
-    return [];
-  }
+  return readJsonArray<LastBatchKey>(FILE_NAME);
 }
 
 export function clearLastBatch(): void {
-  try {
-    const f = batchFile();
-    if (f.exists) f.delete();
-  } catch {
-    // ignore
-  }
+  removeFile(FILE_NAME);
 }
 
 /** シートから読んだ行が、記録したキーと同じものか */
