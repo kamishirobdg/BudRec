@@ -506,6 +506,9 @@ async function writeOrQueue(op: WriteQueue.WriteOp): Promise<void> {
     if (e instanceof AuthError) throw e;
     throw new WriteQueue.QueuedWriteError(reason);
   }
+  // 今の書き込みは、同じ行に溜まっている未送信項目より新しい。
+  // そのまま流すと古い値で上書きされるので、重なる列を潰しておく
+  WriteQueue.reconcileAfterDirectWrite(op);
 }
 
 export interface FlushResult {

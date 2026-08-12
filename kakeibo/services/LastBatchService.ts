@@ -76,8 +76,19 @@ export function matchesKey(row: ExpenseRow, key: LastBatchKey): boolean {
     && row.amount === key.amount;
 }
 
-/** 記録したキーに対応する行を rows から拾う（キーの順序を保つ） */
-export function pickBatchRows(rows: ExpenseRow[], keys: LastBatchKey[]): ExpenseRow[] {
+/**
+ * 記録したキーに対応する行を rows から拾う（キーの順序を保つ）。
+ *
+ * @param overlay 未送信の変更を重ねた行を返す関数。渡した場合は
+ *   **シート上の値と、未送信を重ねた値のどちらで照合しても拾い、返すのは重ねたほう**になる。
+ *   キーがどちらの値で記録されているかは経路によって違うため（一覧の編集モーダル経由の
+ *   未送信はキーが古いまま、「前回の登録」経由の未送信はキーが新しくなっている）。
+ */
+export function pickBatchRows(
+  rows: ExpenseRow[],
+  keys: LastBatchKey[],
+  overlay?: (row: ExpenseRow) => ExpenseRow,
+): ExpenseRow[] {
   const used = new Set<string>();
   const found: ExpenseRow[] = [];
 
@@ -85,11 +96,12 @@ export function pickBatchRows(rows: ExpenseRow[], keys: LastBatchKey[]): Expense
     // 同じ内容の行が複数あっても 1 行ずつ対応させる
     const hit = rows.find((r) => {
       const id = `${r.sheetName ?? ''}:${r.rowIndex ?? ''}`;
-      return !used.has(id) && matchesKey(r, key);
+      if (used.has(id)) return false;
+      return matchesKey(r, key) || (overlay ? matchesKey(overlay(r), key) : false);
     });
     if (!hit) continue;
     used.add(`${hit.sheetName ?? ''}:${hit.rowIndex ?? ''}`);
-    found.push(hit);
+    found.push(overlay ? overlay(hit) : hit);
   }
   return found;
 }

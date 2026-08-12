@@ -35,6 +35,7 @@ import {
   flushWriteQueue,
 } from '../services/SheetsService';
 import { QueuedWriteError, useWriteQueue } from '../services/WriteQueueService';
+import * as WriteQueue from '../services/WriteQueueService';
 import * as RowsCache from '../services/RowsCacheService';
 import * as CategoryService from '../services/CategoryService';
 import { getCurrentUser } from '../services/UserService';
@@ -337,7 +338,9 @@ export default function SummaryScreen({ onSignedOut }: Props) {
     try {
       const sheets = [...new Set(keys.map((k) => k.sheetName))];
       const lists  = await Promise.all(sheets.map((s) => getRows(s)));
-      const found  = LastBatch.pickBatchRows(lists.flat(), keys);
+      // シートを読み直すので、まだ送れていない変更は反映されていない。そのまま編集させると
+      // 古い値で保存され、後からキューが流れて更にちぐはぐになるため、ここで重ねておく
+      const found  = LastBatch.pickBatchRows(lists.flat(), keys, WriteQueue.applyPendingTo);
       if (found.length === 0) {
         Alert.alert('前回の登録', '該当する明細が見つかりませんでした。削除されたか、内容が変更された可能性があります。');
         return;

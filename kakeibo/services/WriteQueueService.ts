@@ -172,6 +172,125 @@ export function discard(id: string): void {
   remove(id);
 }
 
+// ─── 直接書き込みとの整合 ─────────────────────────────────────────────────────
+//
+// 未送信の項目は「積んだ時点のスナップショット」を持っている。通信が戻ったあとに
+// 同じ行を編集して**その書き込みだけ先に成功**すると、あとから流れる古いキュー項目が
+// 新しい内容を上書きしてしまう（例: オフラインで除外をトグル → キューに退避 →
+// 復帰後に同じ行の除外を戻す → 直接成功 → 後からキューが流れて除外に戻る）。
+//
+// 各操作が書く列は決まっているので、重なる列だけを新しい値で潰す。
+//   updateRow    A:L（全部）
+//   updateFlags  H:J（counted_amount / excluded / confirmed）
+//   setRecurring K
+//   markDeleted  L
+//
+// **別端末からの編集は対象外**。検知には行ごとのバージョン管理が要り、Sheets 相手では過剰。
+
+type FieldGroup = 'main' | 'flags' | 'recurring' | 'deleted';
+
+function groupsOf(op: WriteOp): FieldGroup[] {
+  switch (op.kind) {
+    case 'append':       return [];
+    case 'updateRow':    return ['main', 'flags', 'recurring', 'deleted'];
+    case 'updateFlags':  return ['flags'];
+    case 'setRecurring': return ['recurring'];
+    case 'markDeleted':  return ['deleted'];
+  }
+}
+
+/** その操作が対象にしている行（append はまだ行番号が無いので null） */
+function rowTargetOf(op: WriteOp): { sheetName: string; rowIndex: number } | null {
+  return op.kind === 'append' ? null : { sheetName: op.sheetName, rowIndex: op.rowIndex };
+}
+
+/**
+ * 成功した書き込みに合わせて、同じ行のキュー項目から重なる列を取り除く。
+ * 全部の列が上書きされたら null（＝もう送る必要が無い）。
+ */
+function narrowOp(queued: WriteOp, succeeded: WriteOp): WriteOp | null {
+  const covered = new Set(groupsOf(succeeded));
+  const mine    = groupsOf(queued);
+  if (mine.length === 0 || mine.every((g) => covered.has(g))) return null;
+
+  // 部分的にしか重ならないのは updateRow（A:L をまとめて書く）だけ。
+  // 列を削れないので、重なる列の値だけ新しいものに差し替えて送る
+  if (queued.kind !== 'updateRow') return queued;
+
+  let entry = queued.entry;
+  if (succeeded.kind === 'updateFlags')  entry = { ...entry, ...succeeded.patch };
+  if (succeeded.kind === 'setRecurring') entry = { ...entry, recurring: succeeded.recurring };
+  if (succeeded.kind === 'markDeleted')  entry = { ...entry, deleted: true };
+  return entry === queued.entry ? queued : { ...queued, entry };
+}
+
+/**
+ * 直接書き込みが成功したときに呼ぶ。同じ行の未送信項目を新しい内容に合わせて畳む。
+ * **キューからの再送では呼ばないこと**（キュー内は積んだ順に送るので畳む必要が無い）。
+ */
+export function reconcileAfterDirectWrite(succeeded: WriteOp): void {
+  const target = rowTargetOf(succeeded);
+  if (!target) return;
+
+  const items = load();
+  if (items.length === 0) return;
+
+  const next: QueuedWrite[] = [];
+  let changed = false;
+
+  for (const item of items) {
+    const t = rowTargetOf(item.op);
+    if (!t || t.sheetName !== target.sheetName || t.rowIndex !== target.rowIndex) {
+      next.push(item);
+      continue;
+    }
+    const narrowed = narrowOp(item.op, succeeded);
+    if (narrowed === null) {
+      changed = true;
+      continue; // 新しい書き込みに完全に上書きされたので捨てる
+    }
+    if (narrowed !== item.op) {
+      item.op = narrowed;
+      changed = true;
+    }
+    next.push(item);
+  }
+
+  if (!changed) return;
+  const removed = items.length - next.length;
+  if (removed > 0) console.log(`[WriteQueue] 新しい書き込みに追い越された ${removed} 件を破棄`);
+  queue = next;
+  persist();
+  publish();
+}
+
+/**
+ * サーバーから読んだ行に、未送信の変更を重ねて返す。
+ * 「前回の登録」のようにシートを読み直す画面が、退避中の変更を無かったことにして
+ * 古い値で上書き保存してしまうのを防ぐ。
+ */
+export function applyPendingTo(row: ExpenseRow): ExpenseRow {
+  if (!row.sheetName || row.rowIndex === undefined) return row;
+  const items = load();
+  if (items.length === 0) return row;
+
+  let next = row;
+  for (const item of items) {
+    const t = rowTargetOf(item.op);
+    if (!t || t.sheetName !== row.sheetName || t.rowIndex !== row.rowIndex) continue;
+    switch (item.op.kind) {
+      case 'updateRow':
+        next = { ...item.op.entry, sheetName: row.sheetName, rowIndex: row.rowIndex };
+        break;
+      case 'updateFlags':  next = { ...next, ...item.op.patch }; break;
+      case 'setRecurring': next = { ...next, recurring: item.op.recurring }; break;
+      case 'markDeleted':  next = { ...next, deleted: true }; break;
+      case 'append':       break;
+    }
+  }
+  return next;
+}
+
 /** 操作の内容を 1 行で説明する（設定画面の一覧用） */
 export function describeOp(op: WriteOp): string {
   switch (op.kind) {
