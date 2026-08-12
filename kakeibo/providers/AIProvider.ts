@@ -8,6 +8,17 @@ export interface ReceiptItem {
   price: number;
 }
 
+/**
+ * ユーザーが OCR を中断したときに投げる。
+ * 呼び出し側はこれを「失敗」として扱わない（エラーダイアログを出さず、画像も残す）。
+ */
+export class CancelledError extends Error {
+  constructor() {
+    super('OCR を中止しました');
+    this.name = 'CancelledError';
+  }
+}
+
 export interface ReceiptData {
   store:    string;
   amount:   number;
@@ -27,8 +38,10 @@ export interface AIProvider {
    * **1 枚の画像に複数のレシートが並べて写っている場合は、その枚数ぶん返す。**
    * @param imageBase64 画像の base64 文字列（data: プレフィックス無し）
    * @param categories  選択肢となるカテゴリ一覧。モデルはこの中から1つ選ぶ。
+   * @param signal      中断用。ユーザーが「キャンセル」を押したときに abort される。
+   *                    abort されたら CancelledError を投げること。
    */
-  extractReceipts(imageBase64: string, categories: string[]): Promise<ReceiptData[]>;
+  extractReceipts(imageBase64: string, categories: string[], signal?: AbortSignal): Promise<ReceiptData[]>;
 
   /**
    * メール本文（プレーンテキスト）から取引情報を抽出する。

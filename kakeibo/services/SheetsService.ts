@@ -324,16 +324,67 @@ async function ensureSheet(client: AxiosInstance, sheetName: string): Promise<bo
   return true;
 }
 
-/** シートが無ければ新規作成しヘッダー行を書き込む。固定費行も自動コピー */
-async function ensureSheetExists(client: AxiosInstance, sheetName: string): Promise<void> {
-  if (!(await ensureSheet(client, sheetName))) return;
+/** シート名から sheetId を引く（行の挿入など、名前では指定できない操作用） */
+async function fetchSheetId(client: AxiosInstance, sheetName: string): Promise<number | null> {
+  const res = await client.get('', {
+    params: { fields: 'sheets.properties(sheetId,title)' },
+  });
+  const sheets: { properties: { sheetId: number; title: string } }[] = res.data.sheets ?? [];
+  return sheets.find((s) => s.properties.title === sheetName)?.properties.sheetId ?? null;
+}
 
-  // ヘッダー行書き込み
+/**
+ * 新規作成したシートにヘッダー行を書く。
+ *
+ * **1 行目を無条件に上書きしてはいけない。** シートを作ってからヘッダーを書くまでの間に、
+ * 別プロセス（夫婦のもう一方の端末、または同一端末の Gmail 取り込みと固定費コピー）が
+ * 「シートはもう在る＝ヘッダーも書かれている」と判断して先に 1 行を追記することがある。
+ * ヘッダーがまだ無いのでその追記は 1 行目に入り、後から確定するヘッダー PUT に消される。
+ * 月初に二人がほぼ同時に最初の支出を登録した場合に起こりうる（2026-08-12 修正）。
+ */
+async function writeHeaderRow(client: AxiosInstance, sheetName: string): Promise<void> {
+  const res = await client.get(`/values/${encodeURIComponent(sheetName)}!A1:L1`);
+  const firstRow: string[] = res.data.values?.[0] ?? [];
+
+  if (firstRow.length === 0) {
+    // 通常はこちら。まだ誰も書いていない
+    await client.put(
+      `/values/${encodeURIComponent(sheetName)}!A1`,
+      { values: [HEADER_ROW] },
+      { params: { valueInputOption: 'RAW' } },
+    );
+    return;
+  }
+
+  // 誰かがヘッダーを書き終えていたなら何もしない
+  if (firstRow[0] === HEADER_ROW[0]) return;
+
+  // 明細行が入ってしまっている。上書きすると消えるので、上に 1 行差し込んでから書く
+  const sheetId = await fetchSheetId(client, sheetName);
+  if (sheetId === null) {
+    console.error(`[Sheets] ${sheetName} の sheetId が引けずヘッダーを書けなかった`);
+    return;
+  }
+  await client.post(':batchUpdate', {
+    requests: [{
+      insertDimension: {
+        range: { sheetId, dimension: 'ROWS', startIndex: 0, endIndex: 1 },
+        inheritFromBefore: false,
+      },
+    }],
+  });
   await client.put(
     `/values/${encodeURIComponent(sheetName)}!A1`,
     { values: [HEADER_ROW] },
     { params: { valueInputOption: 'RAW' } },
   );
+}
+
+/** シートが無ければ新規作成しヘッダー行を書き込む。固定費行も自動コピー */
+async function ensureSheetExists(client: AxiosInstance, sheetName: string): Promise<void> {
+  if (!(await ensureSheet(client, sheetName))) return;
+
+  await writeHeaderRow(client, sheetName);
 
   // 前月の固定費行をコピー（月次シートのみ対象）
   if (/^\d{4}-\d{2}$/.test(sheetName)) {

@@ -30,6 +30,7 @@ import { AuthError } from '../services/AuthService';
 import { getCurrentUser } from '../services/UserService';
 import { getProvider } from '../providers';
 import type { ReceiptData } from '../providers';
+import { CancelledError } from '../providers/AIProvider';
 import * as ReceiptQueue from '../services/ReceiptQueueService';
 import * as LastBatch from '../services/LastBatchService';
 import * as Demo from '../services/DemoService';
@@ -67,6 +68,11 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
   const [busy, setBusy]           = useState(false);
   const [statusMsg, setStatusMsg] = useState<string>('');
   const cameraRef                 = useRef<CameraView>(null);
+
+  // OCR 中の中止用。429 が続くとモデルを乗り換えながら数分粘ることがあるので、
+  // 待たされ続けるより諦められるようにしておく（画像は pending に残るので後から再開できる）
+  const ocrAbortRef = useRef<AbortController | null>(null);
+  const [ocrCancellable, setOcrCancellable] = useState(false);
 
   // 未処理レシートの URI 一覧
   const [pendingUris, setPendingUris] = useState<string[]>([]);
@@ -209,7 +215,7 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
     onStatusChange('OCR解析中...');
     const categories = await CategoryService.getCategories();
     const provider = getProvider();
-    const receipts = await provider.extractReceipts(base64, categories);
+    const receipts = await provider.extractReceipts(base64, categories, ocrAbortRef.current?.signal);
 
     // 金額を読めなかったものは捨てる（0 円の行を作らない）
     const valid = receipts.filter((r) => r.amount > 0);
@@ -258,13 +264,19 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
   /**
    * 保存済みレシートファイルを OCR 処理する。
    * 失敗時は 1 秒待って 1 回だけ自動リトライ。それでも失敗なら 3 択ダイアログ。
-   * 戻り値は「再サインインが必要な状態で終わったか」。一括処理のループが
-   * 残り全件へ同じ AuthError を連発させないよう、ここで検知できるようにしている。
+   *
+   * 戻り値は一括処理のループを止めるかどうかの判断に使う:
+   * - `auth-failed` … 残り全件も同じ理由で失敗するので、Alert を連発させず打ち切る
+   * - `cancelled`   … ユーザーが中止したので残りも処理しない（画像は pending に残す）
    */
-  const processReceipt = async (uri: string): Promise<boolean> => {
+  const processReceipt = async (uri: string): Promise<'ok' | 'auth-failed' | 'cancelled'> => {
     setBusy(true);
     setStatusMsg('OCR解析中...');
-    let authFailed = false;
+    // キャンセルボタン用。1 枚ごとに作り直す
+    const abort = new AbortController();
+    ocrAbortRef.current = abort;
+    setOcrCancellable(true);
+    let result: 'ok' | 'auth-failed' | 'cancelled' = 'ok';
     try {
       let base64: string;
       try {
@@ -276,18 +288,20 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
         );
         ReceiptQueue.deleteReceipt(uri);
         refreshPending();
-        return false;
+        return 'ok';
       }
 
       try {
         const msg = await attemptReceipt(base64, uri);
-        if (msg === null) return false; // 確認モーダル待ち。画像はモーダル側で片付ける
+        if (msg === null) return 'ok'; // 確認モーダル待ち。画像はモーダル側で片付ける
         ReceiptQueue.deleteReceipt(uri);
         refreshPending();
         onSuccess(msg);
-        return false;
+        return 'ok';
       } catch (firstErr) {
         if (firstErr instanceof AuthError) throw firstErr;
+        // 中止は「失敗」ではない。リトライもダイアログも出さず、画像は pending に残す
+        if (firstErr instanceof CancelledError) return 'cancelled';
         console.warn('[Receipt] OCR 1回目失敗、リトライ:', firstErr);
       }
 
@@ -295,30 +309,40 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
       setStatusMsg('OCR再試行中...');
       onStatusChange('OCR再試行中...');
       await new Promise((r) => setTimeout(r, 1000));
+      if (abort.signal.aborted) return 'cancelled';
       try {
         const msg = await attemptReceipt(base64, uri);
-        if (msg === null) return false;
+        if (msg === null) return 'ok';
         ReceiptQueue.deleteReceipt(uri);
         refreshPending();
         onSuccess(msg);
       } catch (secondErr) {
         if (secondErr instanceof AuthError) throw secondErr;
+        if (secondErr instanceof CancelledError) return 'cancelled';
         const msg = secondErr instanceof Error ? secondErr.message : String(secondErr);
         showFailureDialog(uri, msg);
       }
     } catch (e) {
       if (e instanceof AuthError) {
-        authFailed = true;
+        result = 'auth-failed';
         Alert.alert('再サインインが必要です', 'セッションが期限切れです。再度サインインしてください。', [
           { text: 'OK', onPress: onSignedOut },
         ]);
       }
     } finally {
+      ocrAbortRef.current = null;
+      setOcrCancellable(false);
       setBusy(false);
       setStatusMsg('');
       onStatusChange('');
     }
-    return authFailed;
+    return result;
+  };
+
+  /** OCR 中止。通信を打ち切るだけで、画像は pending に残るので後から再開できる */
+  const handleCancelOcr = () => {
+    ocrAbortRef.current?.abort();
+    setStatusMsg('中止しています...');
   };
 
   const handleShoot = async () => {
@@ -386,10 +410,10 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
     for (const uri of snapshot) {
       // 途中で失敗 → 3択ダイアログが出るのでそこで止まる。
       // ダイアログ閉じた後は refreshPending で次の件がバナーに残るのでユーザーが再開できる
-      const authFailed = await processReceipt(uri);
-      // 再サインインが必要な状態では残りも必ず同じ理由で失敗するので、
-      // Alert を件数分積まないようここで打ち切る（残りは次回起動時の再開に任せる）
-      if (authFailed) break;
+      const outcome = await processReceipt(uri);
+      // 再サインインが必要な状態では残りも必ず同じ理由で失敗するので Alert を件数分
+      // 積まない。中止された場合も残りを続けない。どちらも残りはバナーに残る
+      if (outcome !== 'ok') break;
       // 確認モーダルが開いたら残りは進めない（次の結果で上書きしてしまうため）
       if (reviewRef.current) break;
     }
@@ -558,6 +582,11 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
           <View style={styles.statusBox}>
             <ActivityIndicator color="#fff" />
             <Text style={styles.statusText}>{statusMsg}</Text>
+            {ocrCancellable && (
+              <TouchableOpacity style={styles.cancelOcrBtn} onPress={handleCancelOcr}>
+                <Text style={styles.cancelOcrBtnText}>中止</Text>
+              </TouchableOpacity>
+            )}
           </View>
         ) : (
           <View style={styles.buttonRow}>
@@ -1004,6 +1033,14 @@ const styles = StyleSheet.create({
     color:    '#fff',
     fontSize: 14,
   },
+  cancelOcrBtn: {
+    borderWidth:  1,
+    borderColor:  'rgba(255,255,255,0.6)',
+    borderRadius: 14,
+    paddingHorizontal: 12,
+    paddingVertical:    4,
+  },
+  cancelOcrBtnText: { color: '#fff', fontSize: 13, fontWeight: 'bold' },
   buttonRow: {
     alignItems: 'center',
     gap: 12,

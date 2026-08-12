@@ -1,6 +1,7 @@
 import axios from 'axios';
 import {
   AIProvider,
+  CancelledError,
   EMAIL_RECEIPT_SCHEMA,
   RECEIPT_LIST_SCHEMA,
   ReceiptData,
@@ -28,13 +29,17 @@ const endpointFor = (model: string) =>
 export const geminiProvider: AIProvider = {
   name: 'gemini',
 
-  async extractReceipts(imageBase64: string, categories: string[]): Promise<ReceiptData[]> {
+  async extractReceipts(
+    imageBase64: string,
+    categories: string[],
+    signal?: AbortSignal,
+  ): Promise<ReceiptData[]> {
     const prompt = buildReceiptPrompt(categories);
     const parts = [
       { text: prompt },
       { inline_data: { mime_type: 'image/jpeg', data: imageBase64 } },
     ];
-    const raw = await callGemini(parts, RECEIPT_LIST_SCHEMA, { highRes: true });
+    const raw = await callGemini(parts, RECEIPT_LIST_SCHEMA, { highRes: true, signal });
     return parseReceiptList(raw, categories);
   },
 
@@ -57,23 +62,28 @@ export const geminiProvider: AIProvider = {
 async function callGemini(
   parts: object[],
   schema: object,
-  opts: { highRes: boolean },
+  opts: { highRes: boolean; signal?: AbortSignal },
 ): Promise<string> {
   if (!GEMINI_API_KEY || GEMINI_API_KEY.startsWith('YOUR_')) {
     throw new Error('GEMINI_API_KEY が未設定です');
   }
+
+  const { signal } = opts;
+  const throwIfCancelled = () => {
+    if (signal?.aborted) throw new CancelledError();
+  };
 
   // 高解像度指定に対応しないモデルに当たったら false に落として以降は既定解像度で通す
   let highRes = opts.highRes;
 
   const send = async (model: string): Promise<string> => {
     try {
-      return await postToModel(model, parts, schema, highRes);
+      return await postToModel(model, parts, schema, highRes, signal);
     } catch (e) {
       if (!highRes || !isUnsupportedConfigError(e)) throw e;
       console.warn(`[Gemini] ${model} は mediaResolution 非対応。既定の解像度で再試行します`);
       highRes = false;
-      return postToModel(model, parts, schema, false);
+      return postToModel(model, parts, schema, false, signal);
     }
   };
 
@@ -83,6 +93,10 @@ async function callGemini(
   let lastError: unknown = null;
 
   for (let attempt = 0; attempt < 3; attempt++) {
+    // モデルを乗り換える前に毎回見る。1 モデルあたり最大 60 秒かかるので、
+    // ここで見ないとキャンセルしても次のモデルを試し始めてしまう
+    throwIfCancelled();
+
     let model: string;
     try {
       model = await resolveModel(GEMINI_API_KEY, { exclude: tried, force: attempt > 0 });
@@ -95,6 +109,7 @@ async function callGemini(
     try {
       return await send(model);
     } catch (e) {
+      if (isCancellation(e)) throw new CancelledError();
       lastError = e;
       if (!shouldTryAnotherModel(e)) throw toReadableError(e);
       console.warn(`[Gemini] ${model} が使えないため別のモデルを試します`);
@@ -102,7 +117,13 @@ async function callGemini(
     }
   }
 
+  throwIfCancelled();
   throw toReadableError(lastError ?? new Error('Gemini の呼び出しに失敗しました'));
+}
+
+/** axios の中断か（signal.abort による） */
+function isCancellation(e: unknown): boolean {
+  return e instanceof CancelledError || axios.isCancel(e);
 }
 
 async function postToModel(
@@ -110,6 +131,7 @@ async function postToModel(
   parts: object[],
   schema: object,
   highRes: boolean,
+  signal?: AbortSignal,
 ): Promise<string> {
   const res = await axios.post(
     endpointFor(model),
@@ -129,6 +151,7 @@ async function postToModel(
       params:  { key: GEMINI_API_KEY },
       headers: { 'Content-Type': 'application/json' },
       timeout: 60_000,
+      signal,
     },
   );
 
