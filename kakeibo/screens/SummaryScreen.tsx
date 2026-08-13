@@ -725,11 +725,6 @@ export default function SummaryScreen({ onSignedOut }: Props) {
 
         {/* 合計カード */}
         <View style={styles.totalCard}>
-          {demoMode && (
-            <View style={styles.demoPill}>
-              <Text style={styles.demoPillText}>DEMO</Text>
-            </View>
-          )}
           <Text style={styles.totalCardLabel}>{currentRangeLabel}の支出合計</Text>
           <Text style={styles.totalCardAmount}>¥{summary.total.toLocaleString()}</Text>
           {summary.users.length > 0 && (
@@ -1744,16 +1739,6 @@ const styles = StyleSheet.create({
     borderRadius: 20,
     padding: 20,
   },
-  demoPill: {
-    position: 'absolute',
-    top: 12,
-    right: 12,
-    backgroundColor: 'rgba(255,255,255,0.22)',
-    borderRadius: 8,
-    paddingHorizontal: 8,
-    paddingVertical: 3,
-  },
-  demoPillText: { fontSize: 10, fontWeight: '700', color: '#fff', letterSpacing: 1 },
   totalCardLabel:  { fontSize: 12, color: 'rgba(255,255,255,0.8)', marginBottom: 4 },
   totalCardAmount: { fontSize: 30, fontWeight: '700', color: '#fff', letterSpacing: -0.5, marginBottom: 16 },
   userPills:       { flexDirection: 'row', gap: 10 },

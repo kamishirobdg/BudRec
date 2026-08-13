@@ -26,8 +26,10 @@ export interface DemoConfig {
   enabled:   boolean;
   /** 実名 → デモ表示名。未登録の名前は autoAlias() で自動命名 */
   aliases:   Record<string, string>;
-  /** 金額倍率。これに ±20% の行ごとジッターが乗る */
+  /** 金額倍率（既定値）。1 以外なら ±20% の行ごとジッターが乗る */
   scale:     number;
+  /** カテゴリ表示名 → そのカテゴリ専用の倍率。未指定のカテゴリは scale を使う */
+  categoryScales: Record<string, number>;
   /**
    * カテゴリ表示名 → デモで見せたい合計金額。
    * 指定したカテゴリは倍率・ジッターを無視し、**その月の合計がこの値になるよう
@@ -47,6 +49,7 @@ const DEFAULT_CONFIG: DemoConfig = {
   enabled:        false,
   aliases:        {},
   scale:          1,
+  categoryScales: {},
   categoryTotals: {},
   maskStore:      false,
   hideMemo:       true,
@@ -70,6 +73,7 @@ export async function loadConfig(): Promise<DemoConfig> {
         ...DEFAULT_CONFIG,
         ...parsed,
         aliases:        parsed.aliases ?? {},
+        categoryScales: parsed.categoryScales ?? {},
         categoryTotals: parsed.categoryTotals ?? {},
       };
     }
@@ -138,10 +142,22 @@ function maskStore(store: string): string {
   return STORE_POOL[hash(store) % STORE_POOL.length];
 }
 
-/** 行ごとの金額倍率。同じ行なら常に同じ値になる */
+/** そのカテゴリに適用する倍率。個別指定が無ければ共通の scale を使う */
+function effectiveScale(category: string): number {
+  const s = config.categoryScales[catKey(category)];
+  return typeof s === 'number' && s > 0 ? s : config.scale;
+}
+
+/**
+ * 行ごとの金額倍率。同じ行なら常に同じ値になる。
+ * 倍率がちょうど 1 のときはジッターを乗せず、元の金額のまま表示する
+ * （1 倍を選んだのに金額がズレるのは分かりにくいため）。
+ */
 function rowRatio(row: ExpenseRow): number {
+  const scale = effectiveScale(row.category);
+  if (scale === 1) return 1;
   const jitter = (hash(`${row.timestamp}|${row.store}|${row.amount}`) % 41) / 100; // 0〜0.40
-  return config.scale * (0.8 + jitter); // scale の ±20%
+  return scale * (0.8 + jitter); // scale の ±20%
 }
 
 function scaleAmount(value: number, ratio: number): number {

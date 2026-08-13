@@ -147,6 +147,14 @@ export default function SettingsScreen({ onSignedOut }: Props) {
     patchDemo({ categoryTotals: next });
   };
 
+  /** カテゴリ別倍率を選ぶ。undefined は「指定なし（共通倍率を使う）」 */
+  const setCategoryScale = (category: string, value: number | undefined) => {
+    const next = { ...demo.categoryScales };
+    if (value === undefined) delete next[category];
+    else next[category] = value;
+    patchDemo({ categoryScales: next });
+  };
+
   /** 表示名の入力を確定してデモ設定に保存する */
   const commitAlias = (realName: string) => {
     const next = { ...demo.aliases };
@@ -444,8 +452,45 @@ export default function SettingsScreen({ onSignedOut }: Props) {
                     ))}
                   </View>
                   <Text style={styles.demoHint}>
-                    倍率に加えて明細ごとに ±20% ずらすため、実際の金額は分かりません。
+                    1倍以外を選ぶと、明細ごとに ±20% ずらすため実際の金額は分かりません。
+                    1倍なら元の金額のまま表示されます。
                   </Text>
+
+                  {catActual.length > 0 && (
+                    <>
+                      <Text style={styles.demoGroupLabel}>カテゴリ別倍率（合計未指定のカテゴリ）</Text>
+                      {catActual.map(([cat]) => {
+                        const catScale = demo.categoryScales[cat];
+                        return (
+                          <View key={cat} style={[styles.cardRow, styles.cardRowBorder, { flexWrap: 'wrap' }]}>
+                            <Text style={styles.demoRealName} numberOfLines={1}>{cat}</Text>
+                            <TouchableOpacity
+                              style={[styles.pillBtn, catScale === undefined && styles.pillBtnActive]}
+                              onPress={() => setCategoryScale(cat, undefined)}
+                            >
+                              <Text style={[styles.pillBtnText, catScale === undefined && styles.pillBtnTextActive]}>
+                                共通
+                              </Text>
+                            </TouchableOpacity>
+                            {Demo.SCALE_OPTIONS.map((s) => (
+                              <TouchableOpacity
+                                key={s}
+                                style={[styles.pillBtn, catScale === s && styles.pillBtnActive]}
+                                onPress={() => setCategoryScale(cat, s)}
+                              >
+                                <Text style={[styles.pillBtnText, catScale === s && styles.pillBtnTextActive]}>
+                                  ×{s}
+                                </Text>
+                              </TouchableOpacity>
+                            ))}
+                          </View>
+                        );
+                      })}
+                      <Text style={styles.demoHint}>
+                        カテゴリ別の合計金額を指定した場合はそちらが優先され、この倍率は使われません。
+                      </Text>
+                    </>
+                  )}
 
                   <View style={[styles.cardRow, styles.cardRowBorder]}>
                     <Text style={styles.cardRowLabel}>店名もぼかす</Text>
