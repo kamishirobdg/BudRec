@@ -1,5 +1,13 @@
 import axios, { AxiosInstance } from 'axios';
-import { getAccessToken } from './AuthService';
+import {
+  AuthError,
+  TransientAuthError,
+  getAccessToken,
+  refreshAccessTokenNow,
+} from './AuthService';
+import { attachRetryInterceptor } from './httpRetry';
+import * as Demo from './DemoService';
+import * as WriteQueue from './WriteQueueService';
 
 // ─── スプレッドシート設定（.env の EXPO_PUBLIC_SPREADSHEET_ID に設定） ───────
 // Google Sheets の URL から取得: https://docs.google.com/spreadsheets/d/{ID}/edit
@@ -47,6 +55,10 @@ const CONFIG_KEY_DEFAULT_PARTIAL_AMOUNT = 'default_partial_amount';
 const DEFAULT_PARTIAL_AMOUNT = 1000;
 const CONFIG_KEY_GMAIL_SEARCH_WINDOW = 'gmail_search_window';
 const DEFAULT_GMAIL_SEARCH_WINDOW: GmailSearchWindow = '60d';
+/** 固定費を月初コピー済みの月（'YYYY-MM'）。**端末ローカルではなく共有**に置く。
+ *  端末ごとに持つと、夫婦の2台が月初にほぼ同時に起動したとき両方が「まだ未適用」と
+ *  判断して同じ固定費行を2つ作ってしまうため（2026-08-12 修正） */
+const CONFIG_KEY_RECURRING_APPLIED_MONTH = 'recurring_applied_month';
 
 /** Gmail 検索ウィンドウの選択肢 */
 export type GmailSearchWindow = '30d' | '60d' | '180d' | '1y' | 'all';
@@ -62,18 +74,68 @@ const DEFAULT_CATEGORIES: readonly string[] = [
 
 // ─── 内部: 認証付き axios インスタンスを作る ─────────────────────────────────
 
+/** ネットワークが死んでいるときに無限に待たないための上限 */
+const REQUEST_TIMEOUT_MS = 30_000;
+
 async function createClient(): Promise<AxiosInstance> {
   const token = await getAccessToken();
-  if (!token) {
-    throw new Error('未サインインです。先に signInWithGoogle() を呼んでください。');
-  }
-  return axios.create({
+  if (!token) throw new AuthError();
+  const client = axios.create({
     baseURL: `${SHEETS_API_BASE}/${SPREADSHEET_ID}`,
+    timeout: REQUEST_TIMEOUT_MS,
     headers: {
       Authorization: `Bearer ${token}`,
       'Content-Type': 'application/json',
     },
   });
+
+  // 期限内のトークンでも Google 側で失効していることがある。
+  // 401 が返ったら 1 回だけ取り直して再送し、いきなりサインアウトさせない。
+  client.interceptors.response.use(undefined, async (error) => {
+    const config = error?.config as (typeof error.config & { _authRetried?: boolean }) | undefined;
+    if (error?.response?.status !== 401 || !config || config._authRetried) throw error;
+
+    const fresh = await refreshAccessTokenNow();
+    if (!fresh) throw new AuthError();
+
+    config._authRetried = true;
+    config.headers = { ...config.headers, Authorization: `Bearer ${fresh}` };
+    return client.request(config);
+  });
+
+  // 429 / 5xx / 通信断の再送。401 の再認証より後に登録する（401 を先に処理させる）
+  attachRetryInterceptor(client);
+
+  return client;
+}
+
+/**
+ * 同時に投げる Sheets リクエストの上限。
+ * 全期間表示は月シートの数だけ読み出しが走るので、そのまま並列にすると 429 を招く。
+ */
+const FETCH_CONCURRENCY = 4;
+
+/** items を最大 limit 並列で処理する。結果の順序は入力と揃える */
+async function mapLimited<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let cursor = 0;
+
+  const worker = async () => {
+    for (;;) {
+      const i = cursor++;
+      if (i >= items.length) return;
+      results[i] = await fn(items[i]);
+    }
+  };
+
+  await Promise.all(
+    Array.from({ length: Math.min(limit, items.length) }, worker),
+  );
+  return results;
 }
 
 // ─── 内部: timestamp ユーティリティ ──────────────────────────────────────────
@@ -123,7 +185,7 @@ export function getSheetNameFromDate(date: Date = new Date()): string {
  * 'YYYY/MM/DD ...' または 'YYYY-MM-DD ...' を正規表現で直接パースする。
  * new Date() に頼ると Hermes でスラッシュ区切りが NaN になるため使わない。
  */
-function sheetNameFromTimestamp(timestamp: string): string {
+export function sheetNameFromTimestamp(timestamp: string): string {
   const match = timestamp.match(/^(\d{4})[\/\-](\d{2})/);
   if (match) return `${match[1]}-${match[2]}`;
   // フォールバック: ISO 形式など
@@ -132,11 +194,49 @@ function sheetNameFromTimestamp(timestamp: string): string {
 
 // ─── 内部: シートの存在確認 / 作成 ───────────────────────────────────────────
 
-/** スプレッドシート内の全シート名を取得 */
-async function listSheetNames(client: AxiosInstance): Promise<string[]> {
+/**
+ * シート名一覧の短命キャッシュ。
+ * 全期間表示は月シートの数だけ getRows が走り、その 1 回ごとに「そのシートが
+ * 存在するか」の問い合わせが発生するため、読み出し用途に限りごく短時間だけ使い回す。
+ * シートを追加したら invalidateSheetNames() で必ず捨てること。
+ */
+const SHEET_NAMES_TTL_MS = 15_000;
+let sheetNamesCache: { names: string[]; at: number } | null = null;
+let sheetNamesInflight: Promise<string[]> | null = null;
+
+function invalidateSheetNames(): void {
+  sheetNamesCache = null;
+}
+
+/**
+ * スプレッドシート内の全シート名を取得。
+ * @param allowCache 直近の取得結果を使い回してよいなら true（読み出し専用の判定に使う）。
+ *                   シートを作る前の存在確認では **必ず false**（古い一覧で二重作成しないため）。
+ */
+async function listSheetNames(
+  client: AxiosInstance,
+  allowCache = false,
+): Promise<string[]> {
+  if (allowCache) {
+    if (sheetNamesCache && Date.now() - sheetNamesCache.at < SHEET_NAMES_TTL_MS) {
+      return sheetNamesCache.names;
+    }
+    // 並列に呼ばれても実際のリクエストは 1 本にまとめる
+    if (sheetNamesInflight) return sheetNamesInflight;
+    sheetNamesInflight = fetchSheetNames(client).finally(() => {
+      sheetNamesInflight = null;
+    });
+    return sheetNamesInflight;
+  }
+  return fetchSheetNames(client);
+}
+
+async function fetchSheetNames(client: AxiosInstance): Promise<string[]> {
   const res = await client.get('', { params: { fields: 'sheets.properties.title' } });
   const sheets = res.data.sheets ?? [];
-  return sheets.map((s: { properties: { title: string } }) => s.properties.title);
+  const names = sheets.map((s: { properties: { title: string } }) => s.properties.title);
+  sheetNamesCache = { names, at: Date.now() };
+  return names;
 }
 
 /** YYYY/MM/DD... のタイムスタンプの年月を targetYearMonth (YYYY-MM) に差し替える */
@@ -202,42 +302,105 @@ async function copyRecurringRowsToNewMonth(
   }
 }
 
-/** シートが無ければ新規作成しヘッダー行を書き込む。固定費行も自動コピー */
-async function ensureSheetExists(client: AxiosInstance, sheetName: string): Promise<void> {
-  const existing = await listSheetNames(client);
-  if (existing.includes(sheetName)) return;
+/**
+ * シートが無ければ作る。**作成した場合のみ true** を返す。
+ *
+ * 存在確認にキャッシュを使う（1 行追記するたびに全シート名を引くとリクエスト数が
+ * 倍になり 429 を招くため）。取りこぼし——他端末が直前に作った場合など——は
+ * addSheet が「既に存在する」で失敗するので、そこで一覧を取り直して吸収する。
+ */
+async function ensureSheet(client: AxiosInstance, sheetName: string): Promise<boolean> {
+  const existing = await listSheetNames(client, true);
+  if (existing.includes(sheetName)) return false;
 
-  // シート追加
-  await client.post(':batchUpdate', {
-    requests: [{ addSheet: { properties: { title: sheetName } } }],
+  try {
+    await client.post(':batchUpdate', {
+      requests: [{ addSheet: { properties: { title: sheetName } } }],
+    });
+  } catch (e) {
+    invalidateSheetNames();
+    const fresh = await listSheetNames(client);
+    if (fresh.includes(sheetName)) return false; // 競合しただけ。作成済みなので続行してよい
+    throw e;
+  }
+
+  invalidateSheetNames();
+  return true;
+}
+
+/** シート名から sheetId を引く（行の挿入など、名前では指定できない操作用） */
+async function fetchSheetId(client: AxiosInstance, sheetName: string): Promise<number | null> {
+  const res = await client.get('', {
+    params: { fields: 'sheets.properties(sheetId,title)' },
   });
+  const sheets: { properties: { sheetId: number; title: string } }[] = res.data.sheets ?? [];
+  return sheets.find((s) => s.properties.title === sheetName)?.properties.sheetId ?? null;
+}
 
-  // ヘッダー行書き込み
+/**
+ * 新規作成したシートにヘッダー行を書く。
+ *
+ * **1 行目を無条件に上書きしてはいけない。** シートを作ってからヘッダーを書くまでの間に、
+ * 別プロセス（夫婦のもう一方の端末、または同一端末の Gmail 取り込みと固定費コピー）が
+ * 「シートはもう在る＝ヘッダーも書かれている」と判断して先に 1 行を追記することがある。
+ * ヘッダーがまだ無いのでその追記は 1 行目に入り、後から確定するヘッダー PUT に消される。
+ * 月初に二人がほぼ同時に最初の支出を登録した場合に起こりうる（2026-08-12 修正）。
+ */
+async function writeHeaderRow(client: AxiosInstance, sheetName: string): Promise<void> {
+  const res = await client.get(`/values/${encodeURIComponent(sheetName)}!A1:L1`);
+  const firstRow: string[] = res.data.values?.[0] ?? [];
+
+  if (firstRow.length === 0) {
+    // 通常はこちら。まだ誰も書いていない
+    await client.put(
+      `/values/${encodeURIComponent(sheetName)}!A1`,
+      { values: [HEADER_ROW] },
+      { params: { valueInputOption: 'RAW' } },
+    );
+    return;
+  }
+
+  // 誰かがヘッダーを書き終えていたなら何もしない
+  if (firstRow[0] === HEADER_ROW[0]) return;
+
+  // 明細行が入ってしまっている。上書きすると消えるので、上に 1 行差し込んでから書く
+  const sheetId = await fetchSheetId(client, sheetName);
+  if (sheetId === null) {
+    console.error(`[Sheets] ${sheetName} の sheetId が引けずヘッダーを書けなかった`);
+    return;
+  }
+  await client.post(':batchUpdate', {
+    requests: [{
+      insertDimension: {
+        range: { sheetId, dimension: 'ROWS', startIndex: 0, endIndex: 1 },
+        inheritFromBefore: false,
+      },
+    }],
+  });
   await client.put(
     `/values/${encodeURIComponent(sheetName)}!A1`,
     { values: [HEADER_ROW] },
     { params: { valueInputOption: 'RAW' } },
   );
+}
+
+/** シートが無ければ新規作成しヘッダー行を書き込む。固定費行も自動コピー */
+async function ensureSheetExists(client: AxiosInstance, sheetName: string): Promise<void> {
+  if (!(await ensureSheet(client, sheetName))) return;
+
+  await writeHeaderRow(client, sheetName);
 
   // 前月の固定費行をコピー（月次シートのみ対象）
   if (/^\d{4}-\d{2}$/.test(sheetName)) {
-    await copyRecurringRowsToNewMonth(client, sheetName, existing);
+    await copyRecurringRowsToNewMonth(client, sheetName, await listSheetNames(client, true));
   }
 }
 
-// ─── 公開 API ─────────────────────────────────────────────────────────────────
+// ─── 書き込みの実行と退避 ─────────────────────────────────────────────────────
 
-/**
- * 家計簿エントリを 1 行追記する。
- * シート名は timestamp の年月から自動生成され、未作成なら自動で作る。
- */
-export async function appendRow(entry: ExpenseRow): Promise<void> {
-  const client    = await createClient();
-  const sheetName = sheetNameFromTimestamp(entry.timestamp);
-
-  await ensureSheetExists(client, sheetName);
-
-  const row: (string | number)[] = [
+/** ExpenseRow をシートの 1 行（A:L）に変換する */
+function toSheetRow(entry: ExpenseRow): (string | number)[] {
+  return [
     entry.timestamp,
     entry.source,
     entry.user,
@@ -251,17 +414,166 @@ export async function appendRow(entry: ExpenseRow): Promise<void> {
     entry.recurring ? 'TRUE' : 'FALSE',
     entry.deleted   ? 'TRUE' : 'FALSE',
   ];
+}
 
-  await client.post(
-    `/values/${encodeURIComponent(sheetName)}!${MONTH_RANGE}:append`,
-    { values: [row] },
-    {
-      params: {
-        valueInputOption:    'RAW',
-        insertDataOption:    'INSERT_ROWS',
-      },
-    },
-  );
+/**
+ * 1 操作をスプレッドシートへ送る。
+ * 初回の書き込みと、キューからの再送の両方がここを通る。
+ */
+async function execWrite(op: WriteQueue.WriteOp): Promise<void> {
+  const client = await createClient();
+
+  switch (op.kind) {
+    case 'append': {
+      const sheetName = sheetNameFromTimestamp(op.entry.timestamp);
+      await ensureSheetExists(client, sheetName);
+      await client.post(
+        `/values/${encodeURIComponent(sheetName)}!${MONTH_RANGE}:append`,
+        { values: [toSheetRow(op.entry)] },
+        { params: { valueInputOption: 'RAW', insertDataOption: 'INSERT_ROWS' } },
+      );
+      return;
+    }
+    case 'updateRow':
+      await client.put(
+        `/values/${encodeURIComponent(op.sheetName)}!A${op.rowIndex}:L${op.rowIndex}`,
+        { values: [toSheetRow(op.entry)] },
+        { params: { valueInputOption: 'RAW' } },
+      );
+      return;
+    case 'updateFlags':
+      await client.put(
+        `/values/${encodeURIComponent(op.sheetName)}!H${op.rowIndex}:J${op.rowIndex}`,
+        {
+          values: [[
+            op.patch.countedAmount,
+            op.patch.excluded  ? 'TRUE' : 'FALSE',
+            op.patch.confirmed ? 'TRUE' : 'FALSE',
+          ]],
+        },
+        { params: { valueInputOption: 'RAW' } },
+      );
+      return;
+    case 'markDeleted':
+      await client.put(
+        `/values/${encodeURIComponent(op.sheetName)}!L${op.rowIndex}`,
+        { values: [['TRUE']] },
+        { params: { valueInputOption: 'RAW' } },
+      );
+      return;
+    case 'setRecurring':
+      await client.put(
+        `/values/${encodeURIComponent(op.sheetName)}!K${op.rowIndex}`,
+        { values: [[op.recurring ? 'TRUE' : 'FALSE']] },
+        { params: { valueInputOption: 'RAW' } },
+      );
+      return;
+  }
+}
+
+/** 後で送り直せば成功しうる失敗か（＝キューに積む価値があるか） */
+function isQueueable(e: unknown): boolean {
+  if (e instanceof Demo.DemoModeError) return false;
+  // 再サインインすれば送れる。積んでおけば次のサインイン後に自動で流れる
+  if (e instanceof AuthError || e instanceof TransientAuthError) return true;
+  if (!axios.isAxiosError(e)) return false;
+
+  const status = e.response?.status;
+  if (status === undefined) return true;   // 通信断・タイムアウト
+  return status === 429 || status >= 500;  // クォータ超過・サーバー側の障害
+}
+
+/** キュー一覧に出す短いエラー説明 */
+function describeError(e: unknown): string {
+  if (axios.isAxiosError(e)) {
+    const status = e.response?.status;
+    if (status) return `HTTP ${status}`;
+    return e.code === 'ECONNABORTED' ? 'タイムアウト' : 'ネットワークエラー';
+  }
+  return e instanceof Error ? e.message : String(e);
+}
+
+/**
+ * 書き込みを実行し、一時的な失敗なら端末のキューへ退避する。
+ *
+ * 退避したときは QueuedWriteError を投げる（＝画面側は変更を巻き戻さない）。
+ * ただし AuthError だけは元のまま投げてサインアウト処理をさせる。
+ * キューには積んであるので、再ログイン後に自動で送られる。
+ */
+async function writeOrQueue(op: WriteQueue.WriteOp): Promise<void> {
+  try {
+    await execWrite(op);
+  } catch (e) {
+    if (!isQueueable(e)) throw e;
+    const reason = describeError(e);
+    WriteQueue.enqueue(op, reason);
+    if (e instanceof AuthError) throw e;
+    throw new WriteQueue.QueuedWriteError(reason);
+  }
+  // 今の書き込みは、同じ行に溜まっている未送信項目より新しい。
+  // そのまま流すと古い値で上書きされるので、重なる列を潰しておく
+  WriteQueue.reconcileAfterDirectWrite(op);
+}
+
+export interface FlushResult {
+  sent:      number;
+  remaining: number;
+}
+
+let flushInflight: Promise<FlushResult> | null = null;
+
+/**
+ * 端末に溜まった未送信の書き込みを古い順に送る。
+ * 1 件でも失敗したらそこで止める（同じ行に対する操作の順序を崩さないため）。
+ */
+export async function flushWriteQueue(): Promise<FlushResult> {
+  if (flushInflight) return flushInflight;
+
+  flushInflight = (async () => {
+    // デモ中に実データへ書き込まない（デモを抜けてから送る）
+    if (await Demo.isDemo()) return { sent: 0, remaining: WriteQueue.count() };
+
+    let sent = 0;
+    let authError: AuthError | null = null;
+    for (const item of WriteQueue.list()) {
+      if (item.permanent) continue; // 送り直しても直らないと分かっているものは飛ばす
+      try {
+        await execWrite(item.op);
+        WriteQueue.remove(item.id);
+        sent++;
+      } catch (e) {
+        WriteQueue.markAttempt(item.id, describeError(e), !isQueueable(e));
+        // AuthError は他の一時的な失敗と違い「送り直せば直る」ものではないので、
+        // ここで握りつぶさず呼び出し元へ伝えてサインアウト処理をさせる
+        // （writeOrQueue の直接書き込み経路と同じ扱いに揃える）
+        if (e instanceof AuthError) authError = e;
+        break;
+      }
+    }
+    if (sent > 0) console.log(`[WriteQueue] ${sent}件を送信した`);
+    if (authError) throw authError;
+    return { sent, remaining: WriteQueue.count() };
+  })().finally(() => {
+    flushInflight = null;
+  });
+
+  return flushInflight;
+}
+
+// ─── 公開 API ─────────────────────────────────────────────────────────────────
+
+/**
+ * 家計簿エントリを 1 行追記する。
+ * シート名は timestamp の年月から自動生成され、未作成なら自動で作る。
+ * 通信できなかった場合は端末に退避して QueuedWriteError を投げる。
+ */
+export async function appendRow(entry: ExpenseRow): Promise<void> {
+  // デモモード中はシートに書かず、メモリ上のオーバーレイにだけ積む
+  if (await Demo.isDemo()) {
+    Demo.demoAppend(entry, sheetNameFromTimestamp(entry.timestamp));
+    return;
+  }
+  await writeOrQueue({ kind: 'append', entry });
 }
 
 /**
@@ -270,10 +582,23 @@ export async function appendRow(entry: ExpenseRow): Promise<void> {
  * @returns ExpenseRow の配列（ヘッダー行は除外）。シートが存在しなければ空配列。
  */
 export async function getRows(yearMonth?: string): Promise<ExpenseRow[]> {
+  const sheetName = yearMonth ?? getSheetNameFromDate();
+  const rows      = await getRowsRaw(sheetName);
+
+  // デモモード: 表示だけ差し替え、デモ中の追加・編集を重ねる
+  if (!(await Demo.isDemo())) return rows;
+  return Demo.applyOverlay(sheetName, Demo.maskRows(rows));
+}
+
+/**
+ * 指定月のデータを全件取得する（**デモモードでもマスクしない生データ**）。
+ * デモモードの設定画面のように、実際の値を見せる必要がある箇所だけで使う。
+ */
+export async function getRowsRaw(yearMonth?: string): Promise<ExpenseRow[]> {
   const client    = await createClient();
   const sheetName = yearMonth ?? getSheetNameFromDate();
 
-  const existing = await listSheetNames(client);
+  const existing = await listSheetNames(client, true);
   if (!existing.includes(sheetName)) return [];
 
   const res = await client.get(
@@ -319,7 +644,7 @@ export async function getRows(yearMonth?: string): Promise<ExpenseRow[]> {
 /** 月次シートの一覧を新しい順に返す（'YYYY-MM' のみ、設定系シートは除外） */
 export async function listMonthSheetNames(): Promise<string[]> {
   const client = await createClient();
-  const all = await listSheetNames(client);
+  const all = await listSheetNames(client, true);
   return all
     .filter((n) => /^\d{4}-\d{2}$/.test(n))
     .sort((a, b) => (a < b ? 1 : -1));
@@ -348,7 +673,8 @@ export async function getRowsForRange(spec: RangeSpec): Promise<ExpenseRow[]> {
     spec.type === 'year'
       ? months.filter((m) => m.startsWith(`${spec.year}-`))
       : months;
-  const results = await Promise.all(targets.map((m) => getRows(m)));
+  // 全期間表示ではシート数ぶん読み出しが走るので、同時実行数を絞って 429 を避ける
+  const results = await mapLimited(targets, FETCH_CONCURRENCY, (m) => getRows(m));
   return results.flat();
 }
 
@@ -362,18 +688,11 @@ export async function updateRowFlags(
   rowIndex: number,
   patch: { countedAmount: number; excluded: boolean; confirmed: boolean },
 ): Promise<void> {
-  const client = await createClient();
-  await client.put(
-    `/values/${encodeURIComponent(yearMonth)}!H${rowIndex}:J${rowIndex}`,
-    {
-      values: [[
-        patch.countedAmount,
-        patch.excluded ? 'TRUE' : 'FALSE',
-        patch.confirmed ? 'TRUE' : 'FALSE',
-      ]],
-    },
-    { params: { valueInputOption: 'RAW' } },
-  );
+  if (await Demo.isDemo()) {
+    Demo.demoPatch(yearMonth, rowIndex, patch);
+    return;
+  }
+  await writeOrQueue({ kind: 'updateFlags', sheetName: yearMonth, rowIndex, patch });
 }
 
 /**
@@ -385,26 +704,21 @@ export async function updateRow(
   rowIndex: number,
   entry: ExpenseRow,
 ): Promise<void> {
-  const client = await createClient();
-  const row: (string | number)[] = [
-    entry.timestamp,
-    entry.source,
-    entry.user,
-    entry.store,
-    entry.category,
-    entry.amount,
-    entry.memo,
-    entry.countedAmount > 0 ? entry.countedAmount : entry.amount,
-    entry.excluded  ? 'TRUE' : 'FALSE',
-    entry.confirmed ? 'TRUE' : 'FALSE',
-    entry.recurring ? 'TRUE' : 'FALSE',
-    entry.deleted   ? 'TRUE' : 'FALSE',
-  ];
-  await client.put(
-    `/values/${encodeURIComponent(yearMonth)}!A${rowIndex}:L${rowIndex}`,
-    { values: [row] },
-    { params: { valueInputOption: 'RAW' } },
-  );
+  if (await Demo.isDemo()) {
+    Demo.demoPatch(yearMonth, rowIndex, {
+      timestamp: entry.timestamp,
+      store:     entry.store,
+      category:  entry.category,
+      amount:    entry.amount,
+      memo:      entry.memo,
+      countedAmount: entry.countedAmount > 0 ? entry.countedAmount : entry.amount,
+      excluded:  entry.excluded,
+      confirmed: entry.confirmed,
+      recurring: entry.recurring,
+    });
+    return;
+  }
+  await writeOrQueue({ kind: 'updateRow', sheetName: yearMonth, rowIndex, entry });
 }
 
 /**
@@ -416,12 +730,11 @@ export async function markRowDeleted(
   yearMonth: string,
   rowIndex: number,
 ): Promise<void> {
-  const client = await createClient();
-  await client.put(
-    `/values/${encodeURIComponent(yearMonth)}!L${rowIndex}`,
-    { values: [['TRUE']] },
-    { params: { valueInputOption: 'RAW' } },
-  );
+  if (await Demo.isDemo()) {
+    Demo.demoPatch(yearMonth, rowIndex, { deleted: true });
+    return;
+  }
+  await writeOrQueue({ kind: 'markDeleted', sheetName: yearMonth, rowIndex });
 }
 
 /** 指定行の recurring フラグ（K列）のみ更新する */
@@ -430,24 +743,18 @@ export async function updateRecurringFlag(
   rowIndex: number,
   recurring: boolean,
 ): Promise<void> {
-  const client = await createClient();
-  await client.put(
-    `/values/${encodeURIComponent(yearMonth)}!K${rowIndex}`,
-    { values: [[recurring ? 'TRUE' : 'FALSE']] },
-    { params: { valueInputOption: 'RAW' } },
-  );
+  if (await Demo.isDemo()) {
+    Demo.demoPatch(yearMonth, rowIndex, { recurring });
+    return;
+  }
+  await writeOrQueue({ kind: 'setRecurring', sheetName: yearMonth, rowIndex, recurring });
 }
 
 // ─── カテゴリ管理 ─────────────────────────────────────────────────────────────
 
 /** _settings シートが無ければ作成しデフォルトカテゴリを書き込む */
 async function ensureSettingsSheet(client: AxiosInstance): Promise<void> {
-  const existing = await listSheetNames(client);
-  if (existing.includes(SETTINGS_SHEET)) return;
-
-  await client.post(':batchUpdate', {
-    requests: [{ addSheet: { properties: { title: SETTINGS_SHEET } } }],
-  });
+  if (!(await ensureSheet(client, SETTINGS_SHEET))) return;
 
   await client.put(
     `/values/${encodeURIComponent(SETTINGS_SHEET)}!A1`,
@@ -480,6 +787,7 @@ export async function getCategories(): Promise<string[]> {
 export async function addCategory(name: string): Promise<void> {
   const trimmed = name.trim();
   if (!trimmed) throw new Error('カテゴリ名が空です');
+  if (await Demo.isDemo()) throw new Demo.DemoModeError('デモモード中はカテゴリを変更できません');
 
   const client = await createClient();
   await ensureSettingsSheet(client);
@@ -501,6 +809,8 @@ export async function addCategory(name: string): Promise<void> {
 
 /** カテゴリを削除（該当行の値だけ消し、行は詰めない＝シンプル実装） */
 export async function removeCategory(name: string): Promise<void> {
+  if (await Demo.isDemo()) throw new Demo.DemoModeError('デモモード中はカテゴリを変更できません');
+
   const client = await createClient();
   const current = await getCategories();
   const remaining = current.filter((c) => c !== name);
@@ -525,12 +835,8 @@ export async function removeCategory(name: string): Promise<void> {
 
 /** _config シートが無ければ作成しデフォルト値を書き込む */
 async function ensureConfigSheet(client: AxiosInstance): Promise<void> {
-  const existing = await listSheetNames(client);
-  if (existing.includes(CONFIG_SHEET)) return;
+  if (!(await ensureSheet(client, CONFIG_SHEET))) return;
 
-  await client.post(':batchUpdate', {
-    requests: [{ addSheet: { properties: { title: CONFIG_SHEET } } }],
-  });
   await client.put(
     `/values/${encodeURIComponent(CONFIG_SHEET)}!A1`,
     {
@@ -617,6 +923,8 @@ async function upsertConfigValue(
 
 /** Gmail 検索ウィンドウを更新 */
 export async function setGmailSearchWindow(v: GmailSearchWindow): Promise<void> {
+  if (await Demo.isDemo()) throw new Demo.DemoModeError('デモモード中は設定を変更できません');
+
   const client = await createClient();
   await upsertConfigValue(client, CONFIG_KEY_GMAIL_SEARCH_WINDOW, v);
 }
@@ -630,12 +938,8 @@ export interface GmailFilter {
 
 /** _gmail_filters シートが無ければヘッダーのみ作成する */
 async function ensureGmailFiltersSheet(client: AxiosInstance): Promise<void> {
-  const existing = await listSheetNames(client);
-  if (existing.includes(GMAIL_FILTERS_SHEET)) return;
+  if (!(await ensureSheet(client, GMAIL_FILTERS_SHEET))) return;
 
-  await client.post(':batchUpdate', {
-    requests: [{ addSheet: { properties: { title: GMAIL_FILTERS_SHEET } } }],
-  });
   await client.put(
     `/values/${encodeURIComponent(GMAIL_FILTERS_SHEET)}!A1`,
     { values: [['from', 'subject']] },
@@ -645,12 +949,8 @@ async function ensureGmailFiltersSheet(client: AxiosInstance): Promise<void> {
 
 /** _gmail_processed シートが無ければヘッダーのみ作成する */
 async function ensureGmailProcessedSheet(client: AxiosInstance): Promise<void> {
-  const existing = await listSheetNames(client);
-  if (existing.includes(GMAIL_PROCESSED_SHEET)) return;
+  if (!(await ensureSheet(client, GMAIL_PROCESSED_SHEET))) return;
 
-  await client.post(':batchUpdate', {
-    requests: [{ addSheet: { properties: { title: GMAIL_PROCESSED_SHEET } } }],
-  });
   await client.put(
     `/values/${encodeURIComponent(GMAIL_PROCESSED_SHEET)}!A1`,
     { values: [['message_id', 'processed_at', 'result']] },
@@ -719,6 +1019,8 @@ export async function getSkippedNotTransactionMessageIds(): Promise<{ id: string
  * @returns 書き換えた件数
  */
 export async function resetSkippedNotTransactionIds(): Promise<number> {
+  if (await Demo.isDemo()) throw new Demo.DemoModeError('デモモード中は再取り込みできません');
+
   const client = await createClient();
   await ensureGmailProcessedSheet(client);
 
@@ -747,11 +1049,129 @@ export async function resetSkippedNotTransactionIds(): Promise<number> {
   return data.length;
 }
 
+/**
+ * 直近シートに存在するユーザー名一覧を返す（実際にシートに入っている名前）。
+ * デモモードでもマスクしないので、表示用途には getUniqueUsers() を使うこと。
+ * デモモードの表示名対応表を作るための入力として使う。
+ */
+export async function getUniqueUsersRaw(): Promise<string[]> {
+  const sheetName = getSheetNameFromDate();
+  const client = await createClient();
+  try {
+    const res = await client.get(`/values/${encodeURIComponent(sheetName)}!C:C`);
+    const rows: string[][] = res.data.values ?? [];
+    const users = new Set<string>();
+    for (let i = 1; i < rows.length; i++) {
+      const cell = rows[i]?.[0];
+      if (cell && cell.trim()) users.add(cell.trim());
+    }
+    return [...users];
+  } catch {
+    return [];
+  }
+}
+
+/** 直近シートに存在するユーザー名一覧を返す。代理入力対象の選択に使用 */
+export async function getUniqueUsers(): Promise<string[]> {
+  const users = await getUniqueUsersRaw();
+  if (!(await Demo.isDemo())) return users;
+  return [...new Set(users.map(Demo.maskUser))];
+}
+
+// ─── 固定費: 月初自動コピー ───────────────────────────────────────────────────
+
+/**
+ * 前月の固定費エントリを今月1日付けでコピーする。
+ * 既に source='recurring' の同一キー（店舗・カテゴリ・ユーザー・金額）が
+ * 今月に存在する場合はスキップする（二重作成防止）。
+ * @returns 作成した件数
+ */
+export async function applyRecurringEntries(): Promise<number> {
+  if (await Demo.isDemo()) return 0; // デモ中に実データを増やさない
+
+  const currentMonth = getSheetNameFromDate();
+
+  // 前月シート名
+  const nowDate  = new Date();
+  const prevDate = new Date(nowDate.getFullYear(), nowDate.getMonth() - 1, 1);
+  const prevMonth = getSheetNameFromDate(prevDate);
+
+  // 前月シートが存在しなければスキップ
+  const client = await createClient();
+  const existing = await listSheetNames(client, true);
+  if (!existing.includes(prevMonth)) return 0;
+
+  // 他の端末が今月ぶんを済ませていないか、共有の _config を見る
+  const cfg = await readConfig(client);
+  if ((cfg.get(CONFIG_KEY_RECURRING_APPLIED_MONTH) ?? '').trim() === currentMonth) return 0;
+
+  // 前月の固定費エントリ
+  const prevRows      = await getRows(prevMonth);
+  const recurringRows = prevRows.filter((r) => r.recurring && !r.deleted);
+  if (recurringRows.length === 0) return 0;
+
+  // **コピーする前に「今月はこの端末がやる」と共有側へ書いておく。**
+  // 済ませてから書くと、その間に起動したもう一方の端末も未適用と判断してしまう。
+  // 途中で失敗したら消して、次回起動時にやり直せるようにする
+  await upsertConfigValue(client, CONFIG_KEY_RECURRING_APPLIED_MONTH, currentMonth);
+
+  try {
+    // 今月の既存 recurring エントリのキーセット
+    const currentRows = await getRows(currentMonth);
+    const alreadyKeys = new Set(
+      currentRows
+        .filter((r) => r.source === 'recurring')
+        .map((r) => `${r.store}|${r.category}|${r.user}|${r.amount}`),
+    );
+
+    // 今月1日のタイムスタンプ（YYYY/MM/01 00:00:00）
+    const firstDay = `${currentMonth.replace('-', '/')}/01 00:00:00`;
+
+    let created = 0;
+    for (const entry of recurringRows) {
+      const key = `${entry.store}|${entry.category}|${entry.user}|${entry.amount}`;
+      if (alreadyKeys.has(key)) continue;
+
+      try {
+        await appendRow({
+          ...entry,
+          timestamp:  firstDay,
+          source:     'recurring',
+          excluded:   false,
+          confirmed:  false,
+          deleted:    false,
+          rowIndex:   undefined,
+          sheetName:  undefined,
+        });
+      } catch (e) {
+        // 通信できず端末に退避された場合も「作成済み」として進める。
+        // ここで止めると、呼び出し側が適用済みフラグを立てられず、
+        // 次回起動時にキュー内の未送信ぶんと二重に作ってしまう
+        if (!(e instanceof WriteQueue.QueuedWriteError)) throw e;
+      }
+      alreadyKeys.add(key); // 同一エントリが複数あっても2回作らない
+      created++;
+    }
+
+    return created;
+  } catch (e) {
+    // 確保だけして作れなかった状態を残さない（残すと今月ぶんが永久に作られない）
+    try {
+      await upsertConfigValue(client, CONFIG_KEY_RECURRING_APPLIED_MONTH, '');
+    } catch {
+      console.error('[Recurring] 適用済みフラグを戻せなかった。今月ぶんは手動で確認が必要');
+    }
+    throw e;
+  }
+}
+
 /** 取り込み履歴に1件追記する */
 export async function markGmailMessageProcessed(
   messageId: string,
   result: string,
 ): Promise<void> {
+  if (await Demo.isDemo()) return; // デモ中は Gmail 取り込み自体を止めてある
+
   const client = await createClient();
   await ensureGmailProcessedSheet(client);
 

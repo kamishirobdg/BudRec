@@ -13,7 +13,8 @@
  */
 
 import axios from 'axios';
-import { getAccessToken } from './AuthService';
+import { AuthError, getAccessToken, refreshAccessTokenNow } from './AuthService';
+import { withRetry } from './httpRetry';
 import {
   appendRow,
   ExpenseRow,
@@ -28,6 +29,7 @@ import { getCategories } from './CategoryService';
 import { getCurrentUser } from './UserService';
 import { getProvider } from '../providers';
 import * as Progress from './GmailProgressService';
+import * as Demo from './DemoService';
 
 const GMAIL_API_BASE = 'https://gmail.googleapis.com/gmail/v1/users/me';
 
@@ -73,6 +75,12 @@ export async function runGmailImport(): Promise<void> {
   // 既に別インスタンスが走っているなら何もしない
   if (Progress.getSnapshot().running) {
     console.log('[Gmail] 既に取り込み中のためスキップ');
+    return;
+  }
+
+  // デモモード中は実行しない（実メールを読んで実データを増やしてしまうため）
+  if (await Demo.isDemo()) {
+    console.log('[Gmail] デモモード中のためスキップ');
     return;
   }
 
@@ -187,6 +195,7 @@ export async function runGmailImport(): Promise<void> {
     console.log(`[Gmail] 取り込み完了: imported=${imported}, skipped=${skipped}, failed=${failed}`);
     Progress.finish({ imported, skipped, failed });
   } catch (e) {
+    if (e instanceof AuthError) throw e; // App.tsx 側でサインイン画面に戻す
     const msg = e instanceof Error ? e.message : String(e);
     console.error('[Gmail] runGmailImport 失敗:', e);
     Progress.fail(msg);
@@ -210,6 +219,9 @@ export interface SkippedMessageSummary {
 export async function getSkippedMessageSummaries(
   items: { id: string; processedAt: string }[],
 ): Promise<SkippedMessageSummary[]> {
+  // デモモード中は実メールの件名・本文を画面に出さない
+  if (await Demo.isDemo()) return [];
+
   const results: SkippedMessageSummary[] = [];
   for (const item of items) {
     try {
@@ -243,13 +255,32 @@ function buildQuery(filter: GmailFilter, window: GmailSearchWindow): string {
 
 async function gmailGet<T>(path: string, params?: object): Promise<T> {
   const token = await getAccessToken();
-  if (!token) throw new Error('未サインインです');
+  if (!token) throw new AuthError();
 
-  const res = await axios.get<T>(`${GMAIL_API_BASE}${path}`, {
-    headers: { Authorization: `Bearer ${token}` },
-    params,
-  });
-  return res.data;
+  const url = `${GMAIL_API_BASE}${path}`;
+  const send = (bearer: string) =>
+    axios.get<T>(url, {
+      headers: { Authorization: `Bearer ${bearer}` },
+      params,
+      timeout: 30_000,
+    });
+
+  // Gmail は取り込み中に大量の GET を投げるので 429 を受けやすい。
+  // GET は何度投げても副作用が無いため、通信断・タイムアウトでも再送してよい
+  return withRetry(
+    async () => {
+      try {
+        return (await send(token)).data;
+      } catch (e) {
+        // 期限内でも失効していることがあるので、401 は 1 回だけ取り直して再送する
+        if (!axios.isAxiosError(e) || e.response?.status !== 401) throw e;
+        const fresh = await refreshAccessTokenNow();
+        if (!fresh) throw new AuthError();
+        return (await send(fresh)).data;
+      }
+    },
+    { idempotent: true, label: `GET ${path}` },
+  );
 }
 
 async function searchMessages(query: string, maxResults: number): Promise<GmailMessageRef[]> {
