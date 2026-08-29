@@ -89,16 +89,20 @@ export default function SettingsScreen({ onSignedOut }: Props) {
       setGmailWindowState(win);
       setDemo(cfg);
 
-      // デモ表示名の対応表を作るために「シートに実在する名前」を集める
-      const sheetUsers = await getUniqueUsersRaw();
-      const names = [...new Set([u, ...sheetUsers])];
-      setDemoUsers(names);
-      setAliasDraft(
-        Object.fromEntries(names.map((n) => [n, cfg.aliases[n] ?? ''])),
-      );
+      // デモの導線を畳んでいる間は対応表もカテゴリ別合計も表示しないので、
+      // そのためだけの Sheets 読み出しを走らせない
+      if (Demo.DEMO_MODE_AVAILABLE) {
+        // デモ表示名の対応表を作るために「シートに実在する名前」を集める
+        const sheetUsers = await getUniqueUsersRaw();
+        const names = [...new Set([u, ...sheetUsers])];
+        setDemoUsers(names);
+        setAliasDraft(
+          Object.fromEntries(names.map((n) => [n, cfg.aliases[n] ?? ''])),
+        );
 
-      // カテゴリ別合計の編集はデモON時のみ必要（余計な通信を増やさない）
-      if (cfg.enabled) await loadCategoryTotals(cfg);
+        // カテゴリ別合計の編集はデモON時のみ必要（余計な通信を増やさない）
+        if (cfg.enabled) await loadCategoryTotals(cfg);
+      }
     } catch (e) {
       Alert.alert('読み込み失敗', e instanceof Error ? e.message : String(e));
     } finally {
@@ -379,140 +383,145 @@ export default function SettingsScreen({ onSignedOut }: Props) {
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={handleRefresh} />}
         ListHeaderComponent={
           <View style={styles.body}>
-            <View style={styles.card}>
-              <View style={[styles.cardRow, styles.demoToggleRow, (demo.enabled && panelOpen) && styles.cardRowBorder]}>
-                <TouchableOpacity
-                  onPress={() => {
-                    setPanelOpen(true);
-                    patchDemo({ enabled: !demo.enabled });
-                  }}
-                  style={[styles.demoToggleBtn, demo.enabled && styles.demoToggleBtnOn]}
-                  activeOpacity={0.7}
-                />
-              </View>
+            {/* デモモード。利用期間が終わったので導線は畳んである。
+                機能は DemoService に残してあるので、また外部に見せるときは
+                DEMO_MODE_AVAILABLE を true に戻せばこのカードごと復活する */}
+            {Demo.DEMO_MODE_AVAILABLE && (
+              <View style={styles.card}>
+                <View style={[styles.cardRow, styles.demoToggleRow, (demo.enabled && panelOpen) && styles.cardRowBorder]}>
+                  <TouchableOpacity
+                    onPress={() => {
+                      setPanelOpen(true);
+                      patchDemo({ enabled: !demo.enabled });
+                    }}
+                    style={[styles.demoToggleBtn, demo.enabled && styles.demoToggleBtnOn]}
+                    activeOpacity={0.7}
+                  />
+                </View>
 
-              {demo.enabled && panelOpen && (
-                <>
-                  <Text style={styles.demoGroupLabel}>表示名</Text>
-                  {demoUsers.map((name) => (
-                    <View key={name} style={[styles.cardRow, styles.cardRowBorder]}>
-                      <Text style={styles.demoRealName} numberOfLines={1}>{name} →</Text>
-                      <TextInput
-                        style={styles.cardInput}
-                        value={aliasDraft[name] ?? ''}
-                        onChangeText={(v) => setAliasDraft((p) => ({ ...p, [name]: v }))}
-                        onBlur={() => commitAlias(name)}
-                        onSubmitEditing={() => commitAlias(name)}
-                        placeholder={Demo.maskUser(name)}
-                        returnKeyType="done"
-                      />
-                    </View>
-                  ))}
-
-                  <Text style={styles.demoGroupLabel}>カテゴリ別の合計金額（当月）</Text>
-                  {catActual.length === 0 ? (
-                    <Text style={styles.demoHint}>当月のデータがありません</Text>
-                  ) : (
-                    <>
-                      {catActual.map(([cat, actual]) => (
-                        <View key={cat} style={[styles.cardRow, styles.cardRowBorder]}>
-                          <Text style={styles.demoRealName} numberOfLines={1}>{cat}</Text>
-                          <Text style={styles.demoActualAmount}>¥{actual.toLocaleString()} →</Text>
-                          <TextInput
-                            style={[styles.cardInput, { textAlign: 'right' }]}
-                            value={catDraft[cat] ?? ''}
-                            onChangeText={(v) => setCatDraft((p) => ({ ...p, [cat]: v }))}
-                            onBlur={() => commitCatTotal(cat)}
-                            onSubmitEditing={() => commitCatTotal(cat)}
-                            placeholder="指定なし"
-                            keyboardType="number-pad"
-                            returnKeyType="done"
-                          />
-                        </View>
-                      ))}
-                      <Text style={styles.demoHint}>
-                        金額を入れたカテゴリは、その月の合計がその値になるよう明細を比例配分します。
-                        空欄なら下の倍率が使われます。
-                      </Text>
-                    </>
-                  )}
-
-                  <Text style={styles.demoGroupLabel}>金額の倍率（合計未指定のカテゴリ）</Text>
-                  <View style={[styles.cardRow, styles.cardRowBorder, { flexWrap: 'wrap' }]}>
-                    {Demo.SCALE_OPTIONS.map((s) => (
-                      <TouchableOpacity
-                        key={s}
-                        style={[styles.pillBtn, demo.scale === s && styles.pillBtnActive]}
-                        onPress={() => patchDemo({ scale: s })}
-                      >
-                        <Text style={[styles.pillBtnText, demo.scale === s && styles.pillBtnTextActive]}>
-                          ×{s}
-                        </Text>
-                      </TouchableOpacity>
+                {demo.enabled && panelOpen && (
+                  <>
+                    <Text style={styles.demoGroupLabel}>表示名</Text>
+                    {demoUsers.map((name) => (
+                      <View key={name} style={[styles.cardRow, styles.cardRowBorder]}>
+                        <Text style={styles.demoRealName} numberOfLines={1}>{name} →</Text>
+                        <TextInput
+                          style={styles.cardInput}
+                          value={aliasDraft[name] ?? ''}
+                          onChangeText={(v) => setAliasDraft((p) => ({ ...p, [name]: v }))}
+                          onBlur={() => commitAlias(name)}
+                          onSubmitEditing={() => commitAlias(name)}
+                          placeholder={Demo.maskUser(name)}
+                          returnKeyType="done"
+                        />
+                      </View>
                     ))}
-                  </View>
-                  <Text style={styles.demoHint}>
-                    1倍以外を選ぶと、明細ごとに ±20% ずらすため実際の金額は分かりません。
-                    1倍なら元の金額のまま表示されます。
-                  </Text>
 
-                  {catActual.length > 0 && (
-                    <>
-                      <Text style={styles.demoGroupLabel}>カテゴリ別倍率（合計未指定のカテゴリ）</Text>
-                      {catActual.map(([cat]) => {
-                        const catScale = demo.categoryScales[cat];
-                        return (
-                          <View key={cat} style={[styles.cardRow, styles.cardRowBorder, { flexWrap: 'wrap' }]}>
+                    <Text style={styles.demoGroupLabel}>カテゴリ別の合計金額（当月）</Text>
+                    {catActual.length === 0 ? (
+                      <Text style={styles.demoHint}>当月のデータがありません</Text>
+                    ) : (
+                      <>
+                        {catActual.map(([cat, actual]) => (
+                          <View key={cat} style={[styles.cardRow, styles.cardRowBorder]}>
                             <Text style={styles.demoRealName} numberOfLines={1}>{cat}</Text>
-                            <TouchableOpacity
-                              style={[styles.pillBtn, catScale === undefined && styles.pillBtnActive]}
-                              onPress={() => setCategoryScale(cat, undefined)}
-                            >
-                              <Text style={[styles.pillBtnText, catScale === undefined && styles.pillBtnTextActive]}>
-                                共通
-                              </Text>
-                            </TouchableOpacity>
-                            {Demo.SCALE_OPTIONS.map((s) => (
+                            <Text style={styles.demoActualAmount}>¥{actual.toLocaleString()} →</Text>
+                            <TextInput
+                              style={[styles.cardInput, { textAlign: 'right' }]}
+                              value={catDraft[cat] ?? ''}
+                              onChangeText={(v) => setCatDraft((p) => ({ ...p, [cat]: v }))}
+                              onBlur={() => commitCatTotal(cat)}
+                              onSubmitEditing={() => commitCatTotal(cat)}
+                              placeholder="指定なし"
+                              keyboardType="number-pad"
+                              returnKeyType="done"
+                            />
+                          </View>
+                        ))}
+                        <Text style={styles.demoHint}>
+                          金額を入れたカテゴリは、その月の合計がその値になるよう明細を比例配分します。
+                          空欄なら下の倍率が使われます。
+                        </Text>
+                      </>
+                    )}
+
+                    <Text style={styles.demoGroupLabel}>金額の倍率（合計未指定のカテゴリ）</Text>
+                    <View style={[styles.cardRow, styles.cardRowBorder, { flexWrap: 'wrap' }]}>
+                      {Demo.SCALE_OPTIONS.map((s) => (
+                        <TouchableOpacity
+                          key={s}
+                          style={[styles.pillBtn, demo.scale === s && styles.pillBtnActive]}
+                          onPress={() => patchDemo({ scale: s })}
+                        >
+                          <Text style={[styles.pillBtnText, demo.scale === s && styles.pillBtnTextActive]}>
+                            ×{s}
+                          </Text>
+                        </TouchableOpacity>
+                      ))}
+                    </View>
+                    <Text style={styles.demoHint}>
+                      1倍以外を選ぶと、明細ごとに ±20% ずらすため実際の金額は分かりません。
+                      1倍なら元の金額のまま表示されます。
+                    </Text>
+
+                    {catActual.length > 0 && (
+                      <>
+                        <Text style={styles.demoGroupLabel}>カテゴリ別倍率（合計未指定のカテゴリ）</Text>
+                        {catActual.map(([cat]) => {
+                          const catScale = demo.categoryScales[cat];
+                          return (
+                            <View key={cat} style={[styles.cardRow, styles.cardRowBorder, { flexWrap: 'wrap' }]}>
+                              <Text style={styles.demoRealName} numberOfLines={1}>{cat}</Text>
                               <TouchableOpacity
-                                key={s}
-                                style={[styles.pillBtn, catScale === s && styles.pillBtnActive]}
-                                onPress={() => setCategoryScale(cat, s)}
+                                style={[styles.pillBtn, catScale === undefined && styles.pillBtnActive]}
+                                onPress={() => setCategoryScale(cat, undefined)}
                               >
-                                <Text style={[styles.pillBtnText, catScale === s && styles.pillBtnTextActive]}>
-                                  ×{s}
+                                <Text style={[styles.pillBtnText, catScale === undefined && styles.pillBtnTextActive]}>
+                                  共通
                                 </Text>
                               </TouchableOpacity>
-                            ))}
-                          </View>
-                        );
-                      })}
-                      <Text style={styles.demoHint}>
-                        カテゴリ別の合計金額を指定した場合はそちらが優先され、この倍率は使われません。
-                      </Text>
-                    </>
-                  )}
+                              {Demo.SCALE_OPTIONS.map((s) => (
+                                <TouchableOpacity
+                                  key={s}
+                                  style={[styles.pillBtn, catScale === s && styles.pillBtnActive]}
+                                  onPress={() => setCategoryScale(cat, s)}
+                                >
+                                  <Text style={[styles.pillBtnText, catScale === s && styles.pillBtnTextActive]}>
+                                    ×{s}
+                                  </Text>
+                                </TouchableOpacity>
+                              ))}
+                            </View>
+                          );
+                        })}
+                        <Text style={styles.demoHint}>
+                          カテゴリ別の合計金額を指定した場合はそちらが優先され、この倍率は使われません。
+                        </Text>
+                      </>
+                    )}
 
-                  <View style={[styles.cardRow, styles.cardRowBorder]}>
-                    <Text style={styles.cardRowLabel}>店名もぼかす</Text>
-                    <Switch
-                      value={demo.maskStore}
-                      onValueChange={(v) => patchDemo({ maskStore: v })}
-                      trackColor={{ false: '#ccc', true: '#a5d6a7' }}
-                      thumbColor={demo.maskStore ? '#2e7d32' : '#f4f3f4'}
-                    />
-                  </View>
-                  <View style={styles.cardRow}>
-                    <Text style={styles.cardRowLabel}>メモを隠す</Text>
-                    <Switch
-                      value={demo.hideMemo}
-                      onValueChange={(v) => patchDemo({ hideMemo: v })}
-                      trackColor={{ false: '#ccc', true: '#a5d6a7' }}
-                      thumbColor={demo.hideMemo ? '#2e7d32' : '#f4f3f4'}
-                    />
-                  </View>
-                </>
-              )}
-            </View>
+                    <View style={[styles.cardRow, styles.cardRowBorder]}>
+                      <Text style={styles.cardRowLabel}>店名もぼかす</Text>
+                      <Switch
+                        value={demo.maskStore}
+                        onValueChange={(v) => patchDemo({ maskStore: v })}
+                        trackColor={{ false: '#ccc', true: '#a5d6a7' }}
+                        thumbColor={demo.maskStore ? '#2e7d32' : '#f4f3f4'}
+                      />
+                    </View>
+                    <View style={styles.cardRow}>
+                      <Text style={styles.cardRowLabel}>メモを隠す</Text>
+                      <Switch
+                        value={demo.hideMemo}
+                        onValueChange={(v) => patchDemo({ hideMemo: v })}
+                        trackColor={{ false: '#ccc', true: '#a5d6a7' }}
+                        thumbColor={demo.hideMemo ? '#2e7d32' : '#f4f3f4'}
+                      />
+                    </View>
+                  </>
+                )}
+              </View>
+            )}
 
             {/* ユーザー */}
             <Text style={styles.sectionLabel}>このデバイスのユーザー</Text>

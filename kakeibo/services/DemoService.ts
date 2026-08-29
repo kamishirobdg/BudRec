@@ -9,10 +9,28 @@
  *   → デモ中に追加・編集・削除を実演しても実データは汚れない。アプリ再起動で消える。
  * - 同じ行はいつ見ても同じ偽金額になるように、行内容からハッシュで倍率を決める
  *   （リロードごとに金額が変わると不自然なため）。
+ *
+ * **現在は導線を畳んである（`DEMO_MODE_AVAILABLE = false`）。** 機能そのものは
+ * 一切削っていないので、また外部に見せる機会が来たらフラグを戻すだけで復活する。
  */
 
 import { getItem, setItem } from './Storage';
 import type { ExpenseRow } from './SheetsService';
+
+/**
+ * デモモードの導線（設定画面の ON/OFF ボタンと設定パネル）を出すかどうか。
+ *
+ * デモの利用期間が終わったので false にしてある。**機能は残してあるので、
+ * 再び使うときはここを true に戻すだけでよい**（設定画面の導線と、端末に
+ * 保存済みのデモ設定がそのまま復活する）。
+ *
+ * false の間は `loadConfig()` が `enabled` を強制的に false にする。導線が無い状態で
+ * デモに入ったままだと解除する手段が無くなるため。保存内容そのものは書き換えない。
+ *
+ * 型を `boolean` にしているのは、false リテラル型だと参照側が到達不能コード扱いされ、
+ * 復活させるときに気づきにくい警告が出るのを避けるため。
+ */
+export const DEMO_MODE_AVAILABLE: boolean = false;
 
 /** デモモード中に書き込みを試みたときに投げる */
 export class DemoModeError extends Error {
@@ -80,6 +98,10 @@ export async function loadConfig(): Promise<DemoConfig> {
   } catch {
     config = DEFAULT_CONFIG; // 壊れていたら初期値
   }
+  // 導線を畳んでいる間は、端末に enabled:true が残っていてもデモには入らない
+  // （設定画面のボタンが無いので、入ったままだと解除できなくなるため）。
+  // Storage は書き換えないので、DEMO_MODE_AVAILABLE を戻せば以前の設定のまま復活する。
+  if (!DEMO_MODE_AVAILABLE) config = { ...config, enabled: false };
   loaded = true;
   return config;
 }
