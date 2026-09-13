@@ -1,0 +1,100 @@
+name: Build Android APK
+
+on:
+  push:
+    branches:
+      - claude/competent-bose
+      - claude/reduce-google-relogin-MCMj8
+      - main
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: kakeibo/package-lock.json
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install dependencies
+        working-directory: kakeibo
+        run: npm ci
+
+      - name: Create .env
+        working-directory: kakeibo
+        env:
+          GEMINI_KEY: ${{ secrets.EXPO_PUBLIC_GEMINI_API_KEY }}
+          ANDROID_CLIENT_ID: ${{ secrets.EXPO_PUBLIC_GOOGLE_CLIENT_ID_ANDROID }}
+          WEB_CLIENT_ID: ${{ secrets.EXPO_PUBLIC_GOOGLE_CLIENT_ID_WEB }}
+          SPREADSHEET_ID: ${{ secrets.EXPO_PUBLIC_SPREADSHEET_ID }}
+        run: |
+          echo "EXPO_PUBLIC_GEMINI_API_KEY=$GEMINI_KEY" > .env
+          echo "EXPO_PUBLIC_GOOGLE_CLIENT_ID_ANDROID=$ANDROID_CLIENT_ID" >> .env
+          echo "EXPO_PUBLIC_GOOGLE_CLIENT_ID_WEB=$WEB_CLIENT_ID" >> .env
+          echo "EXPO_PUBLIC_SPREADSHEET_ID=$SPREADSHEET_ID" >> .env
+
+      - name: Verify .env keys and value lengths
+        working-directory: kakeibo
+        run: |
+          echo "=== .env contents (keys + value lengths) ==="
+          while IFS='=' read -r key value; do
+            echo "$key: ${#value} chars"
+          done < .env
+
+      - name: Expo prebuild (generate Android native code)
+        working-directory: kakeibo
+        run: npx expo prebuild --platform android --no-install
+
+      - name: Prepare signing keystore
+        working-directory: kakeibo
+        run: |
+          if [ -n "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" ]; then
+            echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > release.keystore
+            echo "KEYSTORE_PASSWORD=${{ secrets.ANDROID_KEYSTORE_PASSWORD }}" >> $GITHUB_ENV
+            echo "KEY_ALIAS=${{ secrets.ANDROID_KEY_ALIAS }}" >> $GITHUB_ENV
+            echo "KEY_PASSWORD=${{ secrets.ANDROID_KEY_PASSWORD }}" >> $GITHUB_ENV
+          else
+            keytool -genkeypair -v \
+              -keystore release.keystore \
+              -alias release \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass android -keypass android \
+              -dname "CN=BudRec,O=Android,C=JP"
+            echo "KEYSTORE_PASSWORD=android" >> $GITHUB_ENV
+            echo "KEY_ALIAS=release" >> $GITHUB_ENV
+            echo "KEY_PASSWORD=android" >> $GITHUB_ENV
+          fi
+
+      - name: Build release APK
+        working-directory: kakeibo/android
+        run: |
+          ./gradlew assembleRelease --no-daemon \
+            -Pandroid.injected.signing.store.file=$(realpath ../release.keystore) \
+            -Pandroid.injected.signing.store.password=${{ env.KEYSTORE_PASSWORD }} \
+            -Pandroid.injected.signing.key.alias=${{ env.KEY_ALIAS }} \
+            -Pandroid.injected.signing.key.password=${{ env.KEY_PASSWORD }}
+        env:
+          GRADLE_OPTS: '-Dorg.gradle.jvmargs=-Xmx4g'
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: bud-rec-release
+          path: kakeibo/android/app/build/outputs/apk/release/app-release.apk
+          retention-days: 14

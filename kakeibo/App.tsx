@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, Alert, AppState, View } from 'react-native';
+import { ActivityIndicator, Alert, Animated, AppState, StyleSheet, Text, View } from 'react-native';
 import { NavigationContainer } from '@react-navigation/native';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
@@ -8,19 +8,47 @@ import { Ionicons } from '@expo/vector-icons';
 import HomeScreen from './screens/HomeScreen';
 import CameraScreen from './screens/CameraScreen';
 import SummaryScreen from './screens/SummaryScreen';
-import { handleAuthCallback, isSignedIn } from './services/AuthService';
+import ErrorBoundary from './components/ErrorBoundary';
+import { handleAuthCallback, isSignedIn, AuthError } from './services/AuthService';
 import { runGmailImport } from './services/GmailService';
+import { flushWriteQueue } from './services/SheetsService';
+import { loadConfig as loadDemoConfig } from './services/DemoService';
 
 const Tab = createBottomTabNavigator();
 
 export default function App() {
+  return (
+    <ErrorBoundary>
+      <AppContent />
+    </ErrorBoundary>
+  );
+}
+
+/** アプリ本体。描画中に落ちたら外側の ErrorBoundary が受け止める */
+function AppContent() {
   const [signedIn, setSignedIn] = useState(false);
   const [checking, setChecking] = useState(true);
-  // Gmail 取り込みの最終実行時刻（ms）。5分以内の重複実行を防ぐ
   const lastGmailRunRef = useRef(0);
+
+  // OCR 処理中ステータスと成功トースト（画面遷移をまたいで表示するためここで管理）
+  const [ocrStatus, setOcrStatus] = useState('');
+  const [ocrToast,  setOcrToast]  = useState('');
+  const toastOpacity = useRef(new Animated.Value(0)).current;
+
+  useEffect(() => {
+    if (!ocrToast) return;
+    Animated.timing(toastOpacity, { toValue: 1, duration: 200, useNativeDriver: true }).start();
+    const timer = setTimeout(() => {
+      Animated.timing(toastOpacity, { toValue: 0, duration: 300, useNativeDriver: true })
+        .start(() => setOcrToast(''));
+    }, 3000);
+    return () => clearTimeout(timer);
+  }, [ocrToast, toastOpacity]);
 
   useEffect(() => {
     (async () => {
+      // デモモード設定を先に読む（各サービスが同期的に参照するため）
+      await loadDemoConfig();
       try {
         // Web リダイレクトからの戻りを処理（native では no-op）
         await handleAuthCallback();
@@ -39,20 +67,48 @@ export default function App() {
     const now = Date.now();
     if (now - lastGmailRunRef.current < COOLDOWN_MS) return;
     lastGmailRunRef.current = now;
-    runGmailImport();
+    runGmailImport().catch(async () => {
+      const ok = await isSignedIn();
+      if (!ok) setSignedIn(false);
+    });
+  };
+
+  /**
+   * 通信が戻ったであろうタイミングでの同期。
+   * 未送信の書き込みを先に片付けてから Gmail 取り込みを走らせる
+   * （逆順だと取り込みのリクエストで枠を使い切って未送信が残りやすい）。
+   */
+  const syncPending = () => {
+    flushWriteQueue()
+      .catch(async (e) => {
+        console.warn('[App] 未送信の書き込みを送れなかった:', e instanceof Error ? e.message : e);
+        // セッションが本当に切れている場合はサインアウト状態にして再ログインを促す
+        // （それ以外の一時的な失敗は WriteQueue に残ったまま次回の自動送信に任せる）
+        if (e instanceof AuthError) {
+          const ok = await isSignedIn();
+          if (!ok) setSignedIn(false);
+        }
+      })
+      .finally(() => maybeRunGmailImport());
   };
 
   // サインイン直後に実行
   useEffect(() => {
-    if (signedIn) maybeRunGmailImport();
+    if (signedIn) syncPending();
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [signedIn]);
 
-  // フォアグラウンド復帰時にも実行
+  // フォアグラウンド復帰時にも実行（トークン有効性を再確認してから）
   useEffect(() => {
     if (!signedIn) return;
-    const sub = AppState.addEventListener('change', (state) => {
-      if (state === 'active') maybeRunGmailImport();
+    const sub = AppState.addEventListener('change', async (state) => {
+      if (state !== 'active') return;
+      const ok = await isSignedIn();
+      if (!ok) {
+        setSignedIn(false);
+        return;
+      }
+      syncPending();
     });
     return () => sub.remove();
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -83,7 +139,16 @@ export default function App() {
                 ),
               }}
             >
-              {() => <CameraScreen />}
+              {() => (
+                // タブ単位でも囲む。片方の画面が落ちてももう片方は使えるようにする
+                <ErrorBoundary>
+                  <CameraScreen
+                    onSignedOut={() => setSignedIn(false)}
+                    onStatusChange={setOcrStatus}
+                    onSuccess={setOcrToast}
+                  />
+                </ErrorBoundary>
+              )}
             </Tab.Screen>
             <Tab.Screen
               name="Summary"
@@ -94,12 +159,77 @@ export default function App() {
                 ),
               }}
             >
-              {() => <SummaryScreen onSignedOut={() => setSignedIn(false)} />}
+              {() => (
+                <ErrorBoundary>
+                  <SummaryScreen onSignedOut={() => setSignedIn(false)} />
+                </ErrorBoundary>
+              )}
             </Tab.Screen>
           </Tab.Navigator>
         </NavigationContainer>
       )}
+      {/* OCR 処理中バナー（全画面共通） */}
+      {!!ocrStatus && (
+        <View style={styles.statusBanner} pointerEvents="none">
+          <ActivityIndicator color="#fff" size="small" />
+          <Text style={styles.statusBannerText}>{ocrStatus}</Text>
+        </View>
+      )}
+
+      {/* 成功トースト（全画面共通） */}
+      {!!ocrToast && (
+        <Animated.View style={[styles.toast, { opacity: toastOpacity }]} pointerEvents="none">
+          <Text style={styles.toastText}>{ocrToast}</Text>
+        </Animated.View>
+      )}
+
       <StatusBar style="auto" />
     </SafeAreaProvider>
   );
 }
+
+const styles = StyleSheet.create({
+  statusBanner: {
+    position:        'absolute',
+    top:             56,
+    left:            16,
+    right:           16,
+    flexDirection:   'row',
+    alignItems:      'center',
+    gap:             8,
+    backgroundColor: 'rgba(30,30,30,0.88)',
+    borderRadius:    10,
+    paddingHorizontal: 16,
+    paddingVertical:   10,
+    elevation:       10,
+    zIndex:          100,
+  },
+  statusBannerText: {
+    color:      '#fff',
+    fontSize:   14,
+    fontWeight: '600',
+  },
+  toast: {
+    position:        'absolute',
+    top:             56,
+    left:            16,
+    right:           16,
+    backgroundColor: 'rgba(34,197,94,0.95)',
+    borderRadius:    12,
+    paddingHorizontal: 20,
+    paddingVertical:   16,
+    elevation:       10,
+    zIndex:          100,
+    shadowColor:     '#000',
+    shadowOpacity:   0.3,
+    shadowRadius:    8,
+    shadowOffset:    { width: 0, height: 4 },
+  },
+  toastText: {
+    color:      '#fff',
+    fontSize:   16,
+    fontWeight: 'bold',
+    textAlign:  'center',
+    lineHeight: 22,
+  },
+});

@@ -4,6 +4,7 @@ import {
   Alert,
   Button,
   FlatList,
+  KeyboardAvoidingView,
   Modal,
   Pressable,
   RefreshControl,
@@ -20,23 +21,86 @@ import {
   ExpenseRow,
   RangeSpec,
   getDefaultPartialAmount,
+  getRows,
   getRowsForRange,
   getSheetNameFromDate,
+  sheetNameFromTimestamp,
   listAvailableYears,
   listMonthSheetNames,
   markRowDeleted,
   updateRow,
   updateRowFlags,
   updateRecurringFlag,
+  applyRecurringEntries,
+  flushWriteQueue,
 } from '../services/SheetsService';
+import { QueuedWriteError, useWriteQueue } from '../services/WriteQueueService';
+import * as WriteQueue from '../services/WriteQueueService';
+import * as RowsCache from '../services/RowsCacheService';
 import * as CategoryService from '../services/CategoryService';
 import { getCurrentUser } from '../services/UserService';
 import { detectDuplicateWarnings } from '../services/DuplicateDetector';
 import { useGmailProgress } from '../services/GmailProgressService';
-import { SortKey, getSortKey, setSortKey } from '../services/PreferencesService';
+import {
+  SortKey,
+  getSortKey,
+  setSortKey,
+  getRecurringAppliedMonth,
+  setRecurringAppliedMonth,
+} from '../services/PreferencesService';
+import { AuthError } from '../services/AuthService';
+import * as Demo from '../services/DemoService';
+import * as LastBatch from '../services/LastBatchService';
 import SettingsScreen from './SettingsScreen';
 import PersonalModal from './PersonalModal';
+import ReceiptReviewModal, { normalizeTimestampInput } from './ReceiptReviewModal';
 import MemoText from './MemoText';
+
+// ─── UI helpers ──────────────────────────────────────────────────────────────
+
+/**
+ * 未送信キューの追加行を一覧に重ねて表示するための型。
+ * サーバー側の行番号がまだ無いため rowIndex/sheetName は未設定のまま。
+ */
+interface DisplayRow extends ExpenseRow {
+  pendingWriteId?: string;
+}
+
+/** 編集前後で実質同じ行か（触られていない行を書き戻さないため） */
+function isSameEntry(a: ExpenseRow, b: ExpenseRow): boolean {
+  return a.timestamp === b.timestamp
+    && a.store === b.store
+    && a.category === b.category
+    && a.amount === b.amount
+    && a.memo === b.memo
+    && a.countedAmount === b.countedAmount;
+}
+
+function sourceLabel(s: string): string {
+  if (s === 'camera' || s === 'proxy_camera') return 'カメラ';
+  if (s === 'gmail')    return 'Gmail';
+  if (s === 'manual' || s === 'proxy_manual') return '手入力';
+  if (s === 'suica')    return 'Suica';
+  if (s === 'recurring') return '固定費';
+  return s;
+}
+
+function sourceBadgeColors(s: string): [string, string] {
+  if (s === 'gmail')    return ['#fce4ec', '#c62828'];
+  if (s === 'manual' || s === 'proxy_manual') return ['#f3e5f5', '#6a1b9a'];
+  if (s === 'recurring') return ['#e8f5e9', '#2e7d32'];
+  return ['#e3f2fd', '#1565c0'];
+}
+
+function formatTimestamp(ts: string): string {
+  const m = ts.match(/\d{4}[\/\-](\d{2})[\/\-](\d{2})\s+(\d{2}:\d{2})/);
+  return m ? `${m[1]}/${m[2]} ${m[3]}` : ts;
+}
+
+/** 一覧の初期表示件数・追加読み込み単位（全期間表示など件数が多いレンジで一気に描画しないため） */
+const PAGE_SIZE = 50;
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 interface Props {
   onSignedOut: () => void;
@@ -52,6 +116,9 @@ export default function SummaryScreen({ onSignedOut }: Props) {
   const navigation = useNavigation();
   const [rows, setRows]                     = useState<ExpenseRow[]>([]);
   const [loading, setLoading]               = useState(false);
+  const [loadError, setLoadError]           = useState<string | null>(null);
+  // 通信できず端末内キャッシュを表示しているときの案内文（null なら最新データ）
+  const [offlineNotice, setOfflineNotice]   = useState<string | null>(null);
   const [refreshing, setRefreshing]         = useState(false);
   const [defaultPartial, setDefaultPartial] = useState(1000);
   const [currentUser, setCurrentUserState]  = useState<string>('');
@@ -65,7 +132,19 @@ export default function SummaryScreen({ onSignedOut }: Props) {
   const [editTarget, setEditTarget]     = useState<ExpenseRow | null>(null);
   const [sortKey, setSortKeyState]      = useState<SortKey>('timestamp');
   const [sortPickerOpen, setSortPickerOpen] = useState(false);
+  const [catView, setCatView]           = useState<'total' | 'byUser'>('total');
+  const [demoMode, setDemoMode]         = useState(Demo.isDemoSync);
+  // カテゴリ別カードで選択中のカテゴリ（表示名。null なら絞り込みなし）
+  const [catFilter, setCatFilter]       = useState<string | null>(null);
+  // 店舗名・メモの検索（空なら絞り込みなし）
+  const [searchText, setSearchText]     = useState('');
   const gmailProgress                    = useGmailProgress();
+  // 送れずに端末へ退避した書き込み（バナーに件数を出す）
+  const queuedWrites                     = useWriteQueue();
+  const [flushing, setFlushing]          = useState(false);
+  // 「前回の登録」で開く確認・編集モーダル
+  const [lastBatchRows, setLastBatchRows] = useState<ExpenseRow[] | null>(null);
+  const [lastBatchBusy, setLastBatchBusy] = useState(false);
 
   // ソートキーを Storage から復元
   useEffect(() => {
@@ -107,16 +186,27 @@ export default function SummaryScreen({ onSignedOut }: Props) {
     return { type: 'month', yearMonth: getSheetNameFromDate() };
   }, [rangeOptions, rangeKey]);
 
+  // currentRange は rangeOptions の読み込み前後で「中身は同じでもオブジェクト参照が変わる」
+  // ことがある（フォールバック値→本来の値、など）。useEffect の依存に生の currentRange を使うと
+  // 起動直後に読み込みが2回走ってしまうため、内容ベースの文字列キーを別途用意する
+  const currentRangeSignature =
+    currentRange.type === 'month' ? `month:${currentRange.yearMonth}` :
+    currentRange.type === 'year'  ? `year:${currentRange.year}` :
+    'all';
+
   const currentRangeLabel = useMemo(() => {
     return rangeOptions.find((o) => o.key === rangeKey)?.label ?? '当月';
   }, [rangeOptions, rangeKey]);
 
   // 範囲オプションを作る（月一覧と年一覧をシートから取得）
   const buildRangeOptions = useCallback(async () => {
-    const [months, years] = await Promise.all([
-      listMonthSheetNames(),
-      listAvailableYears(),
-    ]);
+    let months: string[], years: string[];
+    try {
+      [months, years] = await Promise.all([listMonthSheetNames(), listAvailableYears()]);
+    } catch (e) {
+      if (e instanceof AuthError) { onSignedOut(); return; }
+      return; // 取得失敗時はデフォルト表示のまま
+    }
     const current = getSheetNameFromDate();
     // 当月が一覧に無くても先頭に置く
     const monthList = months.includes(current) ? months : [current, ...months];
@@ -134,21 +224,47 @@ export default function SummaryScreen({ onSignedOut }: Props) {
 
   const loadRows = useCallback(async (range: RangeSpec) => {
     setLoading(true);
+    // ユーザー名・デモ設定は端末ローカル読み出しのみ（通信不要）。
+    // Sheets 側が落ちていてもここは常に反映しておく（オフラインキャッシュの絞り込みに使うため）
+    let isDemo = false;
     try {
-      const [list, partial, user] = await Promise.all([
+      const [user, demo] = await Promise.all([getCurrentUser(), Demo.isDemo()]);
+      setCurrentUserState(user);
+      setDemoMode(demo);
+      isDemo = demo;
+    } catch (e) {
+      console.error('[SummaryScreen] ローカル設定の読み込み失敗:', e);
+    }
+    try {
+      const [list, partial] = await Promise.all([
         getRowsForRange(range),
         getDefaultPartialAmount(),
-        getCurrentUser(),
       ]);
       setRows(list);
       setDefaultPartial(partial);
-      setCurrentUserState(user);
+      setLoadError(null);
+      setOfflineNotice(null);
+      // デモ中の取得結果は名前・金額が偽装済みなので、実データ用キャッシュに混ぜない
+      if (!isDemo) RowsCache.save(range, list);
     } catch (e) {
-      Alert.alert('読み込み失敗', e instanceof Error ? e.message : String(e));
+      if (e instanceof AuthError) { onSignedOut(); return; }
+      const message = e instanceof Error ? e.message : String(e);
+      // 通信できなくても、この範囲を過去に開いたことがあれば端末内キャッシュを出す。
+      // デモ中は「デモの偽データ」と「実データ」の取り違えを避けるため使わない
+      const cached = isDemo ? null : RowsCache.get(range);
+      if (cached) {
+        setRows(cached.rows);
+        setLoadError(null);
+        setOfflineNotice(`通信できないため ${formatTimestamp(cached.savedAt)} 時点のデータを表示中`);
+      } else {
+        setLoadError(message);
+        setOfflineNotice(null);
+        Alert.alert('読み込み失敗', message);
+      }
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [onSignedOut]);
 
   useEffect(() => {
     buildRangeOptions();
@@ -156,7 +272,9 @@ export default function SummaryScreen({ onSignedOut }: Props) {
 
   useEffect(() => {
     loadRows(currentRange);
-  }, [loadRows, currentRange]);
+    // currentRange 自体ではなく内容ベースの signature を見る（上記コメント参照）
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loadRows, currentRangeSignature]);
 
   // Gmail 取り込みが完了して imported > 0 なら一覧を再取得
   const lastGmailFinishedRef = useRef(false);
@@ -169,13 +287,131 @@ export default function SummaryScreen({ onSignedOut }: Props) {
     } else if (!gmailProgress.finished) {
       lastGmailFinishedRef.current = false;
     }
-  }, [gmailProgress.finished, gmailProgress.result, loadRows, currentRange]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [gmailProgress.finished, gmailProgress.result, loadRows, currentRangeSignature]);
+
+  /** 設定を閉じる。デモモードの ON/OFF を即座に反映するため再読み込みする */
+  const closeSettings = () => {
+    setSettingsOpen(false);
+    loadRows(currentRange);
+  };
 
   const handleRefresh = async () => {
     setRefreshing(true);
     await Promise.all([buildRangeOptions(), loadRows(currentRange)]);
     setRefreshing(false);
   };
+
+  /** 未送信バナーのタップ: 溜まっている書き込みを今すぐ送る */
+  const handleFlushQueue = async () => {
+    if (flushing) return;
+    setFlushing(true);
+    try {
+      const { remaining } = await flushWriteQueue();
+      if (remaining > 0) {
+        Alert.alert(
+          'まだ送信できません',
+          `${remaining} 件が未送信のままです。通信状況を確認してから、もう一度お試しください。`,
+        );
+      }
+    } catch (e) {
+      if (e instanceof AuthError) { onSignedOut(); return; }
+      Alert.alert('送信失敗', e instanceof Error ? e.message : String(e));
+    } finally {
+      setFlushing(false);
+    }
+  };
+
+  /**
+   * 「前回の登録」: この端末から最後に入れた行をシートから探して確認・編集モーダルで開く。
+   * 表示中の期間とは関係なく、登録した月のシートを直接読む。
+   */
+  const handleOpenLastBatch = async () => {
+    if (lastBatchBusy) return;
+    const keys = LastBatch.getLastBatch();
+    if (keys.length === 0) {
+      Alert.alert('前回の登録', 'この端末から登録した記録がまだありません。');
+      return;
+    }
+
+    setLastBatchBusy(true);
+    try {
+      const sheets = [...new Set(keys.map((k) => k.sheetName))];
+      const lists  = await Promise.all(sheets.map((s) => getRows(s)));
+      // シートを読み直すので、まだ送れていない変更は反映されていない。そのまま編集させると
+      // 古い値で保存され、後からキューが流れて更にちぐはぐになるため、ここで重ねておく
+      const found  = LastBatch.pickBatchRows(lists.flat(), keys, WriteQueue.applyPendingTo);
+      if (found.length === 0) {
+        Alert.alert('前回の登録', '該当する明細が見つかりませんでした。削除されたか、内容が変更された可能性があります。');
+        return;
+      }
+      setLastBatchRows(found);
+    } catch (e) {
+      if (e instanceof AuthError) { onSignedOut(); return; }
+      Alert.alert('読み込み失敗', e instanceof Error ? e.message : String(e));
+    } finally {
+      setLastBatchBusy(false);
+    }
+  };
+
+  /** 「前回の登録」モーダルの保存。触られた行だけ書き戻す */
+  const handleLastBatchCommit = async (kept: ExpenseRow[], removed: ExpenseRow[]) => {
+    setLastBatchBusy(true);
+    let changed = 0;
+
+    try {
+      for (const row of kept) {
+        if (!row.sheetName || row.rowIndex === undefined) continue;
+        const before = lastBatchRows?.find(
+          (r) => r.sheetName === row.sheetName && r.rowIndex === row.rowIndex,
+        );
+        if (before && isSameEntry(before, row)) continue; // 触っていない行は送らない
+        try {
+          await updateRow(row.sheetName, row.rowIndex, row);
+          changed++;
+        } catch (e) {
+          if (!(e instanceof QueuedWriteError)) throw e;
+          changed++; // 端末に退避済み。未送信バナーで気づける
+        }
+      }
+
+      for (const row of removed) {
+        if (!row.sheetName || row.rowIndex === undefined) continue;
+        try {
+          await markRowDeleted(row.sheetName, row.rowIndex);
+          changed++;
+        } catch (e) {
+          if (!(e instanceof QueuedWriteError)) throw e;
+          changed++;
+        }
+      }
+
+      // 次に開いたときも同じ行を引けるよう、編集後の内容でキーを取り直す
+      if (kept.length > 0) LastBatch.saveLastBatch(kept);
+
+      setLastBatchRows(null);
+      if (changed > 0) loadRows(currentRange);
+    } catch (e) {
+      if (e instanceof AuthError) { onSignedOut(); return; }
+      Alert.alert('保存失敗', e instanceof Error ? e.message : String(e));
+    } finally {
+      setLastBatchBusy(false);
+    }
+  };
+
+  // 未送信が(一部でも)片付いたら一覧を取り直す（追加行の行番号はサーバー側で決まるため）。
+  // App 側の自動送信で片付いた場合もここで拾える。
+  // 件数が0になった時だけを見ていると、部分送信（例: 3件中2件成功）の直後に
+  // 送れた分が pendingAppendRows（表示専用）からは消えるのに rows にはまだ
+  // 反映されておらず、一覧から一時的に消えたように見える問題があったため、
+  // 「減った」ことを検知するようにした
+  const prevQueueCount = useRef(queuedWrites.length);
+  useEffect(() => {
+    const prev = prevQueueCount.current;
+    prevQueueCount.current = queuedWrites.length;
+    if (queuedWrites.length < prev) loadRows(currentRange);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [queuedWrites.length, loadRows, currentRangeSignature]);
 
   /** 行をローカルで更新しつつスプレッドシートにも反映 */
   const persistRow = async (
@@ -193,6 +429,9 @@ export default function SummaryScreen({ onSignedOut }: Props) {
     try {
       await updateRowFlags(row.sheetName, row.rowIndex, next);
     } catch (e) {
+      if (e instanceof AuthError) { onSignedOut(); return; }
+      // 端末に退避できた変更は巻き戻さない（未送信バナーで気づける）
+      if (e instanceof QueuedWriteError) return;
       Alert.alert('更新失敗', e instanceof Error ? e.message : String(e));
       loadRows(currentRange);
     }
@@ -236,6 +475,8 @@ export default function SummaryScreen({ onSignedOut }: Props) {
     try {
       await updateRecurringFlag(row.sheetName, row.rowIndex, next);
     } catch (e) {
+      if (e instanceof AuthError) { onSignedOut(); return; }
+      if (e instanceof QueuedWriteError) return;
       Alert.alert('更新失敗', e instanceof Error ? e.message : String(e));
       loadRows(currentRange);
     }
@@ -256,9 +497,32 @@ export default function SummaryScreen({ onSignedOut }: Props) {
     });
   };
 
-  // ─── 集計対象（自分の行のみ） ───
+  // ─── 固定費: 月初に未適用なら自動コピー ─────────────────────────────────────
+  const checkAndApplyRecurring = useCallback(async () => {
+    const currentMonth = getSheetNameFromDate();
+    try {
+      // デモ中は実行しない。適用済みフラグも立てない（デモ解除後に改めて走らせる）
+      if (await Demo.isDemo()) return;
+      const applied = await getRecurringAppliedMonth();
+      if (applied === currentMonth) return;
+      const count = await applyRecurringEntries();
+      await setRecurringAppliedMonth(currentMonth);
+      if (count > 0) loadRows(currentRange);
+    } catch (e) {
+      if (e instanceof AuthError) onSignedOut();
+    }
+  }, [currentRange, loadRows, onSignedOut]);
+
+  useEffect(() => {
+    checkAndApplyRecurring();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // 起動時1回のみ
+
+  // ─── 集計対象（自分の行 ＋ 自分が代理入力した行） ───
   const myRows = useMemo(() => {
-    const filtered = rows.filter((r) => r.user === currentUser);
+    const isProxyEntry = (r: ExpenseRow) =>
+      (r.source === 'proxy_camera' || r.source === 'proxy_manual') && r.user !== currentUser;
+    const filtered = rows.filter((r) => r.user === currentUser || isProxyEntry(r));
     const sorted = [...filtered];
     if (sortKey === 'timestamp') {
       sorted.sort((a, b) => (a.timestamp < b.timestamp ? 1 : -1));
@@ -269,6 +533,138 @@ export default function SummaryScreen({ onSignedOut }: Props) {
     }
     return sorted;
   }, [rows, currentUser, sortKey]);
+
+  /** カテゴリ表示名（空カテゴリは '未設定' に寄せる。絞り込みの照合キー） */
+  const catLabel = (c: string) => c || '未設定';
+
+  // 検索クエリ（店舗名・メモを対象、大小文字を区別しない）
+  const searchQuery = useMemo(() => searchText.trim().toLowerCase(), [searchText]);
+  const matchesSearch = useCallback(
+    (r: ExpenseRow) =>
+      searchQuery === '' ||
+      r.store.toLowerCase().includes(searchQuery) ||
+      r.memo.toLowerCase().includes(searchQuery),
+    [searchQuery],
+  );
+
+  // カテゴリ別カードで選択中のカテゴリ・検索語で絞った明細
+  const visibleRows = useMemo(() => {
+    let list = catFilter === null ? myRows : myRows.filter((r) => catLabel(r.category) === catFilter);
+    if (searchQuery !== '') list = list.filter(matchesSearch);
+    return list;
+  }, [myRows, catFilter, searchQuery, matchesSearch]);
+
+  // 未送信キューに溜まっている追加行（送信されるまでシートに存在せず rows には出てこない）。
+  // 表示中の範囲・自分の行に絞って一覧の先頭に重ねる。
+  // キューの中身はマスクされていない実データなので、デモ中は出さない（未送信バナーと同様の扱い）
+  const pendingAppendRows = useMemo<DisplayRow[]>(() => {
+    if (demoMode) return [];
+    const isProxyEntry = (r: ExpenseRow) =>
+      (r.source === 'proxy_camera' || r.source === 'proxy_manual') && r.user !== currentUser;
+    const matchesRange = (ts: string): boolean => {
+      const sheet = sheetNameFromTimestamp(ts);
+      if (currentRange.type === 'month') return sheet === currentRange.yearMonth;
+      if (currentRange.type === 'year')  return sheet.startsWith(`${currentRange.year}-`);
+      return true;
+    };
+    const out: DisplayRow[] = [];
+    for (const q of queuedWrites) {
+      if (q.op.kind !== 'append') continue;
+      const entry = q.op.entry;
+      if (entry.user !== currentUser && !isProxyEntry(entry)) continue;
+      if (!matchesRange(entry.timestamp)) continue;
+      if (catFilter !== null && catLabel(entry.category) !== catFilter) continue;
+      if (searchQuery !== '' && !matchesSearch(entry)) continue;
+      out.push({ ...entry, pendingWriteId: q.id });
+    }
+    return out;
+  }, [queuedWrites, currentRange, currentUser, catFilter, searchQuery, matchesSearch, demoMode]);
+
+  const displayRows = useMemo<DisplayRow[]>(
+    () => [...pendingAppendRows, ...visibleRows],
+    [pendingAppendRows, visibleRows],
+  );
+
+  // 一覧は段階的に描画する（全期間表示など件数が多いと一気に描画すると重いため）。
+  // 範囲・絞り込み・並び替えが変わったら先頭から出し直す
+  const [visibleCount, setVisibleCount] = useState(PAGE_SIZE);
+  useEffect(() => {
+    setVisibleCount(PAGE_SIZE);
+  }, [currentRangeSignature, catFilter, searchQuery, sortKey]);
+
+  const pagedRows = useMemo(
+    () => displayRows.slice(0, visibleCount),
+    [displayRows, visibleCount],
+  );
+
+  const handleLoadMore = useCallback(() => {
+    setVisibleCount((c) => (c < displayRows.length ? c + PAGE_SIZE : c));
+  }, [displayRows.length]);
+
+  // スクロールを待たず、裏で少しずつ自動的に読み進めておく（スクロールのたびに
+  // 読み込みが挟まると引っかかりを感じるため、先回りして表示済みにしておく）
+  useEffect(() => {
+    if (visibleCount >= displayRows.length) return;
+    const timer = setTimeout(() => {
+      setVisibleCount((c) => Math.min(c + PAGE_SIZE, displayRows.length));
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [visibleCount, displayRows.length]);
+
+  // ─── フロートのスクロールボタン（スクロールバーが機種によって見えづらいため） ───
+  const flatListRef       = useRef<FlatList<DisplayRow>>(null);
+  const scrollOffsetRef   = useRef(0);
+  const contentHeightRef  = useRef(0);
+  const viewportHeightRef = useRef(0);
+  // 「最下部へ」を押した時点で全件読み込めていなければ、読み込み終わってから1回だけ着地する
+  const [jumpToEndPending, setJumpToEndPending] = useState(false);
+  // 着地を待っている間に範囲・絞り込み・並び替えが変わったら、別のリストへの
+  // 意図しない自動スクロールを避けるため待機を取り消す
+  useEffect(() => {
+    setJumpToEndPending(false);
+  }, [currentRangeSignature, catFilter, searchQuery, sortKey]);
+
+  const handleScroll = useCallback((e: { nativeEvent: { contentOffset: { y: number } } }) => {
+    scrollOffsetRef.current = e.nativeEvent.contentOffset.y;
+  }, []);
+
+  const handleListLayout = useCallback((e: { nativeEvent: { layout: { height: number } } }) => {
+    viewportHeightRef.current = e.nativeEvent.layout.height;
+  }, []);
+
+  const handleContentSizeChange = useCallback((_w: number, h: number) => {
+    contentHeightRef.current = h;
+    if (jumpToEndPending && visibleCount >= displayRows.length) {
+      setJumpToEndPending(false);
+      flatListRef.current?.scrollToEnd({ animated: true });
+    }
+  }, [jumpToEndPending, visibleCount, displayRows.length]);
+
+  const scrollToTop = useCallback(() => {
+    flatListRef.current?.scrollToOffset({ offset: 0, animated: true });
+  }, []);
+
+  /** 現在位置から全体の10%ぶんだけ上/下へ動かす。着地後の補正はしない（1回押したら1回だけ動く） */
+  const scrollByPercent = useCallback((sign: 1 | -1) => {
+    const delta     = contentHeightRef.current * 0.1 * sign;
+    const maxOffset = Math.max(0, contentHeightRef.current - viewportHeightRef.current);
+    const target    = Math.min(maxOffset, Math.max(0, scrollOffsetRef.current + delta));
+    flatListRef.current?.scrollToOffset({ offset: target, animated: true });
+  }, []);
+
+  const handleJumpToEnd = useCallback(() => {
+    if (visibleCount >= displayRows.length) {
+      flatListRef.current?.scrollToEnd({ animated: true });
+    } else {
+      // 残りを一気に読み込んでから着地する（onContentSizeChange 側で実行）
+      setJumpToEndPending(true);
+      setVisibleCount(displayRows.length);
+    }
+  }, [visibleCount, displayRows.length]);
+
+  const toggleCatFilter = (label: string) => {
+    setCatFilter((prev) => (prev === label ? null : label));
+  };
 
   // 重複判定は全ユーザーの行を対象にする（夫婦間で同じ買い物を二人とも記録した
   // ケースも検出するため）。表示は myRows だが、key で照合するので問題ない。
@@ -292,124 +688,249 @@ export default function SummaryScreen({ onSignedOut }: Props) {
     };
   }, [rows]);
 
-  const renderHeader = () => (
-    <View style={styles.summaryBox}>
-      <View style={styles.rangeRow}>
-        <Text style={styles.rangeLabel}>範囲</Text>
-        <TouchableOpacity
-          style={styles.rangeButton}
-          onPress={() => setPickerOpen(true)}
-        >
-          <Text style={styles.rangeButtonText}>{currentRangeLabel} ▾</Text>
-        </TouchableOpacity>
-        <Text style={[styles.rangeLabel, { marginLeft: 8 }]}>並び</Text>
-        <TouchableOpacity
-          style={styles.rangeButton}
-          onPress={() => setSortPickerOpen(true)}
-        >
-          <Text style={styles.rangeButtonText}>{sortLabel(sortKey)} ▾</Text>
-        </TouchableOpacity>
+  // カテゴリ×ユーザー別集計（全ユーザー対象）
+  const summaryByUserCat = useMemo(() => {
+    const byCatUser = new Map<string, Map<string, number>>();
+    for (const r of rows) {
+      if (r.excluded) continue;
+      const cat = r.category || '未設定';
+      if (!byCatUser.has(cat)) byCatUser.set(cat, new Map());
+      const um = byCatUser.get(cat)!;
+      um.set(r.user, (um.get(r.user) ?? 0) + r.countedAmount);
+    }
+    return [...byCatUser.entries()]
+      .map(([cat, um]) => ({
+        cat,
+        total: [...um.values()].reduce((a, b) => a + b, 0),
+        users: [...um.entries()].sort((a, b) => b[1] - a[1]),
+      }))
+      .sort((a, b) => b.total - a.total);
+  }, [rows]);
+
+  const renderHeader = () => {
+    const maxCat = summary.categories[0]?.[1] ?? 1;
+    return (
+      <View>
+        {/* コントロール行 */}
+        <View style={styles.rangeRow}>
+          <Text style={styles.rangeLabel}>期間</Text>
+          <TouchableOpacity style={styles.rangeButton} onPress={() => setPickerOpen(true)}>
+            <Text style={styles.rangeButtonText}>{currentRangeLabel} ▾</Text>
+          </TouchableOpacity>
+          <Text style={[styles.rangeLabel, { marginLeft: 8 }]}>並び</Text>
+          <TouchableOpacity style={styles.rangeButton} onPress={() => setSortPickerOpen(true)}>
+            <Text style={styles.rangeButtonText}>{sortLabel(sortKey)} ▾</Text>
+          </TouchableOpacity>
+        </View>
+
+        {/* 合計カード */}
+        <View style={styles.totalCard}>
+          <Text style={styles.totalCardLabel}>{currentRangeLabel}の支出合計</Text>
+          <Text style={styles.totalCardAmount}>¥{summary.total.toLocaleString()}</Text>
+          {summary.users.length > 0 && (
+            <View style={styles.userPills}>
+              {summary.users.map(([u, v]) => (
+                <View key={u} style={styles.userPill}>
+                  <Text style={styles.userPillName}>{u || '未設定'}</Text>
+                  <Text style={styles.userPillAmount}>¥{v.toLocaleString()}</Text>
+                </View>
+              ))}
+            </View>
+          )}
+        </View>
+
+        {/* カテゴリ別 */}
+        {summary.categories.length > 0 && (
+          <View style={styles.catCard}>
+            {/* ヘッダー行: タイトル + 人別トグル */}
+            <View style={styles.catCardHeaderRow}>
+              <Text style={styles.catCardTitle}>カテゴリ別</Text>
+              <TouchableOpacity
+                style={[styles.catViewToggle, catView === 'byUser' && styles.catViewToggleActive]}
+                onPress={() => setCatView((v) => v === 'total' ? 'byUser' : 'total')}
+              >
+                <Text style={[styles.catViewToggleText, catView === 'byUser' && styles.catViewToggleTextActive]}>
+                  人別
+                </Text>
+              </TouchableOpacity>
+            </View>
+
+            {catView === 'total' ? (
+              /* ── 合計ビュー ── */
+              summary.categories.map(([c, v]) => {
+                const label = catLabel(c);
+                const selected = catFilter === label;
+                return (
+                  <TouchableOpacity
+                    key={c}
+                    style={[styles.catRow, selected && styles.catRowSelected]}
+                    onPress={() => toggleCatFilter(label)}
+                    activeOpacity={0.6}
+                  >
+                    <View style={styles.catRowLeft}>
+                      <Text style={[styles.catName, selected && styles.catNameSelected]}>
+                        {label}
+                      </Text>
+                      <View style={styles.catBarBg}>
+                        <View style={[styles.catBarFill, { width: `${Math.min(100, Math.round((v / maxCat) * 100))}%` as any }]} />
+                      </View>
+                    </View>
+                    <Text style={[styles.catAmount, selected && styles.catNameSelected]}>
+                      ¥{v.toLocaleString()}
+                    </Text>
+                  </TouchableOpacity>
+                );
+              })
+            ) : (
+              /* ── 人別ビュー ── */
+              summaryByUserCat.map(({ cat, total, users }) => {
+                const maxUser = users[0]?.[1] ?? 1;
+                const selected = catFilter === cat;
+                return (
+                  <View key={cat} style={[styles.catUserGroup, selected && styles.catRowSelected]}>
+                    <TouchableOpacity
+                      style={styles.catUserGroupHeader}
+                      onPress={() => toggleCatFilter(cat)}
+                      activeOpacity={0.6}
+                    >
+                      <Text style={[styles.catUserGroupName, selected && styles.catNameSelected]}>
+                        {cat}
+                      </Text>
+                      <Text style={[styles.catAmount, selected && styles.catNameSelected]}>
+                        ¥{total.toLocaleString()}
+                      </Text>
+                    </TouchableOpacity>
+                    {users.map(([user, amt]) => (
+                      <View key={user} style={styles.catUserRow}>
+                        <Text style={styles.catUserName}>{user}</Text>
+                        <View style={styles.catBarBg}>
+                          <View style={[styles.catUserBar, { width: `${Math.round((amt / maxUser) * 100)}%` as any }]} />
+                        </View>
+                        <Text style={styles.catUserAmt}>¥{amt.toLocaleString()}</Text>
+                      </View>
+                    ))}
+                  </View>
+                );
+              })
+            )}
+          </View>
+        )}
+
+        {/* 検索 */}
+        <View style={styles.searchRow}>
+          <Text style={styles.searchIcon}>🔍</Text>
+          <TextInput
+            style={styles.searchInput}
+            placeholder="店舗名・メモで検索"
+            placeholderTextColor="#999"
+            value={searchText}
+            onChangeText={setSearchText}
+            returnKeyType="search"
+          />
+          {searchText.length > 0 && (
+            <TouchableOpacity onPress={() => setSearchText('')} style={styles.searchClearBtn}>
+              <Text style={styles.searchClearBtnText}>✕</Text>
+            </TouchableOpacity>
+          )}
+        </View>
+
+        {/* 明細セクションヘッダー */}
+        <View style={styles.detailsHeader}>
+          <Text style={styles.detailsHeaderText}>
+            明細 — <Text style={styles.detailsHeaderUser}>{currentUser || '自分'}</Text>
+          </Text>
+          <View style={styles.detailsHeaderRight}>
+            {catFilter !== null && (
+              <TouchableOpacity
+                style={styles.filterChip}
+                onPress={() => setCatFilter(null)}
+                activeOpacity={0.7}
+              >
+                <Text style={styles.filterChipText}>{catFilter} ✕</Text>
+              </TouchableOpacity>
+            )}
+            {/* デモ中は実データを触らせない */}
+            {!demoMode && (
+              <TouchableOpacity
+                style={styles.lastBatchBtn}
+                onPress={handleOpenLastBatch}
+                disabled={lastBatchBusy}
+                activeOpacity={0.7}
+              >
+                <Text style={styles.lastBatchBtnText}>前回の登録</Text>
+              </TouchableOpacity>
+            )}
+          </View>
+        </View>
       </View>
+    );
+  };
 
-      <Text style={styles.summaryTotal}>合計 ¥{summary.total.toLocaleString()}</Text>
-
-      <Text style={styles.summarySection}>ユーザー別</Text>
-      {summary.users.length === 0 ? (
-        <Text style={styles.summaryEmpty}>データ無し</Text>
-      ) : (
-        summary.users.map(([u, v]) => (
-          <View key={u} style={styles.summaryRow}>
-            <Text style={styles.summaryLabel}>{u || '(未設定)'}</Text>
-            <Text style={styles.summaryValue}>¥{v.toLocaleString()}</Text>
-          </View>
-        ))
-      )}
-
-      <Text style={styles.summarySection}>カテゴリ別</Text>
-      {summary.categories.length === 0 ? (
-        <Text style={styles.summaryEmpty}>データ無し</Text>
-      ) : (
-        summary.categories.map(([c, v]) => (
-          <View key={c} style={styles.summaryRow}>
-            <Text style={styles.summaryLabel}>{c || '(未設定)'}</Text>
-            <Text style={styles.summaryValue}>¥{v.toLocaleString()}</Text>
-          </View>
-        ))
-      )}
-
-      <Text style={[styles.summarySection, { marginTop: 16 }]}>
-        明細（{currentUser || '自分'}）
-      </Text>
-    </View>
-  );
-
-  const renderItem = ({ item }: { item: ExpenseRow }) => {
+  const renderItem = ({ item }: { item: DisplayRow }) => {
+    const isPending = !!item.pendingWriteId;
     const isPartial = item.countedAmount !== item.amount;
     const struck = item.excluded ? styles.struck : undefined;
-    const key = `${item.sheetName ?? ''}:${item.rowIndex ?? ''}`;
+    const key = isPending ? `pending:${item.pendingWriteId}` : `${item.sheetName ?? ''}:${item.rowIndex ?? ''}`;
     const isExpanded = expanded.has(key);
-    const isWarned = warningKeys.has(key);
+    const isWarned = !isPending && warningKeys.has(key);
+    const isProxy = item.source === 'proxy_camera' || item.source === 'proxy_manual';
+    const [badgeBg, badgeColor] = sourceBadgeColors(item.source);
 
     return (
-      <View style={[styles.entry, item.excluded && styles.entryExcluded, isWarned && styles.entryWarned]}>
-        <View style={styles.entryHeader}>
-          <Text style={[styles.entryDate, struck]}>{item.timestamp}</Text>
-          <Text style={[styles.entryAmount, struck]}>
-            ¥{item.amount.toLocaleString()}
-          </Text>
+      <View style={[styles.entry, isProxy && styles.entryProxy, item.excluded && styles.entryExcluded, isWarned && styles.entryWarned, isPending && styles.entryPending]}>
+        {/* 上段: 日時・バッジ + 金額 */}
+        <View style={styles.entryTop}>
+          <View style={styles.entryMetaRow}>
+            <Text style={[styles.entryDate, struck]}>{formatTimestamp(item.timestamp)}</Text>
+            <View style={[styles.sourceBadge, { backgroundColor: badgeBg }]}>
+              <Text style={[styles.sourceBadgeText, { color: badgeColor }]}>{sourceLabel(item.source)}</Text>
+            </View>
+            {isProxy && (
+              <View style={styles.proxyBadge}>
+                <Text style={styles.proxyBadgeText}>{item.user}（代理）</Text>
+              </View>
+            )}
+            {isPending && (
+              <View style={styles.pendingBadge}>
+                <Text style={styles.pendingBadgeText}>送信待ち</Text>
+              </View>
+            )}
+          </View>
+          <Text style={[styles.entryAmount, struck]}>¥{item.amount.toLocaleString()}</Text>
         </View>
+
+        {/* 店舗 / カテゴリ */}
         <Text style={[styles.entryStore, struck]}>
           {item.store || '(店舗無し)'} / {item.category}
         </Text>
-        <Text style={[styles.entryMeta, struck]}>
-          {item.user} · {item.source}
-        </Text>
+
+        {/* ユーザー (代理でない場合) */}
+        {!isProxy && <Text style={[styles.entryMeta, struck]}>{item.user}</Text>}
+
+        {/* メモ */}
         {!!item.memo && (
           <TouchableOpacity onPress={() => toggleExpanded(key)} activeOpacity={0.6}>
-            <MemoText
-              memo={item.memo}
-              style={[styles.entryMemo, struck]}
-              numberOfLines={isExpanded ? undefined : 2}
-            />
+            <MemoText memo={item.memo} style={[styles.entryMemo, struck]} numberOfLines={isExpanded ? undefined : 2} />
           </TouchableOpacity>
         )}
 
-        <View style={styles.controls}>
-          <Checkbox
-            label="除外"
-            checked={item.excluded}
-            onPress={() => toggleExcluded(item)}
-          />
-          <Checkbox
-            label="一部計上"
-            checked={isPartial}
-            onPress={() => togglePartial(item)}
-          />
-          {isPartial && (
-            <PartialAmountInput
-              value={item.countedAmount}
-              onCommit={(t) => commitPartialAmount(item, t)}
-            />
-          )}
-          {isWarned && (
-            <Checkbox
-              label="確認済み"
-              checked={item.confirmed}
-              onPress={() => toggleConfirmed(item)}
-            />
-          )}
-          <Checkbox
-            label="固定費"
-            checked={item.recurring}
-            onPress={() => toggleRecurring(item)}
-          />
-          <TouchableOpacity
-            style={styles.editBtn}
-            onPress={() => setEditTarget(item)}
-          >
-            <Text style={styles.editBtnText}>編集</Text>
-          </TouchableOpacity>
-        </View>
+        {/* トグルチップ（送信待ちの行はまだサーバー上に無いので編集不可） */}
+        {isPending ? null : (
+          <View style={styles.controls}>
+            <ToggleChip label="除外" activeLabel="除外中" checked={item.excluded} onPress={() => toggleExcluded(item)} activeColor="#ef4444" />
+            <ToggleChip label="一部計上" checked={isPartial} onPress={() => togglePartial(item)} activeColor="#f59e0b" />
+            {isPartial && (
+              <PartialAmountInput value={item.countedAmount} onCommit={(t) => commitPartialAmount(item, t)} />
+            )}
+            {isWarned && (
+              <ToggleChip label="確認済み" checked={item.confirmed} onPress={() => toggleConfirmed(item)} activeColor="#8b5cf6" />
+            )}
+            <ToggleChip label="固定費" checked={item.recurring} onPress={() => toggleRecurring(item)} activeColor="#3b82f6" />
+            <TouchableOpacity style={styles.editBtn} onPress={() => setEditTarget(item)}>
+              <Text style={styles.editBtnText}>編集</Text>
+            </TouchableOpacity>
+          </View>
+        )}
       </View>
     );
   };
@@ -418,17 +939,22 @@ export default function SummaryScreen({ onSignedOut }: Props) {
     if (!updated.sheetName || updated.rowIndex === undefined) return;
     try {
       await updateRow(updated.sheetName, updated.rowIndex, updated);
-      setRows((prev) =>
-        prev.map((r) =>
-          r.sheetName === updated.sheetName && r.rowIndex === updated.rowIndex
-            ? updated
-            : r,
-        ),
-      );
-      setEditTarget(null);
     } catch (e) {
-      Alert.alert('保存失敗', e instanceof Error ? e.message : String(e));
+      if (e instanceof AuthError) { onSignedOut(); return; }
+      // 端末に退避できたなら画面上は保存できたものとして扱う
+      if (!(e instanceof QueuedWriteError)) {
+        Alert.alert('保存失敗', e instanceof Error ? e.message : String(e));
+        return;
+      }
     }
+    setRows((prev) =>
+      prev.map((r) =>
+        r.sheetName === updated.sheetName && r.rowIndex === updated.rowIndex
+          ? updated
+          : r,
+      ),
+    );
+    setEditTarget(null);
   };
 
   const handleDeleteEdit = (target: ExpenseRow) => {
@@ -444,16 +970,20 @@ export default function SummaryScreen({ onSignedOut }: Props) {
           onPress: async () => {
             try {
               await markRowDeleted(target.sheetName!, target.rowIndex!);
-              setRows((prev) =>
-                prev.filter(
-                  (r) =>
-                    !(r.sheetName === target.sheetName && r.rowIndex === target.rowIndex),
-                ),
-              );
-              setEditTarget(null);
             } catch (e) {
-              Alert.alert('削除失敗', e instanceof Error ? e.message : String(e));
+              if (e instanceof AuthError) { onSignedOut(); return; }
+              if (!(e instanceof QueuedWriteError)) {
+                Alert.alert('削除失敗', e instanceof Error ? e.message : String(e));
+                return;
+              }
             }
+            setRows((prev) =>
+              prev.filter(
+                (r) =>
+                  !(r.sheetName === target.sheetName && r.rowIndex === target.rowIndex),
+              ),
+            );
+            setEditTarget(null);
           },
         },
       ],
@@ -490,18 +1020,106 @@ export default function SummaryScreen({ onSignedOut }: Props) {
         </View>
       )}
 
+      {!!loadError && (
+        <TouchableOpacity
+          style={styles.errorBanner}
+          onPress={() => loadRows(currentRange)}
+          disabled={loading}
+        >
+          {loading && <ActivityIndicator color="#fff" size="small" />}
+          <Text style={styles.errorBannerText}>
+            {loading ? '再試行中...' : `読み込みに失敗しました（タップで再試行）: ${loadError}`}
+          </Text>
+        </TouchableOpacity>
+      )}
+
+      {!!offlineNotice && (
+        <TouchableOpacity
+          style={styles.offlineBanner}
+          onPress={() => loadRows(currentRange)}
+          disabled={loading}
+        >
+          {loading && <ActivityIndicator color="#fff" size="small" />}
+          <Text style={styles.offlineBannerText}>
+            {loading ? '再取得中...' : `${offlineNotice}（タップで再取得）`}
+          </Text>
+        </TouchableOpacity>
+      )}
+
+      {/* デモ中は送信しないのでバナーも出さない（見せている画面に出すと紛らわしい） */}
+      {!demoMode && queuedWrites.length > 0 && (
+        <TouchableOpacity
+          style={styles.queueBanner}
+          onPress={handleFlushQueue}
+          disabled={flushing}
+        >
+          {flushing && <ActivityIndicator color="#fff" size="small" />}
+          <Text style={styles.queueBannerText}>
+            {flushing
+              ? '未送信の変更を送信中...'
+              : `未送信の変更が ${queuedWrites.length} 件（この一覧には未反映・タップで送信）`}
+          </Text>
+        </TouchableOpacity>
+      )}
+
       <FlatList
-        data={myRows}
-        keyExtractor={(r) => `${r.sheetName ?? ''}:${r.rowIndex ?? r.timestamp}`}
+        ref={flatListRef}
+        data={pagedRows}
+        keyExtractor={(r) => (r.pendingWriteId ? `pending:${r.pendingWriteId}` : `${r.sheetName ?? ''}:${r.rowIndex ?? r.timestamp}`)}
         renderItem={renderItem}
-        ListHeaderComponent={renderHeader}
+        ListHeaderComponent={renderHeader()}
+        contentContainerStyle={styles.listContent}
+        persistentScrollbar
+        onScroll={handleScroll}
+        scrollEventThrottle={16}
+        onLayout={handleListLayout}
+        onContentSizeChange={handleContentSizeChange}
         ListEmptyComponent={
-          <Text style={styles.empty}>データがありません</Text>
+          <Text style={styles.empty}>
+            {searchQuery !== ''
+              ? '検索条件に一致する明細はありません'
+              : catFilter === null
+                ? 'データがありません'
+                : `${catFilter} の明細はありません`}
+          </Text>
         }
+        ListFooterComponent={
+          pagedRows.length < displayRows.length ? (
+            <View style={styles.loadMoreHint}>
+              <ActivityIndicator size="small" color="#999" />
+              <Text style={styles.loadMoreHintText}>
+                {pagedRows.length} / {displayRows.length} 件表示中（読み込み中...）
+              </Text>
+            </View>
+          ) : null
+        }
+        onEndReached={handleLoadMore}
+        onEndReachedThreshold={0.5}
+        initialNumToRender={20}
+        maxToRenderPerBatch={20}
+        windowSize={10}
         refreshControl={
           <RefreshControl refreshing={refreshing} onRefresh={handleRefresh} />
         }
       />
+
+      <View style={styles.scrollFloatTop} pointerEvents="box-none">
+        <TouchableOpacity style={styles.scrollFloatBtn} onPress={scrollToTop} activeOpacity={0.7}>
+          <Text style={styles.scrollFloatBtnText}>⤒</Text>
+        </TouchableOpacity>
+        <TouchableOpacity style={styles.scrollFloatBtn} onPress={() => scrollByPercent(-1)} activeOpacity={0.7}>
+          <Text style={styles.scrollFloatBtnText}>↑</Text>
+        </TouchableOpacity>
+      </View>
+
+      <View style={styles.scrollFloatBottom} pointerEvents="box-none">
+        <TouchableOpacity style={styles.scrollFloatBtn} onPress={() => scrollByPercent(1)} activeOpacity={0.7}>
+          <Text style={styles.scrollFloatBtnText}>↓</Text>
+        </TouchableOpacity>
+        <TouchableOpacity style={styles.scrollFloatBtn} onPress={handleJumpToEnd} activeOpacity={0.7}>
+          <Text style={styles.scrollFloatBtnText}>⤓</Text>
+        </TouchableOpacity>
+      </View>
 
       <RangePickerModal
         visible={pickerOpen}
@@ -524,12 +1142,12 @@ export default function SummaryScreen({ onSignedOut }: Props) {
       <Modal
         visible={settingsOpen}
         animationType="slide"
-        onRequestClose={() => setSettingsOpen(false)}
+        onRequestClose={() => closeSettings()}
       >
         <SafeAreaView style={{ flex: 1, backgroundColor: '#fff' }}>
           <View style={styles.modalHeader}>
             <Text style={styles.modalHeaderTitle}>設定</Text>
-            <Button title="閉じる" onPress={() => setSettingsOpen(false)} />
+            <Button title="閉じる" onPress={closeSettings} />
           </View>
           <SettingsScreen
             onSignedOut={() => {
@@ -550,6 +1168,17 @@ export default function SummaryScreen({ onSignedOut }: Props) {
       <PersonalModal
         visible={personalOpen}
         onClose={() => setPersonalOpen(false)}
+      />
+
+      {/* 直近に登録した明細をまとめて見直す */}
+      <ReceiptReviewModal
+        visible={lastBatchRows !== null}
+        title="前回の登録"
+        rows={lastBatchRows ?? []}
+        mode="edit"
+        busy={lastBatchBusy}
+        onClose={() => setLastBatchRows(null)}
+        onCommit={handleLastBatchCommit}
       />
     </SafeAreaView>
   );
@@ -572,6 +1201,34 @@ function Checkbox({
         {checked && <Text style={styles.boxMark}>✓</Text>}
       </View>
       <Text style={styles.checkboxLabel}>{label}</Text>
+    </TouchableOpacity>
+  );
+}
+
+function ToggleChip({
+  label,
+  activeLabel,
+  checked,
+  onPress,
+  activeColor = '#ef4444',
+}: {
+  label:        string;
+  activeLabel?: string;
+  checked:      boolean;
+  onPress:      () => void;
+  activeColor?: string;
+}) {
+  const r = parseInt(activeColor.slice(1, 3), 16);
+  const g = parseInt(activeColor.slice(3, 5), 16);
+  const b = parseInt(activeColor.slice(5, 7), 16);
+  const bg = checked ? `rgba(${r},${g},${b},0.12)` : '#f5f5f5';
+  const col = checked ? activeColor : '#888';
+  return (
+    <TouchableOpacity style={[styles.toggleChip, { backgroundColor: bg }]} onPress={onPress}>
+      <View style={[styles.toggleDot, checked && { backgroundColor: col, borderColor: col }]} />
+      <Text style={[styles.toggleChipText, { color: col }]}>
+        {checked && activeLabel ? activeLabel : label}
+      </Text>
     </TouchableOpacity>
   );
 }
@@ -654,9 +1311,16 @@ function EditEntryModal({
       Alert.alert('入力エラー', '金額が不正です');
       return;
     }
+    // 保存形式は 'YYYY/MM/DD HH:MM:SS'（sheetNameFromTimestamp 等が正規表現で前提にしている）。
+    // 自由入力のまま保存すると月シートの判定・重複検出が静かに壊れるため、ここで検証・正規化する
+    const normalizedTimestamp = normalizeTimestampInput(timestamp);
+    if (normalizedTimestamp === null) {
+      Alert.alert('入力エラー', '日時の形式が不正です（例: 2026-08-09 12:34）');
+      return;
+    }
     onSave({
       ...target,
-      timestamp,
+      timestamp: normalizedTimestamp,
       source,
       user,
       store,
@@ -710,69 +1374,92 @@ function EditEntryModal({
           <Text style={styles.modalHeaderTitle}>明細編集</Text>
           <Button title="閉じる" onPress={onClose} />
         </View>
-        <ScrollView contentContainerStyle={styles.editForm}>
-          <Field label="日時 (YYYY-MM-DD HH:MM)" value={timestamp} onChangeText={setTimestamp} />
-          <Field label="取込元 (source)" value={source} onChangeText={setSource} />
-          <Field label="ユーザー" value={user} onChangeText={setUser} />
-          <Field label="店舗" value={store} onChangeText={setStore} />
-
-          {/* カテゴリはプルダウン選択 */}
-          <View style={styles.fieldBox}>
-            <Text style={styles.fieldLabel}>カテゴリ</Text>
-            <TouchableOpacity
-              style={styles.pickerButton}
-              onPress={() => setCategoryPickerOpen(true)}
-            >
-              <Text style={styles.pickerButtonText}>
-                {category || '(未選択)'} ▾
-              </Text>
-            </TouchableOpacity>
-          </View>
-
-          <Field
-            label="金額"
-            value={amount}
-            onChangeText={setAmount}
-            keyboardType="number-pad"
-          />
-          <Field
-            label="計上金額"
-            value={countedAmount}
-            onChangeText={setCountedAmount}
-            keyboardType="number-pad"
-          />
-          <Field
-            label="メモ"
-            value={memo}
-            onChangeText={setMemo}
-            multiline
-          />
-
-          <TouchableOpacity
-            style={styles.checkbox}
-            onPress={() => setExcluded((v) => !v)}
-          >
-            <View style={[styles.box, excluded && styles.boxChecked]}>
-              {excluded && <Text style={styles.boxMark}>✓</Text>}
+        <KeyboardAvoidingView style={{ flex: 1 }} behavior="height">
+          <ScrollView contentContainerStyle={styles.editForm} keyboardShouldPersistTaps="handled">
+            {/* 読み取り専用フィールド */}
+            <View style={styles.readOnlyGroup}>
+              <View style={styles.readOnlyRow}>
+                <Text style={styles.readOnlyLabel}>取込元</Text>
+                <View style={styles.readOnlyValueRow}>
+                  {(() => { const [bg, col] = sourceBadgeColors(source); return (
+                    <View style={[styles.sourceBadge, { backgroundColor: bg }]}>
+                      <Text style={[styles.sourceBadgeText, { color: col }]}>{sourceLabel(source)}</Text>
+                    </View>
+                  ); })()}
+                  <Text style={styles.readOnlyNote}>変更不可</Text>
+                </View>
+              </View>
+              <View style={[styles.readOnlyRow, { borderBottomWidth: 0 }]}>
+                <Text style={styles.readOnlyLabel}>ユーザー</Text>
+                <View style={styles.readOnlyValueRow}>
+                  <Text style={styles.readOnlyValue}>{user}</Text>
+                  <Text style={styles.readOnlyNote}>変更不可</Text>
+                </View>
+              </View>
             </View>
-            <Text style={styles.checkboxLabel}>集計から除外</Text>
-          </TouchableOpacity>
+            <Field label="日時 (YYYY-MM-DD HH:MM)" value={timestamp} onChangeText={setTimestamp} />
+            <Field label="店舗" value={store} onChangeText={setStore} />
 
-          <View style={{ height: 16 }} />
-          <Button title="保存" onPress={handleSave} />
+            {/* カテゴリはプルダウン選択 */}
+            <View style={styles.fieldBox}>
+              <Text style={styles.fieldLabel}>カテゴリ</Text>
+              <TouchableOpacity
+                style={styles.pickerButton}
+                onPress={() => setCategoryPickerOpen(true)}
+              >
+                <Text style={styles.pickerButtonText}>
+                  {category || '(未選択)'} ▾
+                </Text>
+              </TouchableOpacity>
+            </View>
 
-          <View style={{ height: 24 }} />
-          <TouchableOpacity
-            style={styles.deleteBtn}
-            onPress={() => onDelete(target)}
-          >
-            <Text style={styles.deleteBtnText}>この明細を削除</Text>
-          </TouchableOpacity>
+            <Field
+              label="金額"
+              value={amount}
+              onChangeText={setAmount}
+              keyboardType="number-pad"
+            />
+            <Field
+              label="計上金額"
+              value={countedAmount}
+              onChangeText={setCountedAmount}
+              keyboardType="number-pad"
+            />
+            <Field
+              label="メモ"
+              value={memo}
+              onChangeText={setMemo}
+              multiline
+            />
 
-          <Text style={styles.editNote}>
-            ※ 日時の月を変更しても行は元のシート（{target.sheetName}）のまま残ります
-          </Text>
-        </ScrollView>
+            <TouchableOpacity
+              style={styles.checkbox}
+              onPress={() => setExcluded((v) => !v)}
+            >
+              <View style={[styles.box, excluded && styles.boxChecked]}>
+                {excluded && <Text style={styles.boxMark}>✓</Text>}
+              </View>
+              <Text style={styles.checkboxLabel}>集計から除外</Text>
+            </TouchableOpacity>
+
+            <View style={{ height: 8 }} />
+            <TouchableOpacity style={styles.saveBtn} onPress={handleSave}>
+              <Text style={styles.saveBtnText}>保存する</Text>
+            </TouchableOpacity>
+
+            <View style={{ height: 24 }} />
+            <TouchableOpacity
+              style={styles.deleteBtn}
+              onPress={() => onDelete(target)}
+            >
+              <Text style={styles.deleteBtnText}>この明細を削除</Text>
+            </TouchableOpacity>
+
+            <Text style={styles.editNote}>
+              ※ 日時の月を変更しても行は元のシート（{target.sheetName}）のまま残ります
+            </Text>
+          </ScrollView>
+        </KeyboardAvoidingView>
       </SafeAreaView>
 
       {/* カテゴリ選択モーダル */}
@@ -994,125 +1681,242 @@ function RangePickerModal({
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#fff' },
-  center:    { flex: 1, backgroundColor: '#fff', alignItems: 'center', justifyContent: 'center' },
-  empty:     { textAlign: 'center', color: '#888', marginTop: 24 },
+  // ─── レイアウト ───────────────────────────────────────────────────────────
+  container: { flex: 1, backgroundColor: '#f2f4f7' },
+  center:    { flex: 1, backgroundColor: '#f2f4f7', alignItems: 'center', justifyContent: 'center' },
+  empty:     { textAlign: 'center', color: '#888', marginTop: 24, marginHorizontal: 16 },
+  loadMoreHint: { flexDirection: 'row', justifyContent: 'center', alignItems: 'center', gap: 8, paddingVertical: 16 },
+  loadMoreHintText: { color: '#999', fontSize: 12 },
 
-  summaryBox: {
-    padding: 16,
-    backgroundColor: '#f7f7f9',
-    borderBottomWidth: 1,
-    borderBottomColor: '#eee',
+  // 右下フロートボタン（最下部へ/↓10%）の下に最後の明細の操作ボタンが隠れないよう余白を確保
+  listContent: { paddingBottom: 100 },
+
+  // ─── フロートのスクロールボタン ───
+  scrollFloatTop:    { position: 'absolute', top: 10, right: 12, gap: 8 },
+  scrollFloatBottom: { position: 'absolute', bottom: 12, right: 12, gap: 8 },
+  scrollFloatBtn: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: 'rgba(46, 125, 50, 0.85)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    elevation: 4,
+    shadowColor: '#000',
+    shadowOpacity: 0.2,
+    shadowRadius: 4,
+    shadowOffset: { width: 0, height: 2 },
   },
+  scrollFloatBtnText: { color: '#fff', fontSize: 18, fontWeight: 'bold' },
+
+  // ─── コントロール行 ───────────────────────────────────────────────────────
   rangeRow: {
     flexDirection: 'row',
     alignItems:    'center',
     gap:           8,
-    marginBottom:  8,
-  },
-  rangeLabel:      { fontSize: 13, color: '#444' },
-  rangeButton: {
-    paddingHorizontal: 12,
-    paddingVertical:   6,
-    backgroundColor:   '#fff',
-    borderWidth:       1,
-    borderColor:       '#ccc',
-    borderRadius:      6,
-  },
-  rangeButtonText: { fontSize: 14, color: '#222' },
-
-  summaryTotal:   { fontSize: 22, fontWeight: 'bold', color: '#2563eb', marginBottom: 12 },
-  summarySection: { fontSize: 14, fontWeight: 'bold', color: '#444', marginTop: 8, marginBottom: 4 },
-  summaryEmpty:   { fontSize: 13, color: '#888' },
-  summaryRow:     { flexDirection: 'row', justifyContent: 'space-between', paddingVertical: 2 },
-  summaryLabel:   { fontSize: 14, color: '#222' },
-  summaryValue:   { fontSize: 14, color: '#222' },
-
-  entry: {
     paddingHorizontal: 16,
     paddingVertical:   12,
+    backgroundColor:   '#fff',
     borderBottomWidth: 1,
-    borderBottomColor: '#eee',
+    borderBottomColor: '#f0f0f0',
+  },
+  rangeLabel:      { fontSize: 13, color: '#666' },
+  rangeButton: {
+    paddingHorizontal: 12,
+    paddingVertical:    5,
+    backgroundColor:   '#f5f5f5',
+    borderWidth:        1,
+    borderColor:       '#e0e0e0',
+    borderRadius:      20,
+  },
+  rangeButtonText: { fontSize: 13, color: '#333' },
+
+  // ─── 合計カード ───────────────────────────────────────────────────────────
+  totalCard: {
+    margin: 16,
+    marginBottom: 0,
+    backgroundColor: '#2e7d32',
+    borderRadius: 20,
+    padding: 20,
+  },
+  totalCardLabel:  { fontSize: 12, color: 'rgba(255,255,255,0.8)', marginBottom: 4 },
+  totalCardAmount: { fontSize: 30, fontWeight: '700', color: '#fff', letterSpacing: -0.5, marginBottom: 16 },
+  userPills:       { flexDirection: 'row', gap: 10 },
+  userPill: {
+    flex: 1,
+    backgroundColor: 'rgba(255,255,255,0.2)',
+    borderRadius: 12,
+    padding: 10,
+  },
+  userPillName:   { fontSize: 12, color: 'rgba(255,255,255,0.85)', marginBottom: 2 },
+  userPillAmount: { fontSize: 15, fontWeight: '700', color: '#fff' },
+
+  // ─── カテゴリカード ───────────────────────────────────────────────────────
+  catCard: {
+    margin: 16,
+    marginBottom: 0,
+    backgroundColor: '#fff',
+    borderRadius: 16,
+    overflow: 'hidden',
+  },
+  catCardHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: '#f5f5f5',
+  },
+  catCardTitle: { fontSize: 14, fontWeight: '700', color: '#333' },
+  catViewToggle: {
+    paddingHorizontal: 12,
+    paddingVertical: 4,
+    borderRadius: 14,
+    backgroundColor: '#f5f5f5',
+    borderWidth: 1,
+    borderColor: '#e0e0e0',
+  },
+  catViewToggleActive:     { backgroundColor: '#2e7d32', borderColor: '#2e7d32' },
+  catViewToggleText:       { fontSize: 12, color: '#666', fontWeight: '600' },
+  catViewToggleTextActive: { color: '#fff' },
+
+  catRow:    { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, paddingVertical: 10, gap: 12 },
+  catRowLeft: { flex: 1, gap: 4 },
+  catRowSelected: { backgroundColor: '#e8f5e9' },
+  catNameSelected: { color: '#2e7d32', fontWeight: '700' },
+  catName:   { fontSize: 13, color: '#333' },
+  catBarBg:  { height: 4, backgroundColor: '#f0f0f0', borderRadius: 2 },
+  catBarFill: { height: 4, backgroundColor: '#2e7d32', borderRadius: 2 },
+  catAmount: { fontSize: 14, fontWeight: '600', color: '#333' },
+
+  // カテゴリ×人別
+  catUserGroup:      { borderBottomWidth: 1, borderBottomColor: '#f5f5f5', paddingBottom: 8 },
+  catUserGroupHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingHorizontal: 16, paddingTop: 10, paddingBottom: 4 },
+  catUserGroupName:  { fontSize: 13, fontWeight: '700', color: '#333' },
+  catUserRow:  { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, paddingVertical: 4, gap: 8 },
+  catUserName: { fontSize: 12, color: '#666', width: 64 },
+  catUserBar:  { height: 4, backgroundColor: '#43a047', borderRadius: 2 },
+  catUserAmt:  { fontSize: 12, fontWeight: '600', color: '#555' },
+
+  // ─── 明細ヘッダー ─────────────────────────────────────────────────────────
+  searchRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginTop: 16,
+    marginHorizontal: 16,
+    backgroundColor: '#fff',
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#e0e0e0',
+    paddingHorizontal: 12,
+  },
+  searchIcon: { fontSize: 14, color: '#999', marginRight: 6 },
+  searchInput: { flex: 1, height: 40, fontSize: 14, color: '#333' },
+  searchClearBtn: { paddingHorizontal: 6, paddingVertical: 6 },
+  searchClearBtnText: { fontSize: 14, color: '#999', fontWeight: 'bold' },
+
+  detailsHeader: {
+    marginTop: 16,
+    marginHorizontal: 16,
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    backgroundColor: '#fff',
+    borderTopLeftRadius: 16,
+    borderTopRightRadius: 16,
+    borderBottomWidth: 1,
+    borderBottomColor: '#f0f0f0',
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 8,
+  },
+  detailsHeaderText: { fontSize: 14, fontWeight: '700', color: '#333' },
+  detailsHeaderUser: { color: '#2e7d32' },
+  detailsHeaderRight: { flexDirection: 'row', alignItems: 'center', gap: 8, flexShrink: 1 },
+  lastBatchBtn: {
+    borderWidth: 1,
+    borderColor: '#2e7d32',
+    borderRadius: 14,
+    paddingHorizontal: 12,
+    paddingVertical: 5,
+  },
+  lastBatchBtnText: { color: '#2e7d32', fontSize: 12, fontWeight: '600' },
+  filterChip: {
+    backgroundColor: '#e8f5e9',
+    borderWidth: 1,
+    borderColor: '#2e7d32',
+    borderRadius: 14,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+  },
+  filterChipText: { fontSize: 12, color: '#2e7d32', fontWeight: '600' },
+
+  // ─── 明細カード ───────────────────────────────────────────────────────────
+  entry: {
+    paddingHorizontal: 16,
+    paddingVertical:   14,
+    backgroundColor:   '#fff',
+    marginHorizontal:  16,
+    borderBottomWidth: 1,
+    borderBottomColor: '#f5f5f5',
   },
   entryExcluded: { backgroundColor: '#fafafa' },
-  entryWarned:   { backgroundColor: '#ffedd5' },
-  entryHeader:   { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
-  entryDate:     { fontSize: 12, color: '#666' },
-  entryAmount:   { fontSize: 16, fontWeight: 'bold' },
-  entryStore:    { fontSize: 15, marginTop: 2 },
-  entryMeta:     { fontSize: 12, color: '#888', marginTop: 2 },
-  entryMemo:     { fontSize: 12, color: '#666', marginTop: 2 },
-  struck:        { textDecorationLine: 'line-through', color: '#999' },
+  entryWarned:   { backgroundColor: '#fff7ed' },
+  entryProxy:    { backgroundColor: '#f0fdf4' },
 
-  controls: {
-    flexDirection: 'row',
-    alignItems:    'center',
-    flexWrap:      'wrap',
-    gap:           12,
-    marginTop:     8,
-  },
-  checkbox:      { flexDirection: 'row', alignItems: 'center', gap: 6 },
-  checkboxLabel: { fontSize: 13 },
-  box: {
-    width:        18,
-    height:       18,
-    borderWidth:  1,
-    borderColor:  '#888',
-    borderRadius: 3,
-    alignItems:   'center',
-    justifyContent: 'center',
-  },
-  boxChecked: { backgroundColor: '#2563eb', borderColor: '#2563eb' },
-  boxMark:    { color: '#fff', fontSize: 12, lineHeight: 14 },
+  entryTop:     { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 6 },
+  entryMetaRow: { flexDirection: 'row', alignItems: 'center', gap: 5, flex: 1, flexWrap: 'wrap' },
+  entryDate:    { fontSize: 12, color: '#999' },
+  entryAmount:  { fontSize: 17, fontWeight: '700', color: '#1a1a1a' },
+  entryStore:   { fontSize: 15, fontWeight: '600', color: '#1a1a1a', marginBottom: 2 },
+  entryMeta:    { fontSize: 12, color: '#888', marginBottom: 4 },
+  entryMemo:    { fontSize: 12, color: '#aaa', marginTop: 4 },
+  struck:       { textDecorationLine: 'line-through', color: '#bbb' },
+
+  // ─── バッジ ───────────────────────────────────────────────────────────────
+  sourceBadge:     { paddingHorizontal: 7, paddingVertical: 2, borderRadius: 8 },
+  sourceBadgeText: { fontSize: 10, fontWeight: '500' },
+  proxyBadge:      { paddingHorizontal: 7, paddingVertical: 2, borderRadius: 8, backgroundColor: '#dcfce7' },
+  proxyBadgeText:  { fontSize: 10, fontWeight: '500', color: '#166534' },
+
+  // ─── トグルチップ ─────────────────────────────────────────────────────────
+  controls: { flexDirection: 'row', alignItems: 'center', flexWrap: 'wrap', gap: 6, marginTop: 10 },
+  toggleChip:     { flexDirection: 'row', alignItems: 'center', gap: 4, paddingHorizontal: 10, paddingVertical: 5, borderRadius: 12 },
+  toggleDot:      { width: 8, height: 8, borderRadius: 4, borderWidth: 1.5, borderColor: '#ccc' },
+  toggleChipText: { fontSize: 11 },
 
   partialInput: {
     borderWidth: 1,
-    borderColor: '#ccc',
-    borderRadius: 4,
+    borderColor: '#e0e0e0',
+    borderRadius: 8,
     paddingHorizontal: 8,
     paddingVertical: 4,
     fontSize: 14,
     minWidth: 80,
     textAlign: 'right',
+    backgroundColor: '#fff',
   },
 
-  modalBackdrop: {
-    flex: 1,
-    backgroundColor: 'rgba(0,0,0,0.4)',
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  modalSheet: {
-    backgroundColor: '#fff',
-    borderRadius: 12,
-    width: '80%',
-    maxHeight: '70%',
-    paddingVertical: 12,
-  },
+  editBtn:     { marginLeft: 'auto' as any, paddingHorizontal: 14, paddingVertical: 5, backgroundColor: '#f5f5f5', borderRadius: 10 },
+  editBtnText: { fontSize: 12, color: '#555', fontWeight: '600' },
+
+  // ─── モーダル共通 ─────────────────────────────────────────────────────────
+  modalBackdrop: { flex: 1, backgroundColor: 'rgba(0,0,0,0.4)', justifyContent: 'center', alignItems: 'center' },
+  modalSheet:    { backgroundColor: '#fff', borderRadius: 16, width: '85%', maxHeight: '70%', paddingVertical: 12 },
   modalTitle: {
     fontSize: 16,
     fontWeight: 'bold',
     paddingHorizontal: 16,
-    paddingBottom: 8,
+    paddingBottom: 10,
     borderBottomWidth: 1,
     borderBottomColor: '#eee',
   },
-  modalItem: {
-    paddingHorizontal: 16,
-    paddingVertical: 12,
-  },
-  modalItemSelected: { backgroundColor: '#eaf2ff' },
-  modalItemText: { fontSize: 15, color: '#222' },
-  modalItemTextSelected: { color: '#2563eb', fontWeight: 'bold' },
-
-  editBtn: {
-    paddingHorizontal: 12,
-    paddingVertical:   4,
-    borderWidth:       1,
-    borderColor:       '#2563eb',
-    borderRadius:      4,
-  },
-  editBtnText: { fontSize: 13, color: '#2563eb' },
+  modalItem:             { paddingHorizontal: 16, paddingVertical: 12 },
+  modalItemSelected:     { backgroundColor: '#e8f5e9' },
+  modalItemText:         { fontSize: 15, color: '#222' },
+  modalItemTextSelected: { color: '#2e7d32', fontWeight: 'bold' },
+  modalItemTextAdd:      { color: '#2e7d32', fontWeight: 'bold' },
 
   modalHeader: {
     flexDirection: 'row',
@@ -1122,53 +1926,111 @@ const styles = StyleSheet.create({
     paddingVertical: 12,
     borderBottomWidth: 1,
     borderBottomColor: '#eee',
+    backgroundColor: '#fff',
   },
-  modalHeaderTitle: { fontSize: 18, fontWeight: 'bold' },
+  modalHeaderTitle: { fontSize: 18, fontWeight: '700' },
 
-  editForm: { padding: 16 },
-  fieldBox:   { marginBottom: 12 },
-  fieldLabel: { fontSize: 12, color: '#666', marginBottom: 4 },
+  // ─── 編集フォーム ─────────────────────────────────────────────────────────
+  editForm: { padding: 16, backgroundColor: '#f2f4f7', gap: 0 },
+
+  readOnlyGroup: { backgroundColor: '#fff', borderRadius: 14, overflow: 'hidden', marginBottom: 12 },
+  readOnlyRow:   { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: '#f5f5f5', gap: 10 },
+  readOnlyLabel:    { fontSize: 13, color: '#888', width: 60 },
+  readOnlyValueRow: { flexDirection: 'row', alignItems: 'center', gap: 8, flex: 1 },
+  readOnlyValue:    { fontSize: 15, color: '#333' },
+  readOnlyNote:     { fontSize: 10, backgroundColor: '#f5f5f5', color: '#999', paddingHorizontal: 6, paddingVertical: 2, borderRadius: 6 },
+
+  fieldBox:        { marginBottom: 12 },
+  fieldLabel:      { fontSize: 12, color: '#666', marginBottom: 4 },
   fieldInput: {
     borderWidth: 1,
-    borderColor: '#ccc',
-    borderRadius: 6,
-    paddingHorizontal: 12,
-    paddingVertical: 8,
+    borderColor: '#e0e0e0',
+    borderRadius: 12,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
     fontSize: 15,
+    backgroundColor: '#fff',
   },
   fieldInputMulti: { minHeight: 80, textAlignVertical: 'top' },
-  editNote: { fontSize: 11, color: '#888', marginTop: 12 },
+  editNote:        { fontSize: 11, color: '#999', marginTop: 12, lineHeight: 16 },
 
   pickerButton: {
     borderWidth: 1,
-    borderColor: '#ccc',
-    borderRadius: 6,
-    paddingHorizontal: 12,
+    borderColor: '#e0e0e0',
+    borderRadius: 12,
+    paddingHorizontal: 14,
     paddingVertical: 10,
     backgroundColor: '#fff',
   },
   pickerButtonText: { fontSize: 15, color: '#222' },
 
-  modalItemTextAdd: { color: '#2563eb', fontWeight: 'bold' },
+  saveBtn:     { backgroundColor: '#2e7d32', borderRadius: 14, paddingVertical: 14, alignItems: 'center', marginTop: 4 },
+  saveBtnText: { color: '#fff', fontSize: 16, fontWeight: '700' },
 
-  deleteBtn: {
-    borderWidth: 1,
-    borderColor: '#dc2626',
-    borderRadius: 6,
-    paddingVertical: 10,
+  deleteBtn:     { borderWidth: 1, borderColor: '#dc2626', borderRadius: 12, paddingVertical: 12, alignItems: 'center', backgroundColor: '#fff' },
+  deleteBtnText: { fontSize: 15, color: '#dc2626', fontWeight: '600' },
+
+  // ─── チェックボックス (編集モーダル内) ───────────────────────────────────
+  checkbox:      { flexDirection: 'row', alignItems: 'center', gap: 8, paddingVertical: 4 },
+  checkboxLabel: { fontSize: 14, color: '#333' },
+  box: {
+    width: 20,
+    height: 20,
+    borderWidth: 1.5,
+    borderColor: '#ccc',
+    borderRadius: 4,
     alignItems: 'center',
-    backgroundColor: '#fff',
+    justifyContent: 'center',
   },
-  deleteBtnText: { fontSize: 15, color: '#dc2626', fontWeight: 'bold' },
+  boxChecked: { backgroundColor: '#2e7d32', borderColor: '#2e7d32' },
+  boxMark:    { color: '#fff', fontSize: 13, lineHeight: 15 },
 
+  // ─── Gmail バナー ─────────────────────────────────────────────────────────
   gmailBanner: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 10,
-    backgroundColor: '#2563eb',
+    backgroundColor: '#1d4ed8',
     paddingHorizontal: 14,
     paddingVertical: 8,
   },
   gmailBannerDone: { backgroundColor: '#16a34a' },
   gmailBannerText: { color: '#fff', fontSize: 13, fontWeight: 'bold', flexShrink: 1 },
+  queueBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    backgroundColor: '#b45309',
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+  },
+  queueBannerText: { color: '#fff', fontSize: 13, fontWeight: 'bold', flexShrink: 1 },
+  errorBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    backgroundColor: '#dc2626',
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+  },
+  errorBannerText: { color: '#fff', fontSize: 13, fontWeight: 'bold', flexShrink: 1 },
+  offlineBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    backgroundColor: '#475569',
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+  },
+  offlineBannerText: { color: '#fff', fontSize: 13, fontWeight: 'bold', flexShrink: 1 },
+
+  // ─── 送信待ち行 ───────────────────────────────────────────────────────────
+  entryPending: { opacity: 0.65, borderStyle: 'dashed', borderWidth: 1, borderColor: '#b45309' },
+  pendingBadge: {
+    backgroundColor: '#fef3c7',
+    borderRadius: 8,
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+  },
+  pendingBadgeText: { fontSize: 11, fontWeight: 'bold', color: '#b45309' },
 });
