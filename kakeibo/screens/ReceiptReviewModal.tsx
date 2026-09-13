@@ -13,6 +13,7 @@ import {
   Alert,
   Button,
   FlatList,
+  KeyboardAvoidingView,
   Modal,
   Pressable,
   ScrollView,
@@ -166,74 +167,84 @@ export default function ReceiptReviewModal({
           <Button title="閉じる" onPress={onClose} disabled={busy} />
         </View>
 
-        <ScrollView contentContainerStyle={styles.body} keyboardShouldPersistTaps="handled">
-          <Text style={styles.lead}>
-            {mode === 'confirm'
-              ? `${draft.length}件を読み取りました。内容を確認してください。`
-              : '直した内容はスプレッドシートに反映されます。日時の月を変えても行は元のシートに残ります。'}
-          </Text>
-
-          {draft.map((d, i) => (
-            <View key={`${d.row.sheetName ?? ''}:${d.row.rowIndex ?? i}`} style={[styles.card, d.removed && styles.cardRemoved]}>
-              <View style={styles.cardHead}>
-                <Text style={styles.cardIndex}>{i + 1}件目</Text>
-                <TouchableOpacity style={styles.removeBtn} onPress={() => toggleRemoved(i)}>
-                  <Text style={[styles.removeBtnText, d.removed && styles.restoreBtnText]}>
-                    {d.removed ? '戻す' : mode === 'confirm' ? '登録しない' : '削除する'}
-                  </Text>
-                </TouchableOpacity>
-              </View>
-
-              {d.removed ? (
-                <Text style={styles.removedNote}>
-                  {mode === 'confirm' ? 'この明細は登録しません' : 'この明細を削除します'}
-                  {'  '}
-                  {d.store || '(店名なし)'} ¥{d.row.amount.toLocaleString()}
-                </Text>
-              ) : (
-                <>
-                  <Field
-                    label="日時"
-                    value={d.timestamp}
-                    onChangeText={(v) => patch(i, { timestamp: v })}
-                    placeholder="2026/08/07 12:34"
-                  />
-                  <Field label="店舗" value={d.store} onChangeText={(v) => patch(i, { store: v })} />
-
-                  <View style={styles.fieldBox}>
-                    <Text style={styles.fieldLabel}>カテゴリ</Text>
-                    <TouchableOpacity style={styles.pickerBtn} onPress={() => setPickerFor(i)}>
-                      <Text style={styles.pickerBtnText}>{d.category || '(未選択)'} ▾</Text>
-                    </TouchableOpacity>
-                  </View>
-
-                  <Field
-                    label="金額"
-                    value={d.amount}
-                    onChangeText={(v) => patch(i, { amount: v })}
-                    keyboardType="number-pad"
-                  />
-                  <Field
-                    label="メモ"
-                    value={d.memo}
-                    onChangeText={(v) => patch(i, { memo: v })}
-                    multiline
-                  />
-                </>
-              )}
-            </View>
-          ))}
-        </ScrollView>
-
-        <View style={styles.footer}>
-          <TouchableOpacity
-            style={[styles.primaryBtn, busy && styles.primaryBtnDisabled]}
-            onPress={handleCommit}
-            disabled={busy}
+        {/* Android では Modal が別ウィンドウ扱いになり windowSoftInputMode=adjustResize が
+            効かない。包まないと、件数が多いときに下のカードの金額・メモがキーボードに
+            隠れて見えなくなる（明細編集モーダルと同じ対策）。
+            フッターも中に入れて、キーボードが出ている間は登録ボタンがその上に来るようにする */}
+        <KeyboardAvoidingView style={styles.fill} behavior="height">
+          <ScrollView
+            style={styles.fill}
+            contentContainerStyle={styles.body}
+            keyboardShouldPersistTaps="handled"
           >
-            <Text style={styles.primaryBtnText}>{commitLabel}</Text>
-          </TouchableOpacity>
-        </View>
+            <Text style={styles.lead}>
+              {mode === 'confirm'
+                ? `${draft.length}件を読み取りました。内容を確認してください。`
+                : '直した内容はスプレッドシートに反映されます。日時の月を変えても行は元のシートに残ります。'}
+            </Text>
+
+            {draft.map((d, i) => (
+              <View key={`${d.row.sheetName ?? ''}:${d.row.rowIndex ?? i}`} style={[styles.card, d.removed && styles.cardRemoved]}>
+                <View style={styles.cardHead}>
+                  <Text style={styles.cardIndex}>{i + 1}件目</Text>
+                  <TouchableOpacity style={styles.removeBtn} onPress={() => toggleRemoved(i)}>
+                    <Text style={[styles.removeBtnText, d.removed && styles.restoreBtnText]}>
+                      {d.removed ? '戻す' : mode === 'confirm' ? '登録しない' : '削除する'}
+                    </Text>
+                  </TouchableOpacity>
+                </View>
+
+                {d.removed ? (
+                  <Text style={styles.removedNote}>
+                    {mode === 'confirm' ? 'この明細は登録しません' : 'この明細を削除します'}
+                    {'  '}
+                    {d.store || '(店名なし)'} ¥{d.row.amount.toLocaleString()}
+                  </Text>
+                ) : (
+                  <>
+                    <Field
+                      label="日時"
+                      value={d.timestamp}
+                      onChangeText={(v) => patch(i, { timestamp: v })}
+                      placeholder="2026/08/07 12:34"
+                    />
+                    <Field label="店舗" value={d.store} onChangeText={(v) => patch(i, { store: v })} />
+
+                    <View style={styles.fieldBox}>
+                      <Text style={styles.fieldLabel}>カテゴリ</Text>
+                      <TouchableOpacity style={styles.pickerBtn} onPress={() => setPickerFor(i)}>
+                        <Text style={styles.pickerBtnText}>{d.category || '(未選択)'} ▾</Text>
+                      </TouchableOpacity>
+                    </View>
+
+                    <Field
+                      label="金額"
+                      value={d.amount}
+                      onChangeText={(v) => patch(i, { amount: v })}
+                      keyboardType="number-pad"
+                    />
+                    <Field
+                      label="メモ"
+                      value={d.memo}
+                      onChangeText={(v) => patch(i, { memo: v })}
+                      multiline
+                    />
+                  </>
+                )}
+              </View>
+            ))}
+          </ScrollView>
+
+          <View style={styles.footer}>
+            <TouchableOpacity
+              style={[styles.primaryBtn, busy && styles.primaryBtnDisabled]}
+              onPress={handleCommit}
+              disabled={busy}
+            >
+              <Text style={styles.primaryBtnText}>{commitLabel}</Text>
+            </TouchableOpacity>
+          </View>
+        </KeyboardAvoidingView>
       </SafeAreaView>
 
       {/* カテゴリ選択 */}
@@ -333,6 +344,7 @@ export function normalizeTimestampInput(input: string): string | null {
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#f2f4f7' },
+  fill:      { flex: 1 },
   header: {
     flexDirection: 'row',
     alignItems: 'center',

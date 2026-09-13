@@ -5,6 +5,7 @@ import {
   Button,
   FlatList,
   Image,
+  KeyboardAvoidingView,
   Modal,
   Pressable,
   ScrollView,
@@ -745,70 +746,79 @@ function ManualEntryModal({
           <Button title="閉じる" onPress={onClose} />
         </View>
 
-        <ScrollView contentContainerStyle={styles.manualScroll}>
-          <Image
-            source={{ uri: imageUri }}
-            style={styles.manualImage}
-            resizeMode="contain"
-          />
-
-          <View style={styles.fieldBox}>
-            <Text style={styles.fieldLabel}>日時</Text>
-            <TextInput
-              style={styles.fieldInput}
-              value={timestamp}
-              onChangeText={setTimestamp}
-              placeholder="YYYY/MM/DD HH:MM:SS"
+        {/* Modal 内では Android の adjustResize が効かないため、キーボードぶんの高さを
+            自前で削る。包まないと下部の金額・メモがキーボードに隠れて見えない
+            （明細編集・読み取り確認モーダルと同じ対策） */}
+        <KeyboardAvoidingView style={styles.fill} behavior="height">
+          <ScrollView
+            style={styles.fill}
+            contentContainerStyle={styles.manualScroll}
+            keyboardShouldPersistTaps="handled"
+          >
+            <Image
+              source={{ uri: imageUri }}
+              style={styles.manualImage}
+              resizeMode="contain"
             />
-          </View>
 
-          <View style={styles.fieldBox}>
-            <Text style={styles.fieldLabel}>店舗</Text>
-            <TextInput
-              style={styles.fieldInput}
-              value={store}
-              onChangeText={setStore}
-            />
-          </View>
+            <View style={styles.fieldBox}>
+              <Text style={styles.fieldLabel}>日時</Text>
+              <TextInput
+                style={styles.fieldInput}
+                value={timestamp}
+                onChangeText={setTimestamp}
+                placeholder="YYYY/MM/DD HH:MM:SS"
+              />
+            </View>
 
-          <View style={styles.fieldBox}>
-            <Text style={styles.fieldLabel}>カテゴリ</Text>
-            <TouchableOpacity
-              style={styles.pickerButton}
-              onPress={() => setCategoryPickerOpen(true)}
-            >
-              <Text style={styles.pickerButtonText}>
-                {category || '(未選択)'} ▾
-              </Text>
-            </TouchableOpacity>
-          </View>
+            <View style={styles.fieldBox}>
+              <Text style={styles.fieldLabel}>店舗</Text>
+              <TextInput
+                style={styles.fieldInput}
+                value={store}
+                onChangeText={setStore}
+              />
+            </View>
 
-          <View style={styles.fieldBox}>
-            <Text style={styles.fieldLabel}>金額</Text>
-            <TextInput
-              style={styles.fieldInput}
-              value={amount}
-              onChangeText={setAmount}
-              keyboardType="number-pad"
-            />
-          </View>
+            <View style={styles.fieldBox}>
+              <Text style={styles.fieldLabel}>カテゴリ</Text>
+              <TouchableOpacity
+                style={styles.pickerButton}
+                onPress={() => setCategoryPickerOpen(true)}
+              >
+                <Text style={styles.pickerButtonText}>
+                  {category || '(未選択)'} ▾
+                </Text>
+              </TouchableOpacity>
+            </View>
 
-          <View style={styles.fieldBox}>
-            <Text style={styles.fieldLabel}>メモ</Text>
-            <TextInput
-              style={[styles.fieldInput, { minHeight: 60, textAlignVertical: 'top' }]}
-              value={memo}
-              onChangeText={setMemo}
-              multiline
-            />
-          </View>
+            <View style={styles.fieldBox}>
+              <Text style={styles.fieldLabel}>金額</Text>
+              <TextInput
+                style={styles.fieldInput}
+                value={amount}
+                onChangeText={setAmount}
+                keyboardType="number-pad"
+              />
+            </View>
 
-          <View style={{ height: 8 }} />
-          <Button title="保存" onPress={handleSave} />
-          <Text style={styles.manualNote}>
-            ※ 保存後にレシート画像は削除されます
-          </Text>
-        </ScrollView>
+            <View style={styles.fieldBox}>
+              <Text style={styles.fieldLabel}>メモ</Text>
+              <TextInput
+                style={[styles.fieldInput, { minHeight: 60, textAlignVertical: 'top' }]}
+                value={memo}
+                onChangeText={setMemo}
+                multiline
+              />
+            </View>
+
+            <View style={{ height: 8 }} />
+            <Button title="保存" onPress={handleSave} />
+            <Text style={styles.manualNote}>
+              ※ 保存後にレシート画像は削除されます
+            </Text>
+          </ScrollView>
+        </KeyboardAvoidingView>
       </SafeAreaView>
 
       {/* カテゴリ選択モーダル */}
@@ -1172,6 +1182,7 @@ const styles = StyleSheet.create({
     borderBottomColor: '#eee',
   },
   modalHeaderTitle: { fontSize: 18, fontWeight: 'bold' },
+  fill: { flex: 1 },
   manualScroll: { padding: 16 },
   manualImage: {
     width: '100%',
