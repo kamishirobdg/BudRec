@@ -1050,28 +1050,47 @@ export async function resetSkippedNotTransactionIds(): Promise<number> {
 }
 
 /**
- * 直近シートに存在するユーザー名一覧を返す（実際にシートに入っている名前）。
+ * シートに実際に入っているユーザー名の一覧を返す。
+ * 当月シートを見て、1 人分しか居なければ前月シートも足す
+ * （月が替わった直後は相手がまだ 1 件も記録しておらず代理入力が使えないため）。
  * デモモードでもマスクしないので、表示用途には getUniqueUsers() を使うこと。
- * デモモードの表示名対応表を作るための入力として使う。
  */
 export async function getUniqueUsersRaw(): Promise<string[]> {
-  const sheetName = getSheetNameFromDate();
   const client = await createClient();
+
+  const users = await readUsersFromSheet(client, getSheetNameFromDate());
+
+  // 当月に 1 人分しか記録が無いと代理入力の相手が出てこない。
+  // 月が替わった直後は毎月この状態になるので、前月シートも見て補う。
+  if (users.size <= 1) {
+    const now  = new Date();
+    const prev = getSheetNameFromDate(new Date(now.getFullYear(), now.getMonth() - 1, 1));
+    for (const u of await readUsersFromSheet(client, prev)) users.add(u);
+  }
+
+  return [...users];
+}
+
+/** 指定シートの C 列（user）に現れる名前を集める。シートが無ければ空集合 */
+async function readUsersFromSheet(
+  client: AxiosInstance,
+  sheetName: string,
+): Promise<Set<string>> {
+  const users = new Set<string>();
   try {
     const res = await client.get(`/values/${encodeURIComponent(sheetName)}!C:C`);
     const rows: string[][] = res.data.values ?? [];
-    const users = new Set<string>();
     for (let i = 1; i < rows.length; i++) {
       const cell = rows[i]?.[0];
       if (cell && cell.trim()) users.add(cell.trim());
     }
-    return [...users];
   } catch {
-    return [];
+    // シートが無い・読めない場合は何も足さない
   }
+  return users;
 }
 
-/** 直近シートに存在するユーザー名一覧を返す。代理入力対象の選択に使用 */
+/** シートに存在するユーザー名一覧を返す。代理入力の相手を選ぶのに使う */
 export async function getUniqueUsers(): Promise<string[]> {
   const users = await getUniqueUsersRaw();
   if (!(await Demo.isDemo())) return users;
