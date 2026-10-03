@@ -149,7 +149,7 @@ Hermes エンジンでは `new Date('2026/07/30 12:00:00')` が **NaN** にな�
   相手の候補は**シートに実際に入っている名前**から拾う（下記「代理入力の相手の集め方」参照）
 - **固定費の月初自動作成**（下記参照）
 - **初回起動時のユーザー名入力**（`screens/UserSetupScreen.tsx`、2026-10-03。下記参照）
-- サインイン画面（`screens/HomeScreen.tsx`）は 💰 ロゴ＋「Bud-Rec」＋緑の Google サインインボタン（v1.6.2。未ビルド）
+- サインイン画面（`screens/HomeScreen.tsx`）は 💰 ロゴ＋「Bud-Rec」＋緑の Google サインインボタン（v1.6.2。2026-10-04 EAS ビルドの APK で実機確認済み）
 - 設定: 端末ユーザー名、Gmail 連携、カテゴリ追加/削除、サインアウト
 - **デモモード**（外部にアプリを見せる用。**現在は導線を非表示。** 下記参照）
 - **通信エラーへの耐性**: 429/5xx の自動リトライ、送れなかった書き込みの退避と自動再送、
@@ -448,6 +448,11 @@ Sheets / Gmail は 429（クォータ超過）や 5xx を普通に返す。3 段
 遡及は「前月 → 当月」の 1 世代分だけ初回起動時に自動適用される。
 
 ## 6. ビルド・配布
+
+> **2026-10-04 時点で GitHub Actions のビルドは壊れている。** `android-actions/setup-android@v3` が既定で入れる
+> SDK の `tools` パッケージが提供終了し、`Failed to find package 'tools'` で 20 秒以内に失敗する。
+> `build-apk.yml` の `uses: android-actions/setup-android@v3` に `with: packages: 'platform-tools'` を足せば
+> 直る見込み（PAT の制約で Web UI から編集する必要あり）。当面のビルドは EAS（`preview` プロファイル）で行う。
 
 `.github/workflows/build-apk.yml` が `claude/reduce-google-relogin-MCMj8` / `claude/competent-bose` /
 `main` への push、または手動実行（workflow_dispatch）で走る。所要 **約 26 分**。
