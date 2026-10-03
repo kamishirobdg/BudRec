@@ -31,6 +31,9 @@ jobs:
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          # 既定値の 'tools platform-tools' のうち 'tools' は SDK から削除されており失敗する
+          packages: 'platform-tools'
 
       - name: Install dependencies
         working-directory: kakeibo
@@ -70,6 +73,7 @@ jobs:
             echo "KEY_ALIAS=${{ secrets.ANDROID_KEY_ALIAS }}" >> $GITHUB_ENV
             echo "KEY_PASSWORD=${{ secrets.ANDROID_KEY_PASSWORD }}" >> $GITHUB_ENV
           else
+            echo "::warning::ANDROID_KEYSTORE_BASE64 が未設定です。使い捨てキーストアで署名するため、このAPKを入れる前に旧アプリのアンインストールが必要になり、保存済みのGoogleログインも消えます。"
             keytool -genkeypair -v \
               -keystore release.keystore \
               -alias release \
