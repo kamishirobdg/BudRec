@@ -4,7 +4,6 @@ import {
   Alert,
   Button,
   FlatList,
-  Image,
   KeyboardAvoidingView,
   Modal,
   Pressable,
@@ -36,6 +35,7 @@ import * as ReceiptQueue from '../services/ReceiptQueueService';
 import * as LastBatch from '../services/LastBatchService';
 import * as Demo from '../services/DemoService';
 import ReceiptReviewModal from './ReceiptReviewModal';
+import ZoomableImage from '../components/ZoomableImage';
 
 // 通知ハンドラ: フォアグラウンド時もバナーとリストに表示する。
 // タブ切替・バックグラウンド移行時に OCR 処理の進捗と結果を見せるため。
@@ -262,6 +262,14 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
     );
   };
 
+  /** 中止後の選択。「あとで」なら画像は pending に残る */
+  const showCancelledDialog = (uri: string) => {
+    Alert.alert('中止しました', undefined, [
+      { text: 'あとで', style: 'cancel' },
+      { text: '手動入力', onPress: () => setManualTarget(uri) },
+    ]);
+  };
+
   /**
    * 保存済みレシートファイルを OCR 処理する。
    * 失敗時は 1 秒待って 1 回だけ自動リトライ。それでも失敗なら 3 択ダイアログ。
@@ -301,8 +309,11 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
         return 'ok';
       } catch (firstErr) {
         if (firstErr instanceof AuthError) throw firstErr;
-        // 中止は「失敗」ではない。リトライもダイアログも出さず、画像は pending に残す
-        if (firstErr instanceof CancelledError) return 'cancelled';
+        // 中止は「失敗」ではない。リトライも失敗ダイアログも出さず、画像は pending に残す
+        if (firstErr instanceof CancelledError) {
+          showCancelledDialog(uri);
+          return 'cancelled';
+        }
         console.warn('[Receipt] OCR 1回目失敗、リトライ:', firstErr);
       }
 
@@ -310,7 +321,10 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
       setStatusMsg('OCR再試行中...');
       onStatusChange('OCR再試行中...');
       await new Promise((r) => setTimeout(r, 1000));
-      if (abort.signal.aborted) return 'cancelled';
+      if (abort.signal.aborted) {
+        showCancelledDialog(uri);
+        return 'cancelled';
+      }
       try {
         const msg = await attemptReceipt(base64, uri);
         if (msg === null) return 'ok';
@@ -319,7 +333,10 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
         onSuccess(msg);
       } catch (secondErr) {
         if (secondErr instanceof AuthError) throw secondErr;
-        if (secondErr instanceof CancelledError) return 'cancelled';
+        if (secondErr instanceof CancelledError) {
+          showCancelledDialog(uri);
+          return 'cancelled';
+        }
         const msg = secondErr instanceof Error ? secondErr.message : String(secondErr);
         showFailureDialog(uri, msg);
       }
@@ -750,17 +767,15 @@ function ManualEntryModal({
             自前で削る。包まないと下部の金額・メモがキーボードに隠れて見えない
             （明細編集・読み取り確認モーダルと同じ対策） */}
         <KeyboardAvoidingView style={styles.fill} behavior="height">
+          {/* 入力中も見えるよう、画像はスクロールさせず上部に固定する */}
+          <View style={styles.manualImageBox}>
+            <ZoomableImage uri={imageUri} height={220} />
+          </View>
           <ScrollView
             style={styles.fill}
             contentContainerStyle={styles.manualScroll}
             keyboardShouldPersistTaps="handled"
           >
-            <Image
-              source={{ uri: imageUri }}
-              style={styles.manualImage}
-              resizeMode="contain"
-            />
-
             <View style={styles.fieldBox}>
               <Text style={styles.fieldLabel}>日時</Text>
               <TextInput
@@ -1184,13 +1199,7 @@ const styles = StyleSheet.create({
   modalHeaderTitle: { fontSize: 18, fontWeight: 'bold' },
   fill: { flex: 1 },
   manualScroll: { padding: 16 },
-  manualImage: {
-    width: '100%',
-    height: 240,
-    backgroundColor: '#f3f4f6',
-    borderRadius: 8,
-    marginBottom: 16,
-  },
+  manualImageBox: { paddingHorizontal: 16, paddingTop: 12 },
   manualNote: { fontSize: 11, color: '#888', marginTop: 12, textAlign: 'center' },
 
   fieldBox:   { marginBottom: 12 },
