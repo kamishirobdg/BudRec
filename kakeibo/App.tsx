@@ -8,8 +8,10 @@ import { Ionicons } from '@expo/vector-icons';
 import HomeScreen from './screens/HomeScreen';
 import CameraScreen from './screens/CameraScreen';
 import SummaryScreen from './screens/SummaryScreen';
+import UserSetupScreen from './screens/UserSetupScreen';
 import ErrorBoundary from './components/ErrorBoundary';
 import { handleAuthCallback, isSignedIn, AuthError } from './services/AuthService';
+import { isUserNameSet } from './services/UserService';
 import { runGmailImport } from './services/GmailService';
 import { flushWriteQueue } from './services/SheetsService';
 import { loadConfig as loadDemoConfig } from './services/DemoService';
@@ -28,6 +30,9 @@ export default function App() {
 function AppContent() {
   const [signedIn, setSignedIn] = useState(false);
   const [checking, setChecking] = useState(true);
+  // 初回起動時（再インストール直後含む）はユーザー名が保存されるまで
+  // アプリ本体へ進ませない。既定名のまま Gmail 取り込みが走るのを防ぐ
+  const [userNameSet, setUserNameSet] = useState(false);
   const lastGmailRunRef = useRef(0);
 
   // OCR 処理中ステータスと成功トースト（画面遷移をまたいで表示するためここで管理）
@@ -55,8 +60,9 @@ function AppContent() {
       } catch (e) {
         Alert.alert('サインイン失敗', e instanceof Error ? e.message : String(e));
       }
-      const ok = await isSignedIn();
+      const [ok, named] = await Promise.all([isSignedIn(), isUserNameSet()]);
       setSignedIn(ok);
+      setUserNameSet(named);
       setChecking(false);
     })();
   }, []);
@@ -92,15 +98,15 @@ function AppContent() {
       .finally(() => maybeRunGmailImport());
   };
 
-  // サインイン直後に実行
+  // サインイン直後に実行（ユーザー名が設定されるまでは取り込みを走らせない）
   useEffect(() => {
-    if (signedIn) syncPending();
+    if (signedIn && userNameSet) syncPending();
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [signedIn]);
+  }, [signedIn, userNameSet]);
 
   // フォアグラウンド復帰時にも実行（トークン有効性を再確認してから）
   useEffect(() => {
-    if (!signedIn) return;
+    if (!signedIn || !userNameSet) return;
     const sub = AppState.addEventListener('change', async (state) => {
       if (state !== 'active') return;
       const ok = await isSignedIn();
@@ -112,7 +118,7 @@ function AppContent() {
     });
     return () => sub.remove();
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [signedIn]);
+  }, [signedIn, userNameSet]);
 
   return (
     <SafeAreaProvider>
@@ -122,6 +128,8 @@ function AppContent() {
         </View>
       ) : !signedIn ? (
         <HomeScreen onSignedIn={() => setSignedIn(true)} />
+      ) : !userNameSet ? (
+        <UserSetupScreen onDone={() => setUserNameSet(true)} />
       ) : (
         <NavigationContainer>
           <Tab.Navigator

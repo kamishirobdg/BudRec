@@ -16,8 +16,23 @@ let cache: string | null = null;
 export async function getCurrentUserRaw(): Promise<string> {
   if (cache) return cache;
   const v = await getItem(KEY);
-  cache = v && v.length > 0 ? v : DEFAULT_USER;
-  return cache;
+  if (v && v.length > 0) {
+    cache = v;
+    return v;
+  }
+  // 未設定時の既定名はキャッシュしない（isUserNameSet の判定を壊さないため）
+  return DEFAULT_USER;
+}
+
+/**
+ * 端末にユーザー名が保存済みか。
+ * 未設定のまま Gmail 取り込みが走ると既定名のレコードが作られてしまうため、
+ * 初回起動時はこれが true になるまでアプリ本体へ進ませない。
+ */
+export async function isUserNameSet(): Promise<boolean> {
+  if (cache) return true;
+  const v = await getItem(KEY);
+  return !!v && v.length > 0;
 }
 
 /**
