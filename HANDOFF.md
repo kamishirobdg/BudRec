@@ -515,6 +515,11 @@ APK には `EXPO_PUBLIC_GEMINI_API_KEY` が埋め込まれており、誰でも�
   `workflow` スコープが無く `refusing to allow a Personal Access Token to create or
   update workflow` で弾かれる）。ワークフローを直したいときは GitHub の Web UI で
   編集するか、PAT に `workflow` スコープを付け直すこと。
+  - この制約のために 1 行だけ落とした変更がある（やるなら Web UI で。急がない）。
+    `build-apk.yml` のキーストア分岐の `else` 側（使い捨てキーストアを生成する手前）に
+    次の警告を出す行を足したかった:
+    `echo "::warning::ANDROID_KEYSTORE_BASE64 が未設定です。使い捨てキーストアで署名するため、このAPKを入れる前に旧アプリのアンインストールが必要になり、保存済みのGoogleログインも消えます。"`
+    なお最近のビルドは GitHub Actions ではなく EAS を使っているので、効く場面は限られる。
 - コンテナ側とズレるので、作業開始前に `git fetch origin` して差分を確認する。
 
 ### クラウドコンテナ（`/home/user/BudRec`）
