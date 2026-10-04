@@ -41,8 +41,9 @@ export default function UserSetupScreen({ onDone }: Props) {
 
   return (
     <SafeAreaView style={styles.container}>
+      {/* edgeToEdgeEnabled では Android の adjustResize で画面が縮まないため、自前で避ける */}
       <KeyboardAvoidingView
-        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
         style={styles.body}
       >
         <Text style={styles.title}>ユーザー名</Text>
