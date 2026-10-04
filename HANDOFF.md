@@ -172,6 +172,10 @@ Hermes エンジンでは `new Date('2026/07/30 12:00:00')` が **NaN** にな�
   保存されるまでタブ画面へ進ませない。**その間は `flushWriteQueue` も Gmail 取り込みも
   走らせない**（`syncPending` の依存に `userNameSet` を入れてある）。
 - 名前は設定画面からいつでも変更できる（従来どおり）。
+- **入力欄がキーボードに隠れていた**（v1.7.0 で発覚、v1.7.1 で修正。未検証）。`app.json` が
+  `edgeToEdgeEnabled: true` のため、**モーダルでない通常画面でも Android の adjustResize で画面が縮まない**。
+  `KeyboardAvoidingView` の `behavior` を Android でも `'height'` にした。入力欄を持つ画面を足すときは
+  モーダルかどうかに関係なくこの対策が要る。
 
 ### 代理入力の相手の集め方（`SheetsService.getUniqueUsersRaw`）
 
