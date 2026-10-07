@@ -148,16 +148,67 @@ async function readFoods(): Promise<Map<string, Food>> {
 }
 
 /**
+ * チェーン名の別名（レシート・メールの店名が英字や略称のとき）。キーは食品データの chain 列の名前。
+ * 短すぎて別の店名にも含まれうる略称（「マック」→ マックスバリュ など）は入れない。
+ */
+const CHAIN_ALIASES: Record<string, string[]> = {
+  'マクドナルド':               ["McDonald's", 'McDonalds'],
+  'モスバーガー':               ['MOS BURGER', 'MOSBURGER'],
+  'バーガーキング':             ['BURGER KING'],
+  'ドトール':                   ['DOUTOR'],
+  'すき家':                     ['SUKIYA'],
+  'ガスト':                     ['GUSTO'],
+  'はま寿司':                   ['HAMA-SUSHI', 'HAMASUSHI', 'はまずし'],
+  'ピザハット':                 ['PIZZA HUT', 'PIZZAHUT'],
+  'コメダ珈琲店':               ['コメダ', 'KOMEDA'],
+  'ケンタッキーフライドチキン': ['KFC', 'ケンタッキー', 'KENTUCKY'],
+  'ミスタードーナツ':           ['ミスド', 'MISTER DONUT', 'MISTERDONUT'],
+  'サンマルクカフェ':           ['サンマルク', 'ST.MARC', 'SAINT MARC'],
+  'ドミノ・ピザ':               ["Domino's", 'DOMINOS'],
+  '吉野家':                     ['YOSHINOYA'],
+  'なか卯':                     ['NAKAU'],
+  'やよい軒':                   ['YAYOIKEN'],
+  '松のや':                     ['松乃家', 'MATSUNOYA'],
+  'CoCo壱番屋':                 ['ココイチ', 'ココ壱', 'COCOICHI'],
+  'リンガーハット':             ['RINGER HUT', 'RINGERHUT'],
+  '天丼てんや':                 ['てんや', 'TENYA'],
+  '富士そば':                   ['FUJISOBA'],
+  'スシロー':                   ['SUSHIRO'],
+  'しゃぶ葉':                   ['SHABUYO'],
+  '洋麺屋五右衛門':             ['五右衛門', 'GOEMON'],
+  'びっくりドンキー':           ['BIKKURI DONKEY'],
+  'ペッパーランチ':             ['PEPPER LUNCH'],
+  '回転寿司みさき':             ['みさき'],
+  '壱角家':                     ['IKKAKUYA'],
+  '銚子丸':                     ['CHOSHIMARU'],
+  'カレーショップC&C':          ['C&C'],
+  'ヴィ・ド・フランス':         ['VIE DE FRANCE'],
+};
+
+function chainNames(chain: string): string[] {
+  return [chain, ...(CHAIN_ALIASES[chain] ?? [])];
+}
+
+/** 店名の照合用に揃える（全角英数を半角に、空白・中黒・アポストロフィ・ハイフンを消し、小文字に） */
+function normalizeStore(s: string): string {
+  return s
+    .replace(/[Ａ-Ｚａ-ｚ０-９＆．]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xfee0))
+    .replace(/[\s　・'’\-‐－]/g, '')
+    .toLowerCase();
+}
+
+/**
  * 飲食店のメニューを引く。店名は「マクドナルド 船橋日大前店」のように店舗名付きなので、
- * 食品データにあるチェーン名のうち店名に含まれるものを長い順に試す（自動の調査は店名そのものを
+ * 食品データにあるチェーン名のうち店名に含まれるもの（別名を含む）を長い順に試す（自動の調査は店名そのものを
  * チェーン名として保存するので、「マクドナルド 船橋日大前店」と「マクドナルド」の両方がありうる）。
  * 品名はレシートの表記・写真から読んだ名前など、候補を順に試す。
  */
 export function findMenu(foods: Map<string, Food>, store: string, names: string[]): Food | undefined {
-  const norm = (s: string) => s.replace(/\s+/g, '').toLowerCase();
-  const s = norm(store);
+  const s = normalizeStore(store);
   const chains = new Set<string>([store]);
-  for (const f of foods.values()) if (f.chain && s.includes(norm(f.chain))) chains.add(f.chain);
+  for (const f of foods.values()) {
+    if (f.chain && !chains.has(f.chain) && chainNames(f.chain).some((n) => s.includes(normalizeStore(n)))) chains.add(f.chain);
+  }
   const ordered = [...chains].sort((a, b) => b.length - a.length);
   for (const name of names.filter(Boolean)) {
     for (const chain of ordered) {
