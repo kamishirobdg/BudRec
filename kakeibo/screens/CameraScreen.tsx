@@ -92,7 +92,9 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
     return OcrWorker.subscribe(refresh);
   }, [refresh]);
 
-  const attention = items.filter((i) => i.status !== 'queued');
+  const attention = items.filter((i) => i.status !== 'queued' && i.status !== 'deferred');
+  const deferred  = items.filter((i) => i.status === 'deferred');
+  const deferredUntil = OcrWorker.nextDeferredAt();
 
   useEffect(() => {
     if (listOpen && attention.length === 0) setListOpen(false);
@@ -109,7 +111,7 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
       const allUsers = await getUniqueUsers();
       const others = allUsers.filter((u) => u !== currentUser);
       if (others.length === 0) {
-        Alert.alert('代理入力', '他のユーザーが見つかりません。相手のユーザーが入力を行った後に利用できます。');
+        Alert.alert('代理入力', '他のユーザーが見つかりません。相手の端末でサインインした後に利用できます。');
         return;
       }
       if (others.length === 1) {
@@ -337,6 +339,13 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
       )}
 
       <View style={styles.overlay}>
+        {deferred.length > 0 && !progress.running && (
+          <View style={styles.statusBox}>
+            <Text style={styles.statusText}>
+              推定待ち {deferred.length} 件（{formatClock(deferredUntil)} 以降に自動で処理）
+            </Text>
+          </View>
+        )}
         {progress.running && (
           <View style={styles.statusBox}>
             <ActivityIndicator color="#fff" />
@@ -687,6 +696,15 @@ function ManualEntryModal({
 
 function pad(n: number): string {
   return String(n).padStart(2, '0');
+}
+
+/** 'M/D HH:MM'（今日なら 'HH:MM'） */
+function formatClock(ms: number | null): string {
+  if (ms === null) return '';
+  const d = new Date(ms);
+  const now = new Date();
+  const hm = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  return d.toDateString() === now.toDateString() ? hm : `${d.getMonth() + 1}/${d.getDate()} ${hm}`;
 }
 
 const styles = StyleSheet.create({

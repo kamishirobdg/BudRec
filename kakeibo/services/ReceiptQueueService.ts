@@ -20,20 +20,33 @@ const DIR_NAME  = 'pending-receipts';
 const META_FILE = 'receipt-meta.json';
 
 /**
- * - `queued`  … OCR 待ち。起動時にも自動で処理する
- * - `stopped` … 中止した。自動では処理しない
- * - `failed`  … OCR が 2 回失敗した。自動では処理しない
- * - `review`  … 2 件以上読めたので保存前の確認待ち（`rows` に読み取り結果）
+ * - `queued`   … OCR 待ち。起動時にも自動で処理する
+ * - `deferred` … 無料枠切れで推定待ち。`notBefore` を過ぎたら自動で `queued` に戻る
+ * - `stopped`  … 中止した。自動では処理しない
+ * - `failed`   … OCR が 2 回失敗した。自動では処理しない
+ * - `review`   … 確認待ち（レシートは 2 件以上読めたとき `rows` に読み取り結果、
+ *                食事は判別に困ったとき `mealId` に推定結果の食事）
  */
-export type ReceiptStatus = 'queued' | 'stopped' | 'failed' | 'review';
+export type ReceiptStatus = 'queued' | 'deferred' | 'stopped' | 'failed' | 'review';
+
+/** 撮った写真の種類 */
+export type PhotoKind = 'receipt' | 'meal';
 
 interface ReceiptMeta {
   name:       string;
   status:     ReceiptStatus;
+  /** 省略時は receipt（v1.9 以前の画像） */
+  kind?:      PhotoKind;
+  /** 撮影日時（エポックミリ秒）。食事とレシートを時刻で突き合わせるのに使う */
+  shotAt?:    number;
   /** 撮影時に代理入力中だった相手。後から代理入力を切り替えても撮影時の相手で記録する */
   proxyUser?: string;
   error?:     string;
   rows?:      ExpenseRow[];
+  /** `deferred` のとき、処理し直してよい時刻（エポックミリ秒） */
+  notBefore?: number;
+  /** 食事の `review` のとき、推定済みの食事の ID */
+  mealId?:    string;
 }
 
 export interface ReceiptItem extends ReceiptMeta {
@@ -71,12 +84,12 @@ function writeMeta(list: ReceiptMeta[]): void {
 /**
  * base64 画像を新規ファイルとして保存し、絶対 URI (`file://...`) を返す。
  */
-export function saveReceipt(base64: string, proxyUser?: string): string {
+export function saveReceipt(base64: string, proxyUser?: string, kind: PhotoKind = 'receipt'): string {
   const dir  = getDir();
   const file = new File(dir, genFilename());
   file.create({ overwrite: true });
   file.write(base64, { encoding: 'base64' });
-  writeMeta([...readMeta(), { name: file.name, status: 'queued', proxyUser }]);
+  writeMeta([...readMeta(), { name: file.name, status: 'queued', kind, shotAt: Date.now(), proxyUser }]);
   return file.uri;
 }
 
@@ -89,19 +102,46 @@ export function readReceipt(uri: string): string {
   return file.base64Sync();
 }
 
-/** 状態を書き換える。`rows` / `error` は渡さなければ消える */
+/** 状態を書き換える。`rows` / `error` / `notBefore` / `mealId` は渡さなければ消える */
 export function setStatus(
   uri: string,
   status: ReceiptStatus,
-  extra: { error?: string; rows?: ExpenseRow[] } = {},
+  extra: { error?: string; rows?: ExpenseRow[]; notBefore?: number; mealId?: string } = {},
 ): void {
   // 破棄済みの画像に状態だけ残さない
   if (!new File(uri).exists) return;
   const name = nameOf(uri);
   const list = readMeta();
   const prev = list.find((m) => m.name === name);
-  const next: ReceiptMeta = { name, status, proxyUser: prev?.proxyUser, ...extra };
+  const next: ReceiptMeta = {
+    name,
+    status,
+    kind:      prev?.kind,
+    shotAt:    prev?.shotAt,
+    proxyUser: prev?.proxyUser,
+    ...extra,
+  };
   writeMeta([...list.filter((m) => m.name !== name), next]);
+}
+
+/** 推定待ちのうち、時刻を過ぎたものを OCR 待ちに戻す。戻した件数を返す */
+export function promoteDeferred(now: number = Date.now()): number {
+  let n = 0;
+  for (const item of listItems()) {
+    if (item.status === 'deferred' && (item.notBefore ?? 0) <= now) {
+      setStatus(item.uri, 'queued');
+      n++;
+    }
+  }
+  return n;
+}
+
+/** 推定待ちのうち、いちばん早く処理し直せる時刻（無ければ null） */
+export function nextDeferredAt(): number | null {
+  const times = listItems()
+    .filter((i) => i.status === 'deferred')
+    .map((i) => i.notBefore ?? 0);
+  return times.length > 0 ? Math.min(...times) : null;
 }
 
 /** 指定した状態の画像をまとめて別の状態にする（`except` の画像には触らない） */
@@ -161,8 +201,8 @@ export function listItems(): ReceiptItem[] {
   // ファイル名にタイムスタンプが埋め込まれているので名前順 = 時系列順
   files.sort((a, b) => (a.name < b.name ? -1 : 1));
   const meta = new Map(readMeta().map((m) => [m.name, m]));
-  return files.map((f) => ({
-    ...(meta.get(f.name) ?? { name: f.name, status: 'stopped' as const }),
-    uri: f.uri,
-  }));
+  return files.map((f) => {
+    const m = meta.get(f.name) ?? { name: f.name, status: 'stopped' as const };
+    return { ...m, kind: m.kind ?? 'receipt', uri: f.uri };
+  });
 }

@@ -33,6 +33,7 @@ import {
   getUniqueUsersRaw,
   getRowsRaw,
   flushWriteQueue,
+  registerUser,
 } from '../services/SheetsService';
 import * as WriteQueue from '../services/WriteQueueService';
 import * as RowsCache from '../services/RowsCacheService';
@@ -283,8 +284,12 @@ export default function SettingsScreen({ onSignedOut }: Props) {
       return;
     }
     try {
+      const previous = savedUser;
       await setCurrentUser(name);
       setSavedUser(name);
+      // 共有の名前一覧も書き換える（失敗しても端末の設定は保存済み）
+      registerUser(name, previous).catch((e) =>
+        console.warn('[Settings] ユーザー名を共有できなかった:', e instanceof Error ? e.message : e));
       Alert.alert('保存しました', `ユーザー名: ${name}`);
     } catch (e) {
       Alert.alert('保存失敗', e instanceof Error ? e.message : String(e));

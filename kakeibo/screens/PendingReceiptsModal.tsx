@@ -16,17 +16,19 @@ interface Props {
 }
 
 const STATUS_LABEL: Record<ReceiptStatus, string> = {
-  queued:  'OCR待ち',
-  stopped: '中止',
-  failed:  '失敗',
-  review:  '確認待ち',
+  queued:   'OCR待ち',
+  deferred: '推定待ち',
+  stopped:  '中止',
+  failed:   '失敗',
+  review:   '確認待ち',
 };
 
 const STATUS_COLOR: Record<ReceiptStatus, string> = {
-  queued:  '#6b7280',
-  stopped: '#6b7280',
-  failed:  '#dc2626',
-  review:  '#2563eb',
+  queued:   '#6b7280',
+  deferred: '#6b7280',
+  stopped:  '#6b7280',
+  failed:   '#dc2626',
+  review:   '#2563eb',
 };
 
 /** 撮影画面の「要確認」から開く一覧。画像ごとに再開・手入力・確認・破棄を選ぶ */

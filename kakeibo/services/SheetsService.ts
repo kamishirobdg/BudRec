@@ -10,6 +10,7 @@ import * as Demo from './DemoService';
 import * as WriteQueue from './WriteQueueService';
 import * as Crypto from 'expo-crypto';
 import type { ReceiptItem } from '../providers/AIProvider';
+import { nowLabel } from './jsonFileStore';
 
 // ─── スプレッドシート設定（.env の EXPO_PUBLIC_SPREADSHEET_ID に設定） ───────
 // Google Sheets の URL から取得: https://docs.google.com/spreadsheets/d/{ID}/edit
@@ -1152,6 +1153,7 @@ export async function getUniqueUsersRaw(): Promise<string[]> {
   const client = await createClient();
 
   const users = await readUsersFromSheet(client, getSheetNameFromDate());
+  for (const u of await readRegisteredUsers(client)) users.add(u);
 
   // 当月に 1 人分しか記録が無いと代理入力の相手が出てこない。
   // 月が替わった直後は毎月この状態になるので、前月シートも見て補う。
@@ -1181,6 +1183,62 @@ async function readUsersFromSheet(
     // シートが無い・読めない場合は何も足さない
   }
   return users;
+}
+
+// ─── ユーザー名の登録（_users） ───────────────────────────────────────────────
+//
+// 端末のユーザー名は端末ローカルにしか無いので、各端末がサインイン時に自分の名前を
+// ここへ登録する。代理入力の相手を「シートにその人の記録があるか」に頼らず選べる。
+
+const USERS_SHEET = '_users';
+
+async function readRegisteredUsers(client: AxiosInstance): Promise<Set<string>> {
+  const users = new Set<string>();
+  try {
+    const existing = await listSheetNames(client, true);
+    if (!existing.includes(USERS_SHEET)) return users;
+    const res = await client.get(`/values/${encodeURIComponent(USERS_SHEET)}!A:A`);
+    const rows: string[][] = res.data.values ?? [];
+    for (let i = 1; i < rows.length; i++) {
+      const cell = rows[i]?.[0];
+      if (cell && cell.trim()) users.add(cell.trim());
+    }
+  } catch {
+    // 読めなくても代理入力の候補が減るだけ
+  }
+  return users;
+}
+
+/**
+ * この端末のユーザー名を登録する。既にあれば何もしない。
+ * @param previous 名前を変えた場合の旧名。その行を新しい名前に書き換える
+ */
+export async function registerUser(name: string, previous?: string): Promise<void> {
+  const trimmed = name.trim();
+  if (!trimmed || (await Demo.isDemo())) return;
+  const client = await createClient();
+  if (await ensureSheet(client, USERS_SHEET)) {
+    await writeHeaderRow(client, USERS_SHEET, ['user', 'registered_at']);
+  }
+  const res = await client.get(`/values/${encodeURIComponent(USERS_SHEET)}!A:A`);
+  const rows: string[][] = res.data.values ?? [];
+  const names = rows.map((r) => (r?.[0] ?? '').trim());
+  if (names.includes(trimmed)) return;
+
+  const prevIndex = previous ? names.indexOf(previous.trim()) : -1;
+  if (prevIndex > 0) {
+    await client.put(
+      `/values/${encodeURIComponent(USERS_SHEET)}!A${prevIndex + 1}:B${prevIndex + 1}`,
+      { values: [[trimmed, nowLabel()]] },
+      { params: { valueInputOption: 'RAW' } },
+    );
+    return;
+  }
+  await client.post(
+    `/values/${encodeURIComponent(USERS_SHEET)}!A:B:append`,
+    { values: [[trimmed, nowLabel()]] },
+    { params: { valueInputOption: 'RAW', insertDataOption: 'INSERT_ROWS' } },
+  );
 }
 
 /** シートに存在するユーザー名一覧を返す。代理入力の相手を選ぶのに使う */

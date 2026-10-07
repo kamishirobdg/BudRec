@@ -11,11 +11,12 @@ import SummaryScreen from './screens/SummaryScreen';
 import UserSetupScreen from './screens/UserSetupScreen';
 import ErrorBoundary from './components/ErrorBoundary';
 import { handleAuthCallback, isSignedIn, AuthError } from './services/AuthService';
-import { isUserNameSet } from './services/UserService';
+import { getCurrentUserRaw, isUserNameSet } from './services/UserService';
 import { runGmailImport } from './services/GmailService';
-import { flushWriteQueue } from './services/SheetsService';
+import { flushWriteQueue, registerUser } from './services/SheetsService';
 import { loadConfig as loadDemoConfig } from './services/DemoService';
 import * as OcrWorker from './services/OcrWorker';
+import { registerBackgroundOcr } from './services/BackgroundOcr';
 
 const Tab = createBottomTabNavigator();
 const navigationRef = createNavigationContainerRef();
@@ -129,6 +130,12 @@ function AppContent() {
     syncPending();
     // 前回 OCR 待ちのまま終了された画像の続き（中止・失敗したものは対象外）
     OcrWorker.kick();
+    // 無料枠切れで推定待ちになった画像を、アプリを開いていなくても処理し直す
+    registerBackgroundOcr();
+    // 代理入力の相手の候補として、この端末のユーザー名を共有の一覧に載せる
+    getCurrentUserRaw()
+      .then((name) => registerUser(name))
+      .catch((e) => console.warn('[App] ユーザー名を登録できなかった:', e instanceof Error ? e.message : e));
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [signedIn, userNameSet]);
 
@@ -143,6 +150,8 @@ function AppContent() {
         return;
       }
       syncPending();
+      // 推定待ちの時刻を過ぎていれば OCR を再開する
+      OcrWorker.kick();
     });
     return () => sub.remove();
   // eslint-disable-next-line react-hooks/exhaustive-deps

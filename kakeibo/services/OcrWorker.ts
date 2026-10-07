@@ -14,11 +14,14 @@
  * - 2 回失敗した   → `failed`
  * - 中止された     → `stopped`（中止を押した時点の OCR 待ちもすべて `stopped`）
  * - 認証切れ       → `queued` のまま止めて `auth-failed` を出す（再ログイン後に続きから）
+ * - 無料枠切れ     → `deferred`（OCR 待ちの残りもすべて）。枠が戻る時刻を過ぎたら `kick` で再開する
+ *
+ * アプリを開いていなくても、Android の定期実行（`BackgroundOcr.ts`）から `runPending` が呼ばれる。
  */
 
 import BackgroundService from 'react-native-background-actions';
 import { AuthError } from './AuthService';
-import { CancelledError } from '../providers/AIProvider';
+import { CancelledError, QuotaExceededError } from '../providers/AIProvider';
 import * as ReceiptQueue from './ReceiptQueueService';
 import { extractRows, saveReceiptRows } from './ReceiptProcessing';
 
@@ -40,6 +43,7 @@ let running = false;
 let done    = 0;
 let currentAbort: AbortController | null = null;
 let currentUri:   string | null = null;
+let loopPromise:  Promise<void> | null = null;
 
 export function subscribe(fn: (e: WorkerEvent) => void): () => void {
   listeners.add(fn);
@@ -61,8 +65,13 @@ export function getProgress(): WorkerProgress {
 }
 
 /** 画像を OCR 待ちに積んで処理を始める */
-export function enqueue(base64: string, proxyUser?: string): void {
-  ReceiptQueue.saveReceipt(base64, proxyUser);
+export function enqueue(base64: string, proxyUser?: string, kind: ReceiptQueue.PhotoKind = 'receipt'): void {
+  const uri = ReceiptQueue.saveReceipt(base64, proxyUser, kind);
+  // 無料枠切れで止まっている間は、送っても通らないので同じ時刻まで待たせる
+  const waitUntil = ReceiptQueue.nextDeferredAt();
+  if (waitUntil !== null && waitUntil > Date.now()) {
+    ReceiptQueue.setStatus(uri, 'deferred', { notBefore: waitUntil });
+  }
   emit({ type: 'changed' });
   kick();
 }
@@ -85,10 +94,29 @@ export function cancel(): void {
   emit({ type: 'changed' });
 }
 
-/** OCR 待ちがあれば処理を始める。既に動いていれば何もしない */
+/**
+ * OCR 待ちがあれば処理を始める。既に動いていれば何もしない。
+ * 推定待ちで時刻を過ぎたものは、ここで OCR 待ちに戻す。
+ */
 export function kick(): void {
+  if (ReceiptQueue.promoteDeferred() > 0) emit({ type: 'changed' });
   if (running || queuedCount() === 0) return;
-  void runLoop();
+  loopPromise = runLoop();
+}
+
+/** 定期実行から呼ぶ。処理が終わるまで待つ（定期実行はこの Promise が終わると打ち切られる） */
+export async function runPending(): Promise<void> {
+  kick();
+  while (loopPromise) {
+    const p = loopPromise;
+    await p;
+    if (loopPromise === p) break;
+  }
+}
+
+/** 推定待ちのうち、いちばん早く処理し直せる時刻（無ければ null） */
+export function nextDeferredAt(): number | null {
+  return ReceiptQueue.nextDeferredAt();
 }
 
 async function runLoop(): Promise<void> {
@@ -103,6 +131,11 @@ async function runLoop(): Promise<void> {
       if (!next) break;
       updateNotification();
       const outcome = await processOne(next);
+      if (outcome === 'quota') {
+        // 残りも同じ理由で通らない。時刻が来たら kick で再開する
+        stopLoop = true;
+        break;
+      }
       if (outcome === 'auth-failed') {
         stopLoop = true;
         emit({ type: 'auth-failed' });
@@ -121,13 +154,24 @@ async function runLoop(): Promise<void> {
     await stopService(serviceStarted);
     running = false;
     done    = 0;
+    loopPromise = null;
     emit({ type: 'changed' });
     // 止めている間に積まれたぶん
     if (!stopLoop) kick();
   }
 }
 
-async function processOne(item: ReceiptQueue.ReceiptItem): Promise<'done' | 'cancelled' | 'auth-failed'> {
+type Outcome = 'done' | 'cancelled' | 'auth-failed' | 'quota';
+
+/** 無料枠切れ。この 1 枚と OCR 待ちの残りを推定待ちにする */
+function deferAll(retryAt: number): Outcome {
+  for (const item of ReceiptQueue.listItems()) {
+    if (item.status === 'queued') ReceiptQueue.setStatus(item.uri, 'deferred', { notBefore: retryAt });
+  }
+  return 'quota';
+}
+
+async function processOne(item: ReceiptQueue.ReceiptItem): Promise<Outcome> {
   const abort = new AbortController();
   currentAbort = abort;
   currentUri   = item.uri;
@@ -161,6 +205,7 @@ async function processOne(item: ReceiptQueue.ReceiptItem): Promise<'done' | 'can
       } catch (e) {
         if (e instanceof AuthError) return 'auth-failed';
         if (e instanceof CancelledError || abort.signal.aborted) return cancelled();
+        if (e instanceof QuotaExceededError) return deferAll(e.retryAt);
         if (attempt >= 1) {
           ReceiptQueue.setStatus(item.uri, 'failed', { error: e instanceof Error ? e.message : String(e) });
           return 'done';

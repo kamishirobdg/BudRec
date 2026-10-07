@@ -2,6 +2,7 @@ import axios from 'axios';
 import {
   AIProvider,
   CancelledError,
+  QuotaExceededError,
   EMAIL_RECEIPT_SCHEMA,
   RECEIPT_LIST_SCHEMA,
   ReceiptData,
@@ -10,6 +11,7 @@ import {
   parseReceiptList,
   parseReceiptResponse,
 } from './AIProvider';
+import { classifyQuotaError, quotaRetryAt } from './geminiQuota';
 import {
   invalidateModelCache,
   resolveModel,
@@ -39,7 +41,7 @@ export const geminiProvider: AIProvider = {
       { text: prompt },
       { inline_data: { mime_type: 'image/jpeg', data: imageBase64 } },
     ];
-    const raw = await callGemini(parts, RECEIPT_LIST_SCHEMA, { highRes: true, signal });
+    const raw = await callGemini(parts, { schema: RECEIPT_LIST_SCHEMA, highRes: true, signal });
     return parseReceiptList(raw, categories);
   },
 
@@ -47,23 +49,39 @@ export const geminiProvider: AIProvider = {
     const prompt = buildEmailPrompt(categories);
     const parts = [{ text: `${prompt}\n\n--- メール本文 ---\n${emailText}` }];
     // テキストだけなので解像度指定は要らない
-    const raw = await callGemini(parts, EMAIL_RECEIPT_SCHEMA, { highRes: false });
+    const raw = await callGemini(parts, { schema: EMAIL_RECEIPT_SCHEMA, highRes: false });
     return parseReceiptResponse(raw, categories);
   },
 };
+
+export interface CallOptions {
+  /** responseSchema に渡す出力スキーマ。形式崩れと項目欠落を防ぐ（tools と併用しない） */
+  schema?:  object;
+  /** 画像を高解像度で処理させる（小さい文字・複数レシート対策） */
+  highRes:  boolean;
+  signal?:  AbortSignal;
+  /** Google 検索 grounding（`[{ google_search: {} }]`）。構造化出力と併用できないモデルがあるので schema は付けない */
+  tools?:   object[];
+}
 
 /**
  * Gemini API 呼び出し共通処理。parts はモデルに渡すコンテンツ配列。
  * 戻り値はモデルの生テキスト（パースは呼び出し側で行う。画像は複数件、メールは 1 件）。
  *
- * @param schema  responseSchema に渡す出力スキーマ。形式崩れと項目欠落を防ぐ
- * @param opts.highRes 画像を高解像度で処理させる（小さい文字・複数レシート対策）
+ * 日単位の無料枠を全モデルで使い切ったら QuotaExceededError を投げる（呼び出し側は推定待ちにする）。
  */
-async function callGemini(
-  parts: object[],
-  schema: object,
-  opts: { highRes: boolean; signal?: AbortSignal },
-): Promise<string> {
+export interface GeminiResult {
+  text:    string;
+  /** grounding で参照したページの URL（grounding を使わなければ空） */
+  sources: string[];
+}
+
+/** 生テキストだけ欲しい場合 */
+export async function callGemini(parts: object[], opts: CallOptions): Promise<string> {
+  return (await callGeminiDetailed(parts, opts)).text;
+}
+
+export async function callGeminiDetailed(parts: object[], opts: CallOptions): Promise<GeminiResult> {
   if (!GEMINI_API_KEY || GEMINI_API_KEY.startsWith('YOUR_')) {
     throw new Error('GEMINI_API_KEY が未設定です');
   }
@@ -76,14 +94,27 @@ async function callGemini(
   // 高解像度指定に対応しないモデルに当たったら false に落として以降は既定解像度で通す
   let highRes = opts.highRes;
 
-  const send = async (model: string): Promise<string> => {
+  const send = async (model: string): Promise<GeminiResult> => {
     try {
-      return await postToModel(model, parts, schema, highRes, signal);
+      return await postToModel(model, parts, opts, highRes, signal);
     } catch (e) {
       if (!highRes || !isUnsupportedConfigError(e)) throw e;
       console.warn(`[Gemini] ${model} は mediaResolution 非対応。既定の解像度で再試行します`);
       highRes = false;
-      return postToModel(model, parts, schema, false, signal);
+      return postToModel(model, parts, opts, false, signal);
+    }
+  };
+
+  // 分単位の枠切れは、指定の待ち時間だけ待って同じモデルで 1 回だけ送り直す
+  const sendWithMinuteRetry = async (model: string): Promise<GeminiResult> => {
+    try {
+      return await send(model);
+    } catch (e) {
+      const q = classifyQuotaError(e);
+      if (q?.scope !== 'minute' || (q.retryDelayMs ?? 0) > 60_000) throw e;
+      console.warn(`[Gemini] ${model} の分単位の枠切れ。${q.retryDelayMs ?? 10_000}ms 待って再送します`);
+      await abortableSleep(q.retryDelayMs ?? 10_000, signal);
+      return send(model);
     }
   };
 
@@ -107,7 +138,7 @@ async function callGemini(
     tried.push(model);
 
     try {
-      return await send(model);
+      return await sendWithMinuteRetry(model);
     } catch (e) {
       if (isCancellation(e)) throw new CancelledError();
       lastError = e;
@@ -118,7 +149,22 @@ async function callGemini(
   }
 
   throwIfCancelled();
+  // どのモデルも枠切れだった。失敗にせず、枠が戻ってから処理し直してもらう
+  const quota = classifyQuotaError(lastError);
+  if (quota) {
+    toReadableError(lastError); // 本文をログに残す
+    throw new QuotaExceededError(quotaRetryAt(quota));
+  }
   throw toReadableError(lastError ?? new Error('Gemini の呼び出しに失敗しました'));
+}
+
+function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) { reject(new CancelledError()); return; }
+    const timer = setTimeout(() => { signal?.removeEventListener('abort', onAbort); resolve(); }, ms);
+    const onAbort = () => { clearTimeout(timer); reject(new CancelledError()); };
+    signal?.addEventListener('abort', onAbort);
+  });
 }
 
 /** axios の中断か（signal.abort による） */
@@ -129,19 +175,19 @@ function isCancellation(e: unknown): boolean {
 async function postToModel(
   model: string,
   parts: object[],
-  schema: object,
+  opts: CallOptions,
   highRes: boolean,
   signal?: AbortSignal,
-): Promise<string> {
+): Promise<GeminiResult> {
   const res = await axios.post(
     endpointFor(model),
     {
       contents: [{ parts }],
+      ...(opts.tools ? { tools: opts.tools } : {}),
       generationConfig: {
         temperature:      0.1,
-        responseMimeType: 'application/json',
         // 出力の形を固定する。パース失敗と項目の欠落が消える
-        responseSchema:   schema,
+        ...(opts.schema ? { responseMimeType: 'application/json', responseSchema: opts.schema } : {}),
         // レシートの小さい文字を落とさないよう解像度を上げる。
         // 複数枚を 1 枚に収めた画像では、既定のままだと縮小されて読めない
         ...(highRes ? { mediaResolution: 'MEDIA_RESOLUTION_HIGH' } : {}),
@@ -155,10 +201,17 @@ async function postToModel(
     },
   );
 
-  const text: string = res.data?.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
+  const candidate = res.data?.candidates?.[0];
+  // grounding を使うと本文が複数の part に分かれて返ることがある
+  const text: string = (candidate?.content?.parts ?? [])
+    .map((p: any) => (typeof p?.text === 'string' ? p.text : ''))
+    .join('');
   if (!text) throw new Error('Gemini から空の応答が返されました');
 
-  return text;
+  const sources: string[] = (candidate?.groundingMetadata?.groundingChunks ?? [])
+    .map((c: any) => String(c?.web?.uri ?? ''))
+    .filter((u: string) => u.length > 0);
+  return { text, sources };
 }
 
 /**

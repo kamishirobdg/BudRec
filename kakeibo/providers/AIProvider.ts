@@ -30,6 +30,17 @@ export class CancelledError extends Error {
   }
 }
 
+/**
+ * 日単位の無料枠を使い切ったときに投げる。呼び出し側は失敗にせず「推定待ち」にして、
+ * `retryAt`（エポックミリ秒）を過ぎてから処理し直す。
+ */
+export class QuotaExceededError extends Error {
+  constructor(public readonly retryAt: number) {
+    super('Gemini の無料枠を使い切りました');
+    this.name = 'QuotaExceededError';
+  }
+}
+
 export interface ReceiptData {
   store:    string;
   amount:   number;
