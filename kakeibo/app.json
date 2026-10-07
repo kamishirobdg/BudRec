@@ -3,7 +3,7 @@
     "name": "Bud-Rec",
     "slug": "kakeibo",
     "scheme": "com.svnsfy.kakeibo",
-    "version": "1.7.1",
+    "version": "1.8.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
@@ -30,7 +30,8 @@
     },
     "plugins": [
       "expo-secure-store",
-      "expo-web-browser"
+      "expo-web-browser",
+      "./plugins/withOcrForegroundService"
     ],
     "extra": {
       "eas": {

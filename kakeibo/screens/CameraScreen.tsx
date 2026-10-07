@@ -24,21 +24,17 @@ import * as ImagePicker from 'expo-image-picker';
 import * as Notifications from 'expo-notifications';
 import { useNavigation } from '@react-navigation/native';
 import * as CategoryService from '../services/CategoryService';
-import { appendRow, ExpenseRow, getUniqueUsers } from '../services/SheetsService';
-import { QueuedWriteError } from '../services/WriteQueueService';
+import { ExpenseRow, getUniqueUsers } from '../services/SheetsService';
 import { AuthError } from '../services/AuthService';
 import { getCurrentUser } from '../services/UserService';
-import { getProvider } from '../providers';
-import type { ReceiptData } from '../providers';
-import { CancelledError } from '../providers/AIProvider';
 import * as ReceiptQueue from '../services/ReceiptQueueService';
-import * as LastBatch from '../services/LastBatchService';
-import * as Demo from '../services/DemoService';
+import * as OcrWorker from '../services/OcrWorker';
+import { saveReceiptRows } from '../services/ReceiptProcessing';
 import ReceiptReviewModal from './ReceiptReviewModal';
+import PendingReceiptsModal from './PendingReceiptsModal';
 import ZoomableImage from '../components/ZoomableImage';
 
 // 通知ハンドラ: フォアグラウンド時もバナーとリストに表示する。
-// タブ切替・バックグラウンド移行時に OCR 処理の進捗と結果を見せるため。
 Notifications.setNotificationHandler({
   handleNotification: async () => ({
     shouldShowAlert:  true,
@@ -55,68 +51,52 @@ interface Props {
   onSuccess:      (msg: string) => void;
 }
 
-/** 保存前に確認してもらう読み取り結果 */
-interface ReviewTarget {
-  /** 元のレシート画像。保存するか捨てるまで pending に残す */
-  uri:  string;
-  rows: ExpenseRow[];
-}
-
 export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }: Props) {
   const navigation = useNavigation();
   const [permission, requestPermission] = useCameraPermissions();
   const [facing] = useState<CameraType>('back');
-  const [busy, setBusy]           = useState(false);
-  const [statusMsg, setStatusMsg] = useState<string>('');
+  // 撮影・ギャラリー選択の最中だけ立てる。OCR の処理中も次を撮れる
+  const [capturing, setCapturing] = useState(false);
   const cameraRef                 = useRef<CameraView>(null);
 
-  // OCR 中の中止用。429 が続くとモデルを乗り換えながら数分粘ることがあるので、
-  // 待たされ続けるより諦められるようにしておく（画像は pending に残るので後から再開できる）
-  const ocrAbortRef = useRef<AbortController | null>(null);
-  const [ocrCancellable, setOcrCancellable] = useState(false);
+  // 画像キューと裏の OCR の状態
+  const [items, setItems]       = useState<ReceiptQueue.ReceiptItem[]>([]);
+  const [progress, setProgress] = useState<OcrWorker.WorkerProgress>(OcrWorker.getProgress());
+  const [listOpen, setListOpen] = useState(false);
 
-  // 未処理レシートの URI 一覧
-  const [pendingUris, setPendingUris] = useState<string[]>([]);
-  // 手動入力モーダルの対象レシート
-  const [manualTarget, setManualTarget] = useState<string | null>(null);
-
-  // 複数レシートを読み取ったときの確認対象（まだ書き込んでいない）
-  const [review, setReview]         = useState<ReviewTarget | null>(null);
-  const [reviewBusy, setReviewBusy] = useState(false);
-  // 一括処理のループから同期的に見たいので ref にも持つ
-  const reviewRef = useRef<ReviewTarget | null>(null);
-
-  const openReview = (target: ReviewTarget) => {
-    reviewRef.current = target;
-    setReview(target);
-  };
-  const closeReview = () => {
-    reviewRef.current = null;
-    setReview(null);
-  };
+  // 手動入力・確認の対象
+  const [manualTarget, setManualTarget] = useState<ReceiptQueue.ReceiptItem | null>(null);
+  const [review, setReview]             = useState<ReceiptQueue.ReceiptItem | null>(null);
+  const [reviewBusy, setReviewBusy]     = useState(false);
 
   // 代理入力モード
   const [proxyMode, setProxyMode] = useState(false);
   const [proxyUser, setProxyUser] = useState('');
 
-  // 通知権限を起動時にリクエスト（通知なしでも動作するので静かに）
+  // 通知権限を起動時にリクエスト（OCR 処理中の常駐通知を出すため。拒否されても OCR は動く）
   useEffect(() => {
     Notifications.requestPermissionsAsync().catch(() => {});
   }, []);
 
-  /** pending-receipts ディレクトリを読み直して state に反映 */
-  const refreshPending = useCallback(() => {
+  const refresh = useCallback(() => {
     try {
-      setPendingUris(ReceiptQueue.listPendingReceipts());
+      setItems(ReceiptQueue.listItems());
     } catch {
-      setPendingUris([]);
+      setItems([]);
     }
+    setProgress(OcrWorker.getProgress());
   }, []);
 
-  // マウント時に未処理レシートをスキャン
   useEffect(() => {
-    refreshPending();
-  }, [refreshPending]);
+    refresh();
+    return OcrWorker.subscribe(refresh);
+  }, [refresh]);
+
+  const attention = items.filter((i) => i.status !== 'queued');
+
+  useEffect(() => {
+    if (listOpen && attention.length === 0) setListOpen(false);
+  }, [listOpen, attention.length]);
 
   const handleProxyToggle = useCallback(async () => {
     if (proxyMode) {
@@ -162,212 +142,14 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
     });
   }, [navigation, proxyMode, proxyUser, handleProxyToggle]);
 
-  /**
-   * 行をスプレッドシートに書き込む。1 件でも入れば成功として扱い、結果メッセージを返す。
-   * 全滅したときだけ例外を投げる。
-   */
-  const saveRows = async (rows: ExpenseRow[]): Promise<string> => {
-    setStatusMsg(rows.length > 1 ? `書き込み中... (${rows.length}件)` : '書き込み中...');
-    onStatusChange(
-      rows.length > 1
-        ? `スプレッドシートに書き込み中... (${rows.length}件)`
-        : 'スプレッドシートに書き込み中...',
-    );
-
-    const saved: ExpenseRow[] = [];
-    let queued = 0;
-    let failed = 0;
-
-    for (const row of rows) {
-      try {
-        await appendRow(row);
-        saved.push(row);
-      } catch (e) {
-        // 通信できないだけなら端末に退避済み。OCR をやり直させる必要はない
-        if (e instanceof QueuedWriteError) {
-          saved.push(row);
-          queued++;
-          continue;
-        }
-        // 再サインインが必要なら残りも全部失敗するので即中断する
-        if (e instanceof AuthError) throw e;
-        // 1 件の失敗で他のレシートまで巻き添えにしない。件数だけ伝える
-        console.error('[Receipt] 1件の書き込みに失敗:', e);
-        failed++;
-      }
-    }
-
-    if (saved.length === 0) throw new Error('スプレッドシートに書き込めませんでした');
-    // 一覧の「前回の登録」から後で見直せるようにする。
-    // デモ中は appendRow がメモリ上のオーバーレイに積むだけで実データは書かれないが、
-    // saved にはマスク前の実データ（店名・金額）が入っているため、
-    // ここに保存すると端末ファイルに実データが残ってしまう。デモ中は保存しない
-    if (!(await Demo.isDemo())) LastBatch.saveLastBatch(saved);
-    return buildSaveMessage(saved, queued, failed);
-  };
-
-  /**
-   * OCR して行を組み立てる。
-   * - 1 件だけならそのまま書き込み、通知メッセージを返す
-   * - **複数件なら確認モーダルを開いて null を返す**（誤読が起きやすいので保存前に見せる）
-   */
-  const attemptReceipt = async (base64: string, uri: string): Promise<string | null> => {
-    setStatusMsg('OCR解析中...');
-    onStatusChange('OCR解析中...');
-    const categories = await CategoryService.getCategories();
-    const provider = getProvider();
-    const receipts = await provider.extractReceipts(base64, categories, ocrAbortRef.current?.signal);
-
-    // 金額を読めなかったものは捨てる（0 円の行を作らない）
-    const valid = receipts.filter((r) => r.amount > 0);
-    if (valid.length === 0) throw new Error('レシートを読み取れませんでした');
-
-    const user   = proxyMode ? proxyUser : await getCurrentUser();
-    const source = proxyMode ? 'proxy_camera' : 'camera';
-    const rows   = valid.map((data) => toExpenseRow(data, user, source));
-
-    if (rows.length > 1) {
-      openReview({ uri, rows });
-      return null;
-    }
-    return saveRows(rows);
-  };
-
-  /** 2 回失敗時のダイアログ（再試行 / 手動入力 / 諦める） */
-  const showFailureDialog = (uri: string, msg: string) => {
-    Alert.alert(
-      'OCR失敗',
-      `2 回試行しましたが失敗しました:\n${msg}`,
-      [
-        {
-          text: '再試行',
-          onPress: () => {
-            processReceipt(uri);
-          },
-        },
-        {
-          text: '手動入力',
-          onPress: () => setManualTarget(uri),
-        },
-        {
-          text: '諦める',
-          style: 'destructive',
-          onPress: () => {
-            ReceiptQueue.deleteReceipt(uri);
-            refreshPending();
-          },
-        },
-      ],
-      { cancelable: false },
-    );
-  };
-
-  /** 中止後の選択。「あとで」なら画像は pending に残る */
-  const showCancelledDialog = (uri: string) => {
-    Alert.alert('中止しました', undefined, [
-      { text: 'あとで', style: 'cancel' },
-      { text: '手動入力', onPress: () => setManualTarget(uri) },
-    ]);
-  };
-
-  /**
-   * 保存済みレシートファイルを OCR 処理する。
-   * 失敗時は 1 秒待って 1 回だけ自動リトライ。それでも失敗なら 3 択ダイアログ。
-   *
-   * 戻り値は一括処理のループを止めるかどうかの判断に使う:
-   * - `auth-failed` … 残り全件も同じ理由で失敗するので、Alert を連発させず打ち切る
-   * - `cancelled`   … ユーザーが中止したので残りも処理しない（画像は pending に残す）
-   */
-  const processReceipt = async (uri: string): Promise<'ok' | 'auth-failed' | 'cancelled'> => {
-    setBusy(true);
-    setStatusMsg('OCR解析中...');
-    // キャンセルボタン用。1 枚ごとに作り直す
-    const abort = new AbortController();
-    ocrAbortRef.current = abort;
-    setOcrCancellable(true);
-    let result: 'ok' | 'auth-failed' | 'cancelled' = 'ok';
-    try {
-      let base64: string;
-      try {
-        base64 = ReceiptQueue.readReceipt(uri);
-      } catch (e) {
-        Alert.alert(
-          'ファイル読み込み失敗',
-          `画像ファイルが壊れています。破棄します。\n${e instanceof Error ? e.message : String(e)}`,
-        );
-        ReceiptQueue.deleteReceipt(uri);
-        refreshPending();
-        return 'ok';
-      }
-
-      try {
-        const msg = await attemptReceipt(base64, uri);
-        if (msg === null) return 'ok'; // 確認モーダル待ち。画像はモーダル側で片付ける
-        ReceiptQueue.deleteReceipt(uri);
-        refreshPending();
-        onSuccess(msg);
-        return 'ok';
-      } catch (firstErr) {
-        if (firstErr instanceof AuthError) throw firstErr;
-        // 中止は「失敗」ではない。リトライも失敗ダイアログも出さず、画像は pending に残す
-        if (firstErr instanceof CancelledError) {
-          showCancelledDialog(uri);
-          return 'cancelled';
-        }
-        console.warn('[Receipt] OCR 1回目失敗、リトライ:', firstErr);
-      }
-
-      // 自動リトライ
-      setStatusMsg('OCR再試行中...');
-      onStatusChange('OCR再試行中...');
-      await new Promise((r) => setTimeout(r, 1000));
-      if (abort.signal.aborted) {
-        showCancelledDialog(uri);
-        return 'cancelled';
-      }
-      try {
-        const msg = await attemptReceipt(base64, uri);
-        if (msg === null) return 'ok';
-        ReceiptQueue.deleteReceipt(uri);
-        refreshPending();
-        onSuccess(msg);
-      } catch (secondErr) {
-        if (secondErr instanceof AuthError) throw secondErr;
-        if (secondErr instanceof CancelledError) {
-          showCancelledDialog(uri);
-          return 'cancelled';
-        }
-        const msg = secondErr instanceof Error ? secondErr.message : String(secondErr);
-        showFailureDialog(uri, msg);
-      }
-    } catch (e) {
-      if (e instanceof AuthError) {
-        result = 'auth-failed';
-        Alert.alert('再サインインが必要です', 'セッションが期限切れです。再度サインインしてください。', [
-          { text: 'OK', onPress: onSignedOut },
-        ]);
-      }
-    } finally {
-      ocrAbortRef.current = null;
-      setOcrCancellable(false);
-      setBusy(false);
-      setStatusMsg('');
-      onStatusChange('');
-    }
-    return result;
-  };
-
-  /** OCR 中止。通信を打ち切るだけで、画像は pending に残るので後から再開できる */
-  const handleCancelOcr = () => {
-    ocrAbortRef.current?.abort();
-    setStatusMsg('中止しています...');
+  /** 撮影時点の代理相手で積む（後から代理入力を切り替えても変わらない） */
+  const enqueue = (base64: string) => {
+    OcrWorker.enqueue(base64, proxyMode ? proxyUser : undefined);
   };
 
   const handleShoot = async () => {
-    if (!cameraRef.current || busy) return;
-    setBusy(true);
-    setStatusMsg('撮影中...');
-
+    if (!cameraRef.current || capturing) return;
+    setCapturing(true);
     try {
       const photo = await cameraRef.current.takePictureAsync({
         base64:  true,
@@ -378,71 +160,55 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
         shutterSound: false,
       });
       if (!photo?.base64) throw new Error('画像の取得に失敗しました');
-      const uri = ReceiptQueue.saveReceipt(photo.base64);
-      refreshPending();
-      setBusy(false);
-      setStatusMsg('');
-      navigation.navigate('Summary' as never);
-      await processReceipt(uri);
+      enqueue(photo.base64);
     } catch (e) {
-      setBusy(false);
-      setStatusMsg('');
       Alert.alert('失敗', e instanceof Error ? e.message : String(e));
+    } finally {
+      setCapturing(false);
     }
   };
 
   const handlePickImage = async () => {
-    if (busy) return;
+    if (capturing) return;
     // ピッカーが実際に開くまでの間も連打で多重起動されないようにする（撮影ボタンと同様）
-    setBusy(true);
-
-    const result = await ImagePicker.launchImageLibraryAsync({
-      mediaTypes: ['images'],
-      base64: true,
-      quality: 0.9,
-      allowsMultipleSelection: false,
-    });
-
-    if (result.canceled || !result.assets[0]?.base64) {
-      setBusy(false);
-      return;
-    }
-
+    setCapturing(true);
     try {
-      const uri = ReceiptQueue.saveReceipt(result.assets[0].base64);
-      refreshPending();
-      setBusy(false);
-      navigation.navigate('Summary' as never);
-      await processReceipt(uri);
+      const result = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: ['images'],
+        base64: true,
+        quality: 0.9,
+        allowsMultipleSelection: false,
+      });
+      if (result.canceled || !result.assets[0]?.base64) return;
+      enqueue(result.assets[0].base64);
     } catch (e) {
-      setBusy(false);
       Alert.alert('失敗', e instanceof Error ? e.message : String(e));
+    } finally {
+      setCapturing(false);
     }
   };
 
-  /** pending バナーから一括処理 */
-  const handleProcessPending = async () => {
-    if (busy || pendingUris.length === 0) return;
-    navigation.navigate('Summary' as never);
-    const snapshot = [...pendingUris];
-    for (const uri of snapshot) {
-      // 途中で失敗 → 3択ダイアログが出るのでそこで止まる。
-      // ダイアログ閉じた後は refreshPending で次の件がバナーに残るのでユーザーが再開できる
-      const outcome = await processReceipt(uri);
-      // 再サインインが必要な状態では残りも必ず同じ理由で失敗するので Alert を件数分
-      // 積まない。中止された場合も残りを続けない。どちらも残りはバナーに残る
-      if (outcome !== 'ok') break;
-      // 確認モーダルが開いたら残りは進めない（次の結果で上書きしてしまうため）
-      if (reviewRef.current) break;
-    }
+  const handleDiscard = (item: ReceiptQueue.ReceiptItem) => {
+    Alert.alert('破棄しますか？', undefined, [
+      { text: 'キャンセル', style: 'cancel' },
+      {
+        text: '破棄する',
+        style: 'destructive',
+        onPress: () => {
+          ReceiptQueue.deleteReceipt(item.uri);
+          refresh();
+        },
+      },
+    ]);
   };
 
-  /** pending 全破棄（2 段階確認） */
-  const handleDiscardPending = () => {
-    if (pendingUris.length === 0) return;
+  /** 要確認の全破棄（2 段階確認）。OCR 待ちの画像には触らない */
+  const handleDiscardAll = () => {
+    if (attention.length === 0) return;
+    const targets = [...attention];
     Alert.alert(
       '全て破棄しますか？',
-      `${pendingUris.length} 件の未処理レシートを全て削除します。`,
+      `${targets.length} 件の画像を全て削除します。`,
       [
         { text: 'キャンセル', style: 'cancel' },
         {
@@ -458,8 +224,9 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
                   text: '破棄する',
                   style: 'destructive',
                   onPress: () => {
-                    ReceiptQueue.deleteAllReceipts();
-                    refreshPending();
+                    for (const t of targets) ReceiptQueue.deleteReceipt(t.uri);
+                    setListOpen(false);
+                    refresh();
                   },
                 },
               ],
@@ -470,6 +237,37 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
     );
   };
 
+  const showAuthAlert = () => {
+    Alert.alert('再サインインが必要です', 'セッションが期限切れです。再度サインインしてください。', [
+      { text: 'OK', onPress: onSignedOut },
+    ]);
+  };
+
+  /** 確認・手動入力から保存する。成功したら画像を消す */
+  const saveFromItem = async (uri: string, rows: ExpenseRow[]): Promise<boolean> => {
+    onStatusChange(
+      rows.length > 1
+        ? `スプレッドシートに書き込み中... (${rows.length}件)`
+        : 'スプレッドシートに書き込み中...',
+    );
+    try {
+      const msg = await saveReceiptRows(rows);
+      ReceiptQueue.deleteReceipt(uri);
+      refresh();
+      onSuccess(msg);
+      return true;
+    } catch (e) {
+      if (e instanceof AuthError) {
+        showAuthAlert();
+        return false;
+      }
+      Alert.alert('保存失敗', e instanceof Error ? e.message : String(e));
+      return false;
+    } finally {
+      onStatusChange('');
+    }
+  };
+
   /** 読み取り結果の確認モーダルで「登録する」 */
   const handleReviewCommit = async (kept: ExpenseRow[]) => {
     if (!review) return;
@@ -477,63 +275,23 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
     // 全部「登録しない」＝このレシートは要らない。画像ごと片付ける
     if (kept.length === 0) {
       ReceiptQueue.deleteReceipt(review.uri);
-      closeReview();
-      refreshPending();
+      setReview(null);
+      refresh();
       return;
     }
 
     setReviewBusy(true);
     try {
-      const msg = await saveRows(kept);
-      ReceiptQueue.deleteReceipt(review.uri);
-      closeReview();
-      refreshPending();
-      onSuccess(msg);
-      navigation.navigate('Summary' as never);
-    } catch (e) {
-      if (e instanceof AuthError) {
-        Alert.alert('再サインインが必要です', 'セッションが期限切れです。再度サインインしてください。', [
-          { text: 'OK', onPress: onSignedOut },
-        ]);
-        return;
-      }
-      Alert.alert('保存失敗', e instanceof Error ? e.message : String(e));
+      if (await saveFromItem(review.uri, kept)) setReview(null);
     } finally {
       setReviewBusy(false);
-      setStatusMsg('');
-      onStatusChange('');
     }
-  };
-
-  /** 確認モーダルを閉じる（保存しない）。画像は残すので後から再処理できる */
-  const handleReviewClose = () => {
-    closeReview();
-    refreshPending();
   };
 
   /** 手動入力モーダルから保存 */
   const handleManualSave = async (entry: ExpenseRow) => {
     if (!manualTarget) return;
-    try {
-      const message = await saveRows([entry]);
-      ReceiptQueue.deleteReceipt(manualTarget);
-      setManualTarget(null);
-      refreshPending();
-      onSuccess(message);
-      navigation.navigate('Summary' as never);
-    } catch (e) {
-      if (e instanceof AuthError) {
-        Alert.alert('再サインインが必要です', 'セッションが期限切れです。再度サインインしてください。', [
-          { text: 'OK', onPress: onSignedOut },
-        ]);
-        return;
-      }
-      Alert.alert('保存失敗', e instanceof Error ? e.message : String(e));
-    } finally {
-      // saveRows が出した進捗バナーを消す
-      setStatusMsg('');
-      onStatusChange('');
-    }
+    if (await saveFromItem(manualTarget.uri, [entry])) setManualTarget(null);
   };
 
   if (!permission) {
@@ -570,59 +328,64 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
         </View>
       )}
 
-      {/* 未処理レシートバナー */}
-      {pendingUris.length > 0 && !busy && (
-        <View style={styles.pendingBanner}>
-          <Text style={styles.pendingBannerText}>
-            未処理レシート {pendingUris.length} 件
-          </Text>
-          <View style={styles.pendingBannerActions}>
-            <TouchableOpacity
-              style={styles.pendingBtn}
-              onPress={handleProcessPending}
-            >
-              <Text style={styles.pendingBtnText}>処理する</Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={[styles.pendingBtn, styles.pendingBtnDanger]}
-              onPress={handleDiscardPending}
-            >
-              <Text style={[styles.pendingBtnText, styles.pendingBtnDangerText]}>
-                破棄
-              </Text>
-            </TouchableOpacity>
-          </View>
-        </View>
+      {/* 中止・失敗・確認待ちの画像 */}
+      {attention.length > 0 && (
+        <TouchableOpacity style={styles.pendingBanner} onPress={() => setListOpen(true)}>
+          <Text style={styles.pendingBannerText}>要確認 {attention.length} 件</Text>
+          <Text style={styles.pendingBannerChevron}>›</Text>
+        </TouchableOpacity>
       )}
 
       <View style={styles.overlay}>
-        {busy ? (
+        {progress.running && (
           <View style={styles.statusBox}>
             <ActivityIndicator color="#fff" />
-            <Text style={styles.statusText}>{statusMsg}</Text>
-            {ocrCancellable && (
-              <TouchableOpacity style={styles.cancelOcrBtn} onPress={handleCancelOcr}>
-                <Text style={styles.cancelOcrBtnText}>中止</Text>
-              </TouchableOpacity>
-            )}
-          </View>
-        ) : (
-          <View style={styles.buttonRow}>
-            <TouchableOpacity style={styles.shootBtn} onPress={handleShoot}>
-              <Text style={styles.shootBtnText}>撮影して記録</Text>
-            </TouchableOpacity>
-            <TouchableOpacity style={styles.galleryBtn} onPress={handlePickImage}>
-              <Text style={styles.galleryBtnText}>ギャラリーから選択</Text>
+            <Text style={styles.statusText}>
+              OCR処理中 {Math.min(progress.done + 1, progress.total)}/{progress.total}
+            </Text>
+            <TouchableOpacity style={styles.cancelOcrBtn} onPress={OcrWorker.cancel}>
+              <Text style={styles.cancelOcrBtnText}>中止</Text>
             </TouchableOpacity>
           </View>
         )}
+        <View style={styles.buttonRow}>
+          <TouchableOpacity
+            style={[styles.shootBtn, capturing && styles.btnDisabled]}
+            onPress={handleShoot}
+            disabled={capturing}
+          >
+            <Text style={styles.shootBtnText}>撮影して記録</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[styles.galleryBtn, capturing && styles.btnDisabled]}
+            onPress={handlePickImage}
+            disabled={capturing}
+          >
+            <Text style={styles.galleryBtnText}>ギャラリーから選択</Text>
+          </TouchableOpacity>
+        </View>
       </View>
 
+      <PendingReceiptsModal
+        visible={listOpen}
+        items={attention}
+        onClose={() => setListOpen(false)}
+        onResume={(item) => OcrWorker.requeue([item.uri])}
+        onResumeAll={() => {
+          OcrWorker.requeue(attention.filter((i) => i.status !== 'review').map((i) => i.uri));
+          setListOpen(false);
+        }}
+        onManual={(item) => { setListOpen(false); setManualTarget(item); }}
+        onReview={(item) => { setListOpen(false); setReview(item); }}
+        onDiscard={handleDiscard}
+        onDiscardAll={handleDiscardAll}
+      />
+
       <ManualEntryModal
-        imageUri={manualTarget}
+        imageUri={manualTarget?.uri ?? null}
         onClose={() => setManualTarget(null)}
         onSave={handleManualSave}
-        proxyUser={proxyMode ? proxyUser : undefined}
+        proxyUser={manualTarget?.proxyUser}
       />
 
       {/* 複数レシートを読み取ったときの確認・編集 */}
@@ -632,7 +395,7 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
         rows={review?.rows ?? []}
         mode="confirm"
         busy={reviewBusy}
-        onClose={handleReviewClose}
+        onClose={() => setReview(null)}
         onCommit={handleReviewCommit}
       />
     </View>
@@ -925,109 +688,8 @@ function ManualEntryModal({
 
 // ─── utils ───────────────────────────────────────────────────────────────────
 
-/** OCR 結果 1 件を書き込み用の行に変換する */
-function toExpenseRow(data: ReceiptData, user: string, source: string): ExpenseRow {
-  return {
-    timestamp:     formatTimestamp(data.date, data.time),
-    source,
-    user,
-    store:         data.store,
-    category:      data.category,
-    amount:        data.amount,
-    memo:          summarizeItems(data.items),
-    countedAmount: data.amount,
-    excluded:      false,
-    confirmed:     false,
-    recurring:     false,
-  };
-}
-
-/**
- * 保存結果をトーストの文面にする。
- * 1 件なら日時・カテゴリまで見せ、複数なら店名と金額を並べる。
- */
-function buildSaveMessage(saved: ExpenseRow[], queued: number, failed: number): string {
-  const notes: string[] = [];
-  if (failed > 0) notes.push(`${failed}件は書き込めませんでした`);
-
-  if (saved.length === 1) {
-    const r = saved[0];
-    return [
-      queued > 0 ? '未送信で保存しました（通信が戻ったら自動送信）' : '記録しました',
-      `${r.store || '(店名なし)'}  ¥${r.amount.toLocaleString()}`,
-      `${r.category} · ${r.timestamp}`,
-      ...notes,
-    ].join('\n');
-  }
-
-  const lines = saved
-    .slice(0, 3)
-    .map((r) => `${r.store || '(店名なし)'}  ¥${r.amount.toLocaleString()}`);
-  if (saved.length > 3) lines.push(`ほか ${saved.length - 3} 件`);
-  if (queued > 0) notes.unshift(`うち ${queued} 件は未送信（通信が戻ったら自動送信）`);
-
-  return [`${saved.length}件を記録しました`, ...lines, ...notes].join('\n');
-}
-
-/**
- * レシートの日付として受け入れる過去の幅（日）。
- * これより古いものは年の誤読とみなす。
- */
-const MAX_PAST_DAYS = 400;
-
-/**
- * レシートから抽出した日付・時刻で 'YYYY/MM/DD HH:MM:SS' 形式の timestamp を作る。
- * 日付は AIProvider 側で YYYY-MM-DD に正規化済み。ここでは採用してよい値かだけ見る。
- */
-function formatTimestamp(receiptDate: string, receiptTime?: string): string {
-  const now = new Date();
-  const accepted = acceptableDate(receiptDate, now);
-  const datePart = accepted
-    ? accepted.replace(/-/g, '/')
-    : `${now.getFullYear()}/${pad(now.getMonth() + 1)}/${pad(now.getDate())}`;
-  let timePart: string;
-  if (receiptTime && /^\d{1,2}:\d{2}(:\d{2})?$/.test(receiptTime)) {
-    const [h, m, s] = receiptTime.split(':');
-    timePart = `${pad(Number(h))}:${pad(Number(m))}:${pad(Number(s ?? 0))}`;
-  } else {
-    timePart = `${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
-  }
-  return `${datePart} ${timePart}`;
-}
-
-/**
- * 読み取った日付を採用してよいか。駄目なら null（＝撮影日を使う）。
- *
- * 未来日は有効期限や次回来店期限を購入日と取り違えたケース、極端に古い日付は年の
- * 誤読が多い。そのまま書くと別の月シートに入って一覧から消えたように見えるので、
- * 撮影日に寄せる方が事故が小さい。
- */
-function acceptableDate(date: string, now: Date): string | null {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return null;
-
-  const [y, m, d] = date.split('-').map(Number);
-  const parsed  = new Date(y, m - 1, d).getTime();
-  const today   = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
-  const diffDay = (parsed - today) / 86_400_000;
-
-  if (diffDay > 1) { // 時差ぶんだけ 1 日は許容する
-    console.warn('[OCR] 未来の日付だったので撮影日を使う:', date);
-    return null;
-  }
-  if (diffDay < -MAX_PAST_DAYS) {
-    console.warn('[OCR] 古すぎる日付だったので撮影日を使う:', date);
-    return null;
-  }
-  return date;
-}
-
 function pad(n: number): string {
   return String(n).padStart(2, '0');
-}
-
-function summarizeItems(items?: { name: string; price: number }[]): string {
-  if (!items || items.length === 0) return '';
-  return items.map((it) => `${it.name}:${it.price}`).join(', ');
 }
 
 const styles = StyleSheet.create({
@@ -1053,6 +715,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     paddingVertical:   12,
     borderRadius:      8,
+    marginBottom:      16,
   },
   statusText: {
     color:    '#fff',
@@ -1093,6 +756,7 @@ const styles = StyleSheet.create({
     color: '#fff',
     fontSize: 14,
   },
+  btnDisabled: { opacity: 0.5 },
   center: {
     flex: 1,
     backgroundColor: '#fff',
@@ -1162,28 +826,10 @@ const styles = StyleSheet.create({
     fontWeight: 'bold',
     flexShrink: 1,
   },
-  pendingBannerActions: {
-    flexDirection: 'row',
-    gap: 8,
-  },
-  pendingBtn: {
-    backgroundColor: '#fff',
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    borderRadius: 6,
-  },
-  pendingBtnText: {
+  pendingBannerChevron: {
     color: '#1f2937',
-    fontSize: 13,
+    fontSize: 22,
     fontWeight: 'bold',
-  },
-  pendingBtnDanger: {
-    backgroundColor: '#fff',
-    borderWidth: 1,
-    borderColor: '#dc2626',
-  },
-  pendingBtnDangerText: {
-    color: '#dc2626',
   },
 
   // 手動入力モーダル

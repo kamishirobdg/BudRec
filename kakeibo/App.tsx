@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, Alert, Animated, AppState, StyleSheet, Text, View } from 'react-native';
-import { NavigationContainer } from '@react-navigation/native';
+import { ActivityIndicator, Alert, Animated, AppState, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import { createNavigationContainerRef, NavigationContainer } from '@react-navigation/native';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { StatusBar } from 'expo-status-bar';
@@ -15,8 +15,10 @@ import { isUserNameSet } from './services/UserService';
 import { runGmailImport } from './services/GmailService';
 import { flushWriteQueue } from './services/SheetsService';
 import { loadConfig as loadDemoConfig } from './services/DemoService';
+import * as OcrWorker from './services/OcrWorker';
 
 const Tab = createBottomTabNavigator();
+const navigationRef = createNavigationContainerRef();
 
 export default function App() {
   return (
@@ -35,20 +37,43 @@ function AppContent() {
   const [userNameSet, setUserNameSet] = useState(false);
   const lastGmailRunRef = useRef(0);
 
-  // OCR 処理中ステータスと成功トースト（画面遷移をまたいで表示するためここで管理）
+  // 書き込み中ステータスと成功トースト（画面遷移をまたいで表示するためここで管理）
   const [ocrStatus, setOcrStatus] = useState('');
-  const [ocrToast,  setOcrToast]  = useState('');
+  // 同じ文面が続いても出し直せるよう連番を持つ
+  const [ocrToast, setOcrToastState] = useState<{ text: string; id: number } | null>(null);
   const toastOpacity = useRef(new Animated.Value(0)).current;
+  const toastSeq = useRef(0);
+  const setOcrToast = (text: string) => setOcrToastState({ text, id: ++toastSeq.current });
+
+  // 裏の OCR の進み具合。撮影タブには専用の表示があるので、それ以外のタブで上部に出す
+  const [currentRoute, setCurrentRoute] = useState<string | undefined>();
+  const [ocrProgress, setOcrProgress]   = useState<OcrWorker.WorkerProgress>(OcrWorker.getProgress());
 
   useEffect(() => {
     if (!ocrToast) return;
     Animated.timing(toastOpacity, { toValue: 1, duration: 200, useNativeDriver: true }).start();
     const timer = setTimeout(() => {
       Animated.timing(toastOpacity, { toValue: 0, duration: 300, useNativeDriver: true })
-        .start(() => setOcrToast(''));
-    }, 3000);
+        .start(({ finished }) => { if (finished) setOcrToastState(null); });
+    }, 4000);
     return () => clearTimeout(timer);
   }, [ocrToast, toastOpacity]);
+
+  useEffect(() => OcrWorker.subscribe((e) => {
+    if (e.type === 'saved') setOcrToast(e.message);
+    if (e.type === 'auth-failed') {
+      // 画像は OCR 待ちのまま残るので、再サインイン後に続きから処理される
+      Alert.alert('再サインインが必要です', 'セッションが期限切れです。再度サインインしてください。', [
+        { text: 'OK', onPress: () => setSignedIn(false) },
+      ]);
+    }
+    setOcrProgress(OcrWorker.getProgress());
+  }), []);
+
+  const goToSummary = () => {
+    setOcrToastState(null);
+    if (navigationRef.isReady()) navigationRef.navigate('Summary' as never);
+  };
 
   useEffect(() => {
     (async () => {
@@ -100,7 +125,10 @@ function AppContent() {
 
   // サインイン直後に実行（ユーザー名が設定されるまでは取り込みを走らせない）
   useEffect(() => {
-    if (signedIn && userNameSet) syncPending();
+    if (!signedIn || !userNameSet) return;
+    syncPending();
+    // 前回 OCR 待ちのまま終了された画像の続き（中止・失敗したものは対象外）
+    OcrWorker.kick();
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [signedIn, userNameSet]);
 
@@ -131,7 +159,11 @@ function AppContent() {
       ) : !userNameSet ? (
         <UserSetupScreen onDone={() => setUserNameSet(true)} />
       ) : (
-        <NavigationContainer>
+        <NavigationContainer
+          ref={navigationRef}
+          onReady={() => setCurrentRoute(navigationRef.getCurrentRoute()?.name)}
+          onStateChange={() => setCurrentRoute(navigationRef.getCurrentRoute()?.name)}
+        >
           <Tab.Navigator
             screenOptions={{
               headerShown: true,
@@ -176,18 +208,33 @@ function AppContent() {
           </Tab.Navigator>
         </NavigationContainer>
       )}
-      {/* OCR 処理中バナー（全画面共通） */}
-      {!!ocrStatus && (
-        <View style={styles.statusBanner} pointerEvents="none">
-          <ActivityIndicator color="#fff" size="small" />
-          <Text style={styles.statusBannerText}>{ocrStatus}</Text>
-        </View>
-      )}
+      {/* 書き込み中・OCR 処理中バナー（全画面共通） */}
+      {(() => {
+        const text = ocrStatus || (
+          ocrProgress.running && signedIn && userNameSet && currentRoute !== 'Camera'
+            ? `OCR処理中 ${Math.min(ocrProgress.done + 1, ocrProgress.total)}/${ocrProgress.total}`
+            : ''
+        );
+        return !!text && (
+          <View style={styles.statusBanner} pointerEvents="none">
+            <ActivityIndicator color="#fff" size="small" />
+            <Text style={styles.statusBannerText}>{text}</Text>
+          </View>
+        );
+      })()}
 
       {/* 成功トースト（全画面共通） */}
       {!!ocrToast && (
-        <Animated.View style={[styles.toast, { opacity: toastOpacity }]} pointerEvents="none">
-          <Text style={styles.toastText}>{ocrToast}</Text>
+        <Animated.View style={[styles.toast, { opacity: toastOpacity }]} pointerEvents="box-none">
+          {/* 文面はタッチを受けない（下の「要確認」バナーやヘッダーを塞がない） */}
+          <View pointerEvents="none">
+            <Text style={styles.toastText}>{ocrToast.text}</Text>
+          </View>
+          {currentRoute !== 'Summary' && (
+            <TouchableOpacity style={styles.toastBtn} onPress={goToSummary}>
+              <Text style={styles.toastBtnText}>一覧へ</Text>
+            </TouchableOpacity>
+          )}
         </Animated.View>
       )}
 
@@ -239,5 +286,18 @@ const styles = StyleSheet.create({
     fontWeight: 'bold',
     textAlign:  'center',
     lineHeight: 22,
+  },
+  toastBtn: {
+    alignSelf:       'center',
+    marginTop:       10,
+    backgroundColor: '#fff',
+    borderRadius:    8,
+    paddingHorizontal: 20,
+    paddingVertical:   6,
+  },
+  toastBtnText: {
+    color:      '#15803d',
+    fontSize:   14,
+    fontWeight: 'bold',
   },
 });
