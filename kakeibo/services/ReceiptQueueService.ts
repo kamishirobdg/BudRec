@@ -45,8 +45,9 @@ interface ReceiptMeta {
   rows?:      ExpenseRow[];
   /** `deferred` のとき、処理し直してよい時刻（エポックミリ秒） */
   notBefore?: number;
-  /** 食事の `review` のとき、推定済みの食事の ID */
+  /** 食事の `review` のとき、推定済みの食事の ID と、その食事が入っているシート */
   mealId?:    string;
+  mealSheet?: string;
 }
 
 export interface ReceiptItem extends ReceiptMeta {
@@ -106,7 +107,7 @@ export function readReceipt(uri: string): string {
 export function setStatus(
   uri: string,
   status: ReceiptStatus,
-  extra: { error?: string; rows?: ExpenseRow[]; notBefore?: number; mealId?: string } = {},
+  extra: { error?: string; rows?: ExpenseRow[]; notBefore?: number; mealId?: string; mealSheet?: string } = {},
 ): void {
   // 破棄済みの画像に状態だけ残さない
   if (!new File(uri).exists) return;

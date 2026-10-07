@@ -474,6 +474,17 @@ async function execWrite(op: WriteQueue.WriteOp): Promise<void> {
       );
       return;
     }
+    case 'appendRaw': {
+      if (await ensureSheet(client, op.sheetName)) {
+        await writeHeaderRow(client, op.sheetName, op.header);
+      }
+      await client.post(
+        `/values/${encodeURIComponent(op.sheetName)}!${op.range}:append`,
+        { values: op.rows },
+        { params: { valueInputOption: 'RAW', insertDataOption: 'INSERT_ROWS' } },
+      );
+      return;
+    }
     case 'updateRow':
       await client.put(
         `/values/${encodeURIComponent(op.sheetName)}!A${op.rowIndex}:L${op.rowIndex}`,
@@ -599,6 +610,22 @@ export async function flushWriteQueue(): Promise<FlushResult> {
 
   return flushInflight;
 }
+
+/**
+ * 食事・共有写真などの別サービスが、同じスプレッドシートを読み書きするための入口。
+ * 認証・再送・シート作成の扱いをここに揃える（各サービスで写経しない）。
+ */
+export const SheetsInternal = {
+  createClient,
+  ensureSheet,
+  writeHeaderRow,
+  listSheetNames,
+  fetchSheetId,
+  invalidateSheetNames,
+  writeOrQueue,
+  describeError,
+  isQueueable,
+};
 
 // ─── 公開 API ─────────────────────────────────────────────────────────────────
 

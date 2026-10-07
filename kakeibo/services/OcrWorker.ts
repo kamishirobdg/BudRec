@@ -24,6 +24,9 @@ import { AuthError } from './AuthService';
 import { CancelledError, QuotaExceededError } from '../providers/AIProvider';
 import * as ReceiptQueue from './ReceiptQueueService';
 import { extractRows, saveReceiptRows } from './ReceiptProcessing';
+import { linkReceiptToMeals, processMealPhoto } from './MealProcessing';
+import { ensureMealShared } from './SharedPhotos';
+import type { ExpenseRow } from './SheetsService';
 
 export type WorkerEvent =
   | { type: 'changed' }
@@ -190,6 +193,8 @@ async function processOne(item: ReceiptQueue.ReceiptItem): Promise<Outcome> {
 
     for (let attempt = 0; ; attempt++) {
       try {
+        if (item.kind === 'meal') return await processMeal(item, base64, abort.signal);
+
         const rows = await extractRows(base64, item.proxyUser, abort.signal);
         // OCR が返った直後に中止された場合。ここを過ぎたら書き込みは最後まで行う
         if (abort.signal.aborted) return cancelled();
@@ -198,9 +203,10 @@ async function processOne(item: ReceiptQueue.ReceiptItem): Promise<Outcome> {
           ReceiptQueue.setStatus(item.uri, 'review', { rows });
           return 'done';
         }
-        const { message, entryIds } = await saveReceiptRows(rows);
+        const { message, entryIds, saved } = await saveReceiptRows(rows);
         ReceiptQueue.completeReceipt(item.uri, entryIds);
         emit({ type: 'saved', message });
+        await linkSavedReceipts(saved);
         return 'done';
       } catch (e) {
         if (e instanceof AuthError) return 'auth-failed';
@@ -218,6 +224,39 @@ async function processOne(item: ReceiptQueue.ReceiptItem): Promise<Outcome> {
   } finally {
     currentAbort = null;
     currentUri   = null;
+  }
+}
+
+/**
+ * 食事写真を 1 枚処理する。判別に困ったときは `review` にして「要確認」に出す
+ * （画像は確認が済むまで残す）。二人にまたがる食事なら写真を相手と共有する。
+ */
+async function processMeal(item: ReceiptQueue.ReceiptItem, base64: string, signal: AbortSignal): Promise<Outcome> {
+  const r = await processMealPhoto(item.uri, base64, item.shotAt ?? Date.now(), item.proxyUser, signal, {
+    keepOriginal: (needsReview) => needsReview,
+  });
+  if (r.needsReview) {
+    ReceiptQueue.setStatus(item.uri, 'review', { mealId: r.mealId, mealSheet: r.sheetName });
+  } else {
+    ReceiptQueue.deleteReceipt(item.uri);
+  }
+  const dishes = [...new Set(r.rows.map((x) => x.dish))];
+  emit({
+    type: 'saved',
+    message: [
+      r.needsReview ? '食事を記録しました（要確認）' : '食事を記録しました',
+      dishes.slice(0, 3).join('・') + (dishes.length > 3 ? ` ほか ${dishes.length - 3} 品` : ''),
+    ].join('\n'),
+  });
+  if (r.sharedMeal) await ensureMealShared(r.rows, r.rows[0]?.updatedBy ?? '');
+  return 'done';
+}
+
+/** 登録したレシートを、前後の時間の食事にひも付け直す（品目のあるものだけ） */
+export async function linkSavedReceipts(saved: ExpenseRow[]): Promise<void> {
+  for (const row of saved) {
+    if (!row.entryId || !row.items || row.items.length === 0) continue;
+    await linkReceiptToMeals({ entryId: row.entryId, timestamp: row.timestamp, store: row.store, items: row.items });
   }
 }
 

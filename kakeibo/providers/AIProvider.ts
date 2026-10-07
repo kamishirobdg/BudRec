@@ -274,7 +274,7 @@ export function normalizeDateString(raw: string, today: Date = new Date()): stri
 }
 
 /** モデルの返答を JSON として読む（コードブロックで返された場合に備えて剥がす） */
-function parseJson(raw: string): any {
+export function parseJson(raw: string): any {
   const cleaned = raw
     .trim()
     .replace(/^```(?:json)?\s*/i, '')
@@ -284,6 +284,16 @@ function parseJson(raw: string): any {
   try {
     return JSON.parse(cleaned);
   } catch (e) {
+    // grounding を使うと JSON の前後に説明文が付くことがある。最初の { から最後の } までを読む
+    const start = cleaned.indexOf('{');
+    const end   = cleaned.lastIndexOf('}');
+    if (start >= 0 && end > start) {
+      try {
+        return JSON.parse(cleaned.slice(start, end + 1));
+      } catch {
+        // 下で投げる
+      }
+    }
     throw new Error(`AI 応答の JSON パースに失敗: ${cleaned.slice(0, 200)}`);
   }
 }

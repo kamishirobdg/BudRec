@@ -14,6 +14,7 @@ import { readJsonArray, writeJson } from './jsonFileStore';
 
 const INDEX_FILE  = 'photo-index.json';
 const RECEIPT_DIR = ['photos', 'receipts'] as const;
+const MEAL_DIR    = ['photos', 'meals'] as const;
 
 interface PhotoIndexEntry {
   entryId: string;
@@ -47,11 +48,44 @@ export function archiveReceiptPhoto(uri: string, entryIds: string[]): void {
   }
 }
 
+/** 支出行にひも付いた写真の参照（この端末に無ければ null） */
+export function receiptPhotoRef(entryId: string | undefined): string | null {
+  if (!entryId) return null;
+  return readJsonArray<PhotoIndexEntry>(INDEX_FILE).find((e) => e.entryId === entryId)?.ref ?? null;
+}
+
 /** 支出行にひも付いた写真の URI（この端末に無ければ null） */
 export function receiptPhotoUri(entryId: string | undefined): string | null {
-  if (!entryId) return null;
-  const hit = readJsonArray<PhotoIndexEntry>(INDEX_FILE).find((e) => e.entryId === entryId);
-  if (!hit?.ref.startsWith('local:')) return null;
-  const file = new File(Paths.document, ...hit.ref.slice('local:'.length).split('/'));
-  return file.exists ? file.uri : null;
+  return localUri(receiptPhotoRef(entryId));
+}
+
+/**
+ * 食事の写真を OCR 待ちのフォルダから保存先へ移し、参照（`local:...`）を返す。
+ * 失敗したら null（記録は写真なしで続ける）。
+ */
+export function archiveMealPhoto(uri: string, keepOriginal = false): string | null {
+  try {
+    const src = new File(uri);
+    if (!src.exists) return null;
+    const dir = new Directory(Paths.document, ...MEAL_DIR);
+    if (!dir.exists) dir.create({ intermediates: true, idempotent: true });
+    const name = src.name;
+    if (keepOriginal) src.copy(dir);
+    else src.move(dir);
+    return `local:${MEAL_DIR.join('/')}/${name}`;
+  } catch (e) {
+    console.warn('[PhotoStore] 食事の写真を残せなかった:', e instanceof Error ? e.message : e);
+    return null;
+  }
+}
+
+/** `local:` の参照を、この端末のファイル URI にする（無ければ null） */
+export function localUri(ref: string | null | undefined): string | null {
+  if (!ref?.startsWith('local:')) return null;
+  try {
+    const file = new File(Paths.document, ...ref.slice('local:'.length).split('/'));
+    return file.exists ? file.uri : null;
+  } catch {
+    return null;
+  }
 }

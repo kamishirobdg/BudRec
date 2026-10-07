@@ -36,6 +36,8 @@ export interface SaveResult {
   message:  string;
   /** 書き込めた（未送信に回ったものを含む）行の ID。写真のひも付けに使う */
   entryIds: string[];
+  /** 書き込めた行（ID・品目付き）。食事とのひも付けに使う */
+  saved:    ExpenseRow[];
 }
 
 /**
@@ -76,6 +78,7 @@ export async function saveReceiptRows(rows: ExpenseRow[]): Promise<SaveResult> {
   return {
     message:  buildSaveMessage(saved, queued, failed),
     entryIds: saved.map((r) => r.entryId!),
+    saved,
   };
 }
 

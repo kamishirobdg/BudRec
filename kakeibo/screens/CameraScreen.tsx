@@ -253,8 +253,10 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
         : 'スプレッドシートに書き込み中...',
     );
     try {
-      const { message: msg, entryIds } = await saveReceiptRows(rows);
+      const { message: msg, entryIds, saved } = await saveReceiptRows(rows);
       ReceiptQueue.completeReceipt(uri, entryIds);
+      // 前後の時間の食事にレシートをひも付け直す（待たずに裏で進める）
+      void OcrWorker.linkSavedReceipts(saved);
       refresh();
       onSuccess(msg);
       return true;

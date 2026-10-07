@@ -29,6 +29,8 @@ export type WriteOp =
   | { kind: 'append';       entry: ExpenseRow }
   /** 購入品目の追記（`_items_YYYY-MM`）。支出行の append の直後に積む */
   | { kind: 'appendItems';  sheetName: string; entryId: string; store: string; rows: (string | number)[][] }
+  /** 汎用の追記（食事など）。シートが無ければ header を書いて作る */
+  | { kind: 'appendRaw';    sheetName: string; header: string[]; range: string; label: string; rows: (string | number)[][] }
   | { kind: 'updateRow';    sheetName: string; rowIndex: number; entry: ExpenseRow }
   | { kind: 'updateFlags';  sheetName: string; rowIndex: number; patch: RowFlagsPatch }
   | { kind: 'markDeleted';  sheetName: string; rowIndex: number }
@@ -167,6 +169,7 @@ function groupsOf(op: WriteOp): FieldGroup[] {
   switch (op.kind) {
     case 'append':       return [];
     case 'appendItems':  return [];
+    case 'appendRaw':    return [];
     case 'updateRow':    return ['main', 'flags', 'recurring', 'deleted'];
     case 'updateFlags':  return ['flags'];
     case 'setRecurring': return ['recurring'];
@@ -176,7 +179,7 @@ function groupsOf(op: WriteOp): FieldGroup[] {
 
 /** その操作が対象にしている行（追記はまだ行番号が無いので null） */
 function rowTargetOf(op: WriteOp): { sheetName: string; rowIndex: number } | null {
-  if (op.kind === 'append' || op.kind === 'appendItems') return null;
+  if (op.kind === 'append' || op.kind === 'appendItems' || op.kind === 'appendRaw') return null;
   return { sheetName: op.sheetName, rowIndex: op.rowIndex };
 }
 
@@ -263,6 +266,7 @@ export function applyPendingTo(row: ExpenseRow): ExpenseRow {
       case 'markDeleted':  next = { ...next, deleted: true }; break;
       case 'append':       break;
       case 'appendItems':  break;
+      case 'appendRaw':    break;
     }
   }
   return next;
@@ -275,6 +279,8 @@ export function describeOp(op: WriteOp): string {
       return `追加: ${op.entry.store || '(店名なし)'} ¥${op.entry.amount.toLocaleString()}`;
     case 'appendItems':
       return `品目の追加: ${op.store || '(店名なし)'} ${op.rows.length}品`;
+    case 'appendRaw':
+      return op.label;
     case 'updateRow':
       return `編集: ${op.entry.store || '(店名なし)'} ¥${op.entry.amount.toLocaleString()}`;
     case 'updateFlags':
