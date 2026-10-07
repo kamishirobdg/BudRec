@@ -47,7 +47,9 @@ kakeibo/
 ├── .env.example             必要な環境変数のテンプレート
 ├── assets/                  icon.png / adaptive-icon.png / splash-icon.png（緑背景＋💰）
 ├── components/
-│   └── ErrorBoundary.tsx    描画中の例外を受け止める。App全体＋タブ単位で使う
+│   ├── ErrorBoundary.tsx    描画中の例外を受け止める。App全体＋タブ単位で使う
+│   ├── ZoomableImage.tsx    ＋/− で拡大して縦横に動かせる画像
+│   └── MealPhotos.tsx       食事・レシートの写真（自分の端末は元の写真、相手の端末は共有版）
 ├── screens/
 │   ├── HomeScreen.tsx       (52行) ホーム
 │   ├── CameraScreen.tsx     (1093行) レシート撮影・ギャラリー選択・OCR→確認→保存
@@ -55,6 +57,8 @@ kakeibo/
 │   ├── SettingsScreen.tsx   (768行) ユーザー名・Gmail連携・カテゴリ管理・未送信キュー
 │   ├── ReceiptReviewModal.tsx (385行) 複数明細の確認・編集（保存前／登録後の両方で使う）
 │   ├── PendingReceiptsModal.tsx 「要確認」の画像一覧（再開・手入力・確認・破棄）
+│   ├── MealsScreen.tsx      「食事」タブ（日ごとの一覧・栄養の合計）
+│   ├── MealEditModal.tsx    食事の編集（食べた人・割合・品・確定・以前の内容に戻す）
 │   ├── PersonalModal.tsx    (297行) 個人支出モーダル（読み出しのみ）
 │   └── MemoText.tsx         メモ内の価格を太字表示
 ├── services/
@@ -68,6 +72,12 @@ kakeibo/
 │   ├── ReceiptQueueService.ts  レシート画像と状態（OCR待ち/中止/失敗/確認待ち）
 │   ├── OcrWorker.ts         裏で 1 枚ずつ OCR（フォアグラウンドサービス）
 │   ├── ReceiptProcessing.ts OCR→行の組み立て→保存（画面に依存しない部分）
+│   ├── MealService.ts       食事のシート（_meals）の読み書き・rev・履歴
+│   ├── MealProcessing.ts    食事写真の判別→レシートとの突き合わせ→栄養→割り振り
+│   ├── SharedPhotos.ts      二人の食事の写真を共有用シート（非表示）経由で見せる
+│   ├── PhotoStore.ts        写真を端末に残す（photos/receipts・photos/meals）
+│   ├── Nutrients.ts         栄養素の定義（成分表の INFOODS タグ）と合計
+│   ├── BackgroundOcr.ts     推定待ちを処理し直す Android の定期実行
 │   ├── DuplicateDetector.ts 重複候補の検出
 │   ├── CategoryService.ts / UserService.ts / PreferencesService.ts / Storage.ts
 ├── plugins/
@@ -79,16 +89,30 @@ kakeibo/
 
 ## 4. データモデル（スプレッドシート）
 
-月ごとに `YYYY-MM` という名前のシートを作り、1 行 = 1 支出。列範囲は **`A:M`**（v1.9.0 で M 列を追加）。
+月ごとに `YYYY-MM` という名前のシートを作り、1 行 = 1 支出。列範囲は **`A:N`**（v1.9.0 で M 列、v2.0.0 で N 列を追加）。
 
 ```
 A timestamp | B source | C user  | D store   | E category | F amount
 G memo      | H counted_amount   | I excluded | J confirmed | K recurring | L deleted
-M entry_id（行の ID。v1.9.0 以降に追加した行だけ。編集の updateRow は A:L だけ書き M に触らない）
+M entry_id（行の ID。v1.9.0 以降に追加した行だけ）
+N rev（同時編集の検出用。書き換えるたびに 1 増える。v2.0.0 以前の行は空 = 0）
 ```
+
+- **支出行の書き換え（編集・除外などの切り替え・固定費・削除）は `SheetsService.writeRowWithRev` を通る。**
+  書く前に行を読み、N 列の rev が画面に読み込んだときの値と違えば `ExpenseConflictError`（ほかの端末が先に変更した）。
+  一覧画面は「相手の内容を残す / 自分の内容で上書き」を選ばせる。書くのは操作の列から N 列までの連続した
+  範囲を 1 回の PUT で（間の列は読んだ値を書き戻す）。編集と削除は直前の内容を `_history` に残し、
+  編集画面の「以前の内容に戻す」から戻せる。未送信キューから流すときに食い違ったら「競合」で止め、
+  設定画面の「未送信の変更」で上書きか破棄を選ばせる（`WriteQueue.forceRetry`）。
+  自分の書き込み同士で競合扱いにならないよう、書けたら手元の行と後続の未送信項目の rev を進める
+  （`applyRev` / `WriteQueue.advanceBaseRev`）。
 
 購入品目は `_items_YYYY-MM`（購入月ごと）に 1 行 = 1 品目で入る（`entry_id` で支出行とひも付く）。
 列の定義は `docs/meal-nutrition-spec.md` §3.2。
+
+食事関係のシート（v2.0.0。定義は仕様書 §3）: `_meals_YYYY-MM`（1 行 = 1 人 × 1 品）、`_meal_corrections`、
+`_history`（食事・支出行の上書き前の内容）、`_shared_photos`（**非表示**。二人の食事の写真を base64 で一時的に置く）、
+`_users`（各端末のユーザー名。代理入力の相手の候補）。
 
 ```ts
 interface ExpenseRow {
@@ -198,8 +222,9 @@ Hermes エンジンでは `new Date('2026/07/30 12:00:00')` が **NaN** にな�
 
 - 2 人分揃っている通常時は読み出しが増えない（前月は読まない）。
 - 前月シートが無ければ何も足さずに終わる（`readUsersFromSheet` が例外を飲む）。
-- それでも 2 か月続けて相手の記録が無ければ出ない。根本的に直すなら `_settings` に
-  ユーザー名の列を足して各端末が自分の名前を登録する作りが要る（未実装）。
+- それでも 2 か月続けて相手の記録が無ければ出ない。→ **v2.0.0 で解消**: 各端末がサインイン時に
+  自分のユーザー名を `_users` シートに登録し（`SheetsService.registerUser`。名前を変えたら旧名の行を書き換える）、
+  `getUniqueUsersRaw` がそれも合わせて返す。
 
 ### 固定費の月初自動作成の仕組み
 1. `SummaryScreen` 起動時に 1 回だけ `checkAndApplyRecurring()` を実行
@@ -812,6 +837,16 @@ critic エージェント3体（services層／画面層／カメラ・OCR・基�
 ### 食事・栄養記録（設計中）
 - 仕様書: **`docs/meal-nutrition-spec.md`**。決定事項・データモデル・段階・未決事項はそちらを正とする。
 - [x] 段階 1（支出行の ID・品目の構造化保存・レシート写真を端末に残す）実装（2026-10-07、v1.9.0）
+- [x] 段階 2（食事の記録・推定・共有写真・同時編集の検出・推定待ちのバッチ再処理）実装（2026-10-07、v2.0.0）。
+  何を入れて何が残っているかは仕様書 §8.6
+- [ ] **段階 2 の実機確認（v2.0.0）**:
+  - 撮影画面で「食事」に切り替えて料理を撮る → 「食事」タブに記録され、料理名・カロリーが出ること
+  - 料理を撮ってから同じ店のレシートを撮る → 食事にレシートがひも付き、料理名がレシートの品名に寄ること
+  - 二人分の料理・取り分ける料理 → 二人に割り振られること。迷う写真は「要確認」に出ること
+  - 食事の編集（食べた人・割合・料理名・品の追加削除・確定・以前の内容に戻す・削除）
+  - 二人の端末で同じ食事・同じ支出行を編集 → 後から保存した側に警告が出ること
+  - 二人の食事の写真が相手の端末でも見られること（共有用シート `_shared_photos` が非表示でできること）
+  - 代理入力の相手が、相手の端末でサインインしただけで選べること
 - [ ] **段階 1 の実機確認**: レシートを登録 → 月次シートの M 列に ID が入ること、`_items_YYYY-MM` シートが
   でき品目が並ぶこと（正規化した品名・数量・種類）、Gmail 取り込みでも同様なこと、固定費の月初コピーで
   新しい ID が振られること、編集しても M 列の ID が消えないこと
