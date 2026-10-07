@@ -27,6 +27,7 @@ import { archiveMealPhoto, mealPhotoRef } from '../services/PhotoStore';
 import { ensureMealShared, markSettled } from '../services/SharedPhotos';
 import { researchNow } from '../services/FoodService';
 import { consume } from '../services/InventoryService';
+import FoodThumb from '../components/FoodThumb';
 
 export type MealTarget =
   | { mode: 'edit'; sheetName: string; mealId: string }
@@ -487,13 +488,15 @@ export default function MealEditModal({ target, onClose, onSaved }: Props) {
                         <Text style={styles.choiceTitle}>どれですか？</Text>
                         <View style={styles.chips}>
                           {d.choices.map((c) => (
-                            <Chip
-                              key={c.itemId}
-                              small
-                              label={`${c.name}（${c.store} ${c.bought}）`}
-                              active={d.chosen === c.itemId}
-                              onPress={() => update(d.dishId, { chosen: c.itemId })}
-                            />
+                            <View key={c.itemId} style={styles.choiceItem}>
+                              <FoodThumb name={c.name} size={32} />
+                              <Chip
+                                small
+                                label={`${c.name}（${c.store} ${c.bought}）`}
+                                active={d.chosen === c.itemId}
+                                onPress={() => update(d.dishId, { chosen: c.itemId })}
+                              />
+                            </View>
                           ))}
                           <Chip
                             small
@@ -679,6 +682,7 @@ const styles = StyleSheet.create({
   ratioLegend:    { fontSize: 12, color: '#6b7280' },
   choiceBox:      { gap: 6, backgroundColor: '#fffbeb', borderRadius: 10, padding: 10 },
   choiceTitle:    { fontSize: 13, color: '#b45309', fontWeight: '700' },
+  choiceItem:     { flexDirection: 'row', alignItems: 'center', gap: 4 },
   reresearch:     { fontSize: 12, color: '#2563eb', fontWeight: '600' },
   addRow:    { flexDirection: 'row', gap: 8 },
   addInput: {

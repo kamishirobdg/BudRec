@@ -13,6 +13,7 @@ import {
   InventoryItem, keepInStock, listInventory, markUsedUp, remainLabel,
 } from '../services/InventoryService';
 import { researchNow } from '../services/FoodService';
+import FoodThumb from '../components/FoodThumb';
 
 const STORAGE_LABEL: Record<string, string> = { chilled: '冷蔵', frozen: '冷凍', ambient: '常温', '': 'その他' };
 const DAY = 24 * 60 * 60 * 1000;
@@ -88,6 +89,7 @@ export default function InventoryView({ onConfirmCount }: { onConfirmCount?: (n:
         return (
           <View style={styles.card}>
             <View style={styles.cardTop}>
+              <FoodThumb name={item.name} />
               <Text style={styles.name} numberOfLines={1}>{item.name}</Text>
               <Text style={styles.remain}>{remainLabel(item)}</Text>
             </View>

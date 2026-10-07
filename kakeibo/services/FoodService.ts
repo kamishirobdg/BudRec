@@ -21,9 +21,9 @@ const SHEET = '_foods';
 const HEADER = [
   'food_id', 'key', 'name', 'chain', 'kind', 'storage', 'shelf_days', 'pieces', 'content',
   'nutrients', 'basis', 'source', 'sources', 'fetched_at', 'purchase_count', 'last_price', 'prices',
-  'status', 'updated_at',
+  'status', 'updated_at', 'image_url',
 ];
-const RANGE = 'A:S';
+const RANGE = 'A:T';
 
 const REFRESH_MS = 180 * 24 * 60 * 60 * 1000;
 /** 空き時間に 1 日に調べる品目数の上限（grounding の無料枠を通常の OCR に残すため） */
@@ -53,6 +53,8 @@ export interface Food {
   lastPrice:     number | null;
   prices:        number[];
   status:        FoodStatus;
+  /** パッケージ画像（公式ページの og:image）。'' = まだ探していない / '-' = 見つからなかった */
+  imageUrl:      string;
   rowIndex:      number;
 }
 
@@ -81,6 +83,7 @@ function fromCells(c: any[], rowIndex: number): Food {
     sources: parseJsonCell<string[]>(c[12], []), fetchedAt: Number(c[13]) || 0,
     purchaseCount: Number(c[14]) || 0, lastPrice: num(c[15]), prices: parseJsonCell<number[]>(c[16], []),
     status: c[17] === 'done' || c[17] === 'failed' ? c[17] : 'pending',
+    imageUrl: String(c[19] ?? ''),
     rowIndex,
   };
 }
@@ -89,7 +92,7 @@ function toCells(f: Food): (string | number)[] {
   return [
     f.foodId, f.key, f.name, f.chain, f.kind, f.storage, f.shelfDays ?? '', f.pieces ?? '', f.content,
     JSON.stringify(f.nutrients), f.basis, f.source, JSON.stringify(f.sources), f.fetchedAt || '',
-    f.purchaseCount, f.lastPrice ?? '', JSON.stringify(f.prices.slice(-10)), f.status, nowLabel(),
+    f.purchaseCount, f.lastPrice ?? '', JSON.stringify(f.prices.slice(-10)), f.status, nowLabel(), f.imageUrl,
   ];
 }
 
@@ -98,8 +101,17 @@ function toCells(f: Food): (string | number)[] {
 let cache: { foods: Map<string, Food>; at: number } | null = null;
 const CACHE_MS = 60_000;
 
+let inflight: Promise<Map<string, Food>> | null = null;
+
 export async function loadFoods(force = false): Promise<Map<string, Food>> {
   if (!force && cache && Date.now() - cache.at < CACHE_MS) return cache.foods;
+  // 画像の表示などで同時に何か所からも呼ばれるので、読み込み中なら同じ結果を待つ
+  if (!force && inflight) return inflight;
+  inflight = readFoods().finally(() => { inflight = null; });
+  return inflight;
+}
+
+async function readFoods(): Promise<Map<string, Food>> {
   const client = await SheetsInternal.createClient();
   const names = await SheetsInternal.listSheetNames(client, true);
   const foods = new Map<string, Food>();
@@ -123,6 +135,7 @@ export async function loadFoods(force = false): Promise<Map<string, Food>> {
         nutrients: nutrition.nutrients, basis: nutrition.basis, source: nutrition.source,
         sources: nutrition.sources, fetchedAt: nutrition.fetchedAt, status: nutrition.status,
         purchaseCount: Math.max(prev.purchaseCount, f.purchaseCount),
+        imageUrl: prev.imageUrl || f.imageUrl,
       });
     });
   }
@@ -168,16 +181,16 @@ async function ensureSheet(): Promise<void> {
  * 書き換えるのは役割ごとの列だけにする。購入の記録（E〜I・O〜Q）と栄養の調査（J〜N・R）が同時に走っても、
  * 相手が書いた列を古い値で上書きしない。
  */
-type FoodColumns = 'purchase' | 'nutrition';
+type FoodColumns = 'purchase' | 'nutrition' | 'image';
 
 function rangesFor(f: Food, cols: FoodColumns): { range: string; values: (string | number)[][] }[] {
   const c = toCells(f);
   const r = f.rowIndex;
   const at = (from: string, to: string, a: number, b: number) =>
     ({ range: `'${SHEET}'!${from}${r}:${to}${r}`, values: [c.slice(a, b + 1)] });
-  return cols === 'purchase'
-    ? [at('E', 'I', 4, 8), at('O', 'Q', 14, 16), at('S', 'S', 18, 18)]
-    : [at('J', 'N', 9, 13), at('R', 'S', 17, 18)];
+  if (cols === 'purchase') return [at('E', 'I', 4, 8), at('O', 'Q', 14, 16), at('S', 'S', 18, 18)];
+  if (cols === 'nutrition') return [at('J', 'N', 9, 13), at('R', 'S', 17, 18)];
+  return [at('T', 'T', 19, 19)];
 }
 
 async function writeFoods(updates: Food[], appends: Food[], cols: FoodColumns): Promise<void> {
@@ -204,7 +217,7 @@ function newFood(key: string, name: string, chain: string): Food {
   return {
     foodId: newEntryId(), key, name, chain, kind: '', storage: '', shelfDays: null, pieces: null, content: '',
     nutrients: sanitizeNutrients({}), basis: 'package', source: '', sources: [], fetchedAt: 0,
-    purchaseCount: 0, lastPrice: null, prices: [], status: 'pending', rowIndex: 0,
+    purchaseCount: 0, lastPrice: null, prices: [], status: 'pending', imageUrl: '', rowIndex: 0,
   };
 }
 
@@ -311,6 +324,12 @@ export async function saveResearched(entries: { query: FoodQuery; result: FoodNu
     (next.rowIndex > 0 ? updates : appends).push(next);
   }
   await writeFoods(updates, appends, 'nutrition');
+}
+
+/** パッケージ画像の URL を書く（見つからなかったときは '-'） */
+export async function saveImageUrls(list: { food: Food; imageUrl: string }[]): Promise<void> {
+  const rows = list.filter((x) => x.food.rowIndex > 0).map((x) => ({ ...x.food, imageUrl: x.imageUrl }));
+  await writeFoods(rows, [], 'image');
 }
 
 /** 調べ直す（在庫・食事の画面の「調べ直す」）。調べた結果を返す */

@@ -32,6 +32,7 @@ import { mealExists, mealsSheetName } from './MealService';
 import { existingEntryIds } from './SheetsService';
 import { ensureMealShared } from './SharedPhotos';
 import { researchSomePending } from './FoodService';
+import { fillSomeImages } from './FoodImages';
 import type { ExpenseRow } from './SheetsService';
 
 export type WorkerEvent =
@@ -138,6 +139,14 @@ export async function researchIdle(): Promise<void> {
     }
   } catch (e) {
     if (!(e instanceof QuotaExceededError)) console.warn('[OcrWorker] 食品データの調査に失敗:', e instanceof Error ? e.message : e);
+  }
+  // パッケージ画像は公式ページを読むだけで AI の無料枠を使わないので、調査が止まっても進める
+  try {
+    for (let i = 0; i < 4 && !running && queuedCount() === 0; i++) {
+      if (!(await fillSomeImages())) break;
+    }
+  } catch (e) {
+    console.warn('[OcrWorker] パッケージ画像を探せなかった:', e instanceof Error ? e.message : e);
   } finally {
     researching = false;
   }
