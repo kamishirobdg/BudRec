@@ -8,6 +8,8 @@ import { Ionicons } from '@expo/vector-icons';
 import HomeScreen from './screens/HomeScreen';
 import CameraScreen from './screens/CameraScreen';
 import SummaryScreen from './screens/SummaryScreen';
+import MealsScreen from './screens/MealsScreen';
+import { cleanupExpired as cleanupSharedPhotos } from './services/SharedPhotos';
 import UserSetupScreen from './screens/UserSetupScreen';
 import ErrorBoundary from './components/ErrorBoundary';
 import { handleAuthCallback, isSignedIn, AuthError } from './services/AuthService';
@@ -132,6 +134,8 @@ function AppContent() {
     OcrWorker.kick();
     // 無料枠切れで推定待ちになった画像を、アプリを開いていなくても処理し直す
     registerBackgroundOcr();
+    // 期限（保存から 7 日・共有から 14 日）を過ぎた共有写真を共有用シートから消す
+    cleanupSharedPhotos();
     // 代理入力の相手の候補として、この端末のユーザー名を共有の一覧に載せる
     getCurrentUserRaw()
       .then((name) => registerUser(name))
@@ -196,6 +200,21 @@ function AppContent() {
                     onStatusChange={setOcrStatus}
                     onSuccess={setOcrToast}
                   />
+                </ErrorBoundary>
+              )}
+            </Tab.Screen>
+            <Tab.Screen
+              name="Meals"
+              options={{
+                title: '食事',
+                tabBarIcon: ({ color, size }) => (
+                  <Ionicons name="restaurant" color={color} size={size} />
+                ),
+              }}
+            >
+              {() => (
+                <ErrorBoundary>
+                  <MealsScreen />
                 </ErrorBoundary>
               )}
             </Tab.Screen>

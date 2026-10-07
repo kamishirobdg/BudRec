@@ -32,6 +32,7 @@ import * as OcrWorker from '../services/OcrWorker';
 import { saveReceiptRows } from '../services/ReceiptProcessing';
 import ReceiptReviewModal from './ReceiptReviewModal';
 import PendingReceiptsModal from './PendingReceiptsModal';
+import MealEditModal, { MealTarget } from './MealEditModal';
 import ZoomableImage from '../components/ZoomableImage';
 
 // 通知ハンドラ: フォアグラウンド時もバナーとリストに表示する。
@@ -68,6 +69,10 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
   const [manualTarget, setManualTarget] = useState<ReceiptQueue.ReceiptItem | null>(null);
   const [review, setReview]             = useState<ReceiptQueue.ReceiptItem | null>(null);
   const [reviewBusy, setReviewBusy]     = useState(false);
+  // 食事の確認・手入力（料理の写真から）
+  const [mealTarget, setMealTarget]     = useState<{ item: ReceiptQueue.ReceiptItem; target: MealTarget } | null>(null);
+  // 撮るものの種類。続けて撮りやすいよう、切り替えるまで保つ
+  const [shotKind, setShotKind]         = useState<ReceiptQueue.PhotoKind>('receipt');
 
   // 代理入力モード
   const [proxyMode, setProxyMode] = useState(false);
@@ -146,7 +151,7 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
 
   /** 撮影時点の代理相手で積む（後から代理入力を切り替えても変わらない） */
   const enqueue = (base64: string) => {
-    OcrWorker.enqueue(base64, proxyMode ? proxyUser : undefined);
+    OcrWorker.enqueue(base64, proxyMode ? proxyUser : undefined, shotKind);
   };
 
   const handleShoot = async () => {
@@ -359,6 +364,19 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
             </TouchableOpacity>
           </View>
         )}
+        <View style={styles.kindRow}>
+          {(['receipt', 'meal'] as const).map((k) => (
+            <TouchableOpacity
+              key={k}
+              style={[styles.kindChip, shotKind === k && styles.kindChipActive]}
+              onPress={() => setShotKind(k)}
+            >
+              <Text style={[styles.kindChipText, shotKind === k && styles.kindChipTextActive]}>
+                {k === 'receipt' ? 'レシート' : '食事'}
+              </Text>
+            </TouchableOpacity>
+          ))}
+        </View>
         <View style={styles.buttonRow}>
           <TouchableOpacity
             style={[styles.shootBtn, capturing && styles.btnDisabled]}
@@ -386,8 +404,22 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
           OcrWorker.requeue(attention.filter((i) => i.status !== 'review').map((i) => i.uri));
           setListOpen(false);
         }}
-        onManual={(item) => { setListOpen(false); setManualTarget(item); }}
-        onReview={(item) => { setListOpen(false); setReview(item); }}
+        onManual={(item) => {
+          setListOpen(false);
+          if (item.kind === 'meal') {
+            setMealTarget({ item, target: { mode: 'new', photoUri: item.uri, shotAt: item.shotAt ?? Date.now(), proxyUser: item.proxyUser } });
+          } else {
+            setManualTarget(item);
+          }
+        }}
+        onReview={(item) => {
+          setListOpen(false);
+          if (item.kind === 'meal' && item.mealId && item.mealSheet) {
+            setMealTarget({ item, target: { mode: 'edit', sheetName: item.mealSheet, mealId: item.mealId } });
+          } else {
+            setReview(item);
+          }
+        }}
         onDiscard={handleDiscard}
         onDiscardAll={handleDiscardAll}
       />
@@ -397,6 +429,18 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
         onClose={() => setManualTarget(null)}
         onSave={handleManualSave}
         proxyUser={manualTarget?.proxyUser}
+      />
+
+      {/* 食事の確認（判別に困ったもの）・手入力 */}
+      <MealEditModal
+        target={mealTarget?.target ?? null}
+        onClose={() => setMealTarget(null)}
+        onSaved={() => {
+          // 確認・手入力が済んだので OCR 待ちのフォルダから外す（食事の写真は保存先に移してある）
+          if (mealTarget) ReceiptQueue.deleteReceipt(mealTarget.item.uri);
+          setMealTarget(null);
+          refresh();
+        }}
       />
 
       {/* 複数レシートを読み取ったときの確認・編集 */}
@@ -774,6 +818,18 @@ const styles = StyleSheet.create({
     fontSize: 14,
   },
   btnDisabled: { opacity: 0.5 },
+  kindRow: { flexDirection: 'row', gap: 8, marginBottom: 12 },
+  kindChip: {
+    paddingHorizontal: 18,
+    paddingVertical: 6,
+    borderRadius: 16,
+    backgroundColor: 'rgba(0,0,0,0.55)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.4)',
+  },
+  kindChipActive:     { backgroundColor: '#2e7d32', borderColor: '#2e7d32' },
+  kindChipText:       { color: '#fff', fontSize: 14, fontWeight: '600' },
+  kindChipTextActive: { color: '#fff' },
   center: {
     flex: 1,
     backgroundColor: '#fff',

@@ -62,7 +62,7 @@ export default function PendingReceiptsModal({
               <Image source={{ uri: item.uri }} style={styles.thumb} resizeMode="cover" />
               <View style={styles.body}>
                 <Text style={[styles.status, { color: STATUS_COLOR[item.status] }]}>
-                  {STATUS_LABEL[item.status]}
+                  {item.kind === 'meal' ? '食事・' : ''}{STATUS_LABEL[item.status]}
                   {item.proxyUser ? `（${item.proxyUser}の代理）` : ''}
                 </Text>
                 {item.status === 'failed' && !!item.error && (
