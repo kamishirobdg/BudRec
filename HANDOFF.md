@@ -79,12 +79,16 @@ kakeibo/
 
 ## 4. データモデル（スプレッドシート）
 
-月ごとに `YYYY-MM` という名前のシートを作り、1 行 = 1 支出。列範囲は **`A:L`**。
+月ごとに `YYYY-MM` という名前のシートを作り、1 行 = 1 支出。列範囲は **`A:M`**（v1.9.0 で M 列を追加）。
 
 ```
 A timestamp | B source | C user  | D store   | E category | F amount
 G memo      | H counted_amount   | I excluded | J confirmed | K recurring | L deleted
+M entry_id（行の ID。v1.9.0 以降に追加した行だけ。編集の updateRow は A:L だけ書き M に触らない）
 ```
+
+購入品目は `_items_YYYY-MM`（購入月ごと）に 1 行 = 1 品目で入る（`entry_id` で支出行とひも付く）。
+列の定義は `docs/meal-nutrition-spec.md` §3.2。
 
 ```ts
 interface ExpenseRow {
@@ -806,8 +810,13 @@ critic エージェント3体（services層／画面層／カメラ・OCR・基�
 `ReceiptQueueService` は画像（base64）を扱う別物なので対象外。
 
 ### 食事・栄養記録（設計中）
-- [ ] 仕様書: **`docs/meal-nutrition-spec.md`**（2026-10-07 ドラフト）。決定事項・データモデル・段階・未決事項は
-  そちらを正とする。着手は段階 1（品目の構造化保存）から。
+- 仕様書: **`docs/meal-nutrition-spec.md`**。決定事項・データモデル・段階・未決事項はそちらを正とする。
+- [x] 段階 1（支出行の ID・品目の構造化保存・レシート写真を端末に残す）実装（2026-10-07、v1.9.0）
+- [ ] **段階 1 の実機確認**: レシートを登録 → 月次シートの M 列に ID が入ること、`_items_YYYY-MM` シートが
+  でき品目が並ぶこと（正規化した品名・数量・種類）、Gmail 取り込みでも同様なこと、固定費の月初コピーで
+  新しい ID が振られること、編集しても M 列の ID が消えないこと
+- [ ] 段階 2 の前に手作業が要る: Google Cloud Console で Drive API の有効化、OAuth 同意画面に
+  `drive.file` / `drive.readonly` を追加（仕様書 §3.5.1）。追加後は二人とも再ログインが要る
 
 ### 将来やりたいこと（保留中）
 - [ ] **GPS で食事した店舗を特定する**（2026-10-07 棚上げ）。位置から店舗名を引くには Google Places API が
