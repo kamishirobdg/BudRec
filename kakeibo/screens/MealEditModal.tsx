@@ -23,7 +23,7 @@ import { lookupNutrition } from '../providers/GeminiMeal';
 import { getCurrentUser } from '../services/UserService';
 import { getUniqueUsers } from '../services/SheetsService';
 import { epochToTimestamp } from '../services/MealProcessing';
-import { archiveMealPhoto } from '../services/PhotoStore';
+import { archiveMealPhoto, mealPhotoRef } from '../services/PhotoStore';
 import { ensureMealShared, markSettled } from '../services/SharedPhotos';
 
 export type MealTarget =
@@ -243,7 +243,7 @@ export default function MealEditModal({ target, onClose, onSaved }: Props) {
       return await saveMeal(sheet, mealId, rows, rev, me, { force });
     } catch (e) {
       if (!(e instanceof MealConflictError)) throw e;
-      return new Promise((resolve) => {
+      return new Promise((resolve, reject) => {
         Alert.alert(
           'ほかの端末で先に保存されています',
           `${e.savedBy || '相手'}さんが先にこの食事を保存しました。`,
@@ -260,7 +260,7 @@ export default function MealEditModal({ target, onClose, onSaved }: Props) {
             {
               text: '自分の内容で上書き',
               style: 'destructive',
-              onPress: () => { persist(rows, mealRev(e.current), true).then(resolve, () => resolve(null)); },
+              onPress: () => { persist(rows, mealRev(e.current), true).then(resolve, reject); },
             },
           ],
           { cancelable: false },
@@ -288,12 +288,15 @@ export default function MealEditModal({ target, onClose, onSaved }: Props) {
         return;
       }
       const list = await refreshNutrition(drafts);
-      const photoRef = target.mode === 'new' ? archiveMealPhoto(target.photoUri) : null;
+      // 写真は保存できてから移す（失敗したときに画像が消えないように）
+      const photoRef = target.mode === 'new' ? mealPhotoRef(target.photoUri) : null;
       const saved = await persist(buildRows(list, photoRef), baseRev);
       if (!saved) return;
+      if (target.mode === 'new') archiveMealPhoto(target.photoUri);
       await logCorrections(corrections(list));
-      await markSettled(mealId);
+      // 共有してから確定日時を書く（この保存で新しく共有した写真にも 7 日の期限を付ける）
       await ensureMealShared(saved, me);
+      await markSettled(mealId);
       onSaved();
     } catch (e) {
       Alert.alert('保存失敗', e instanceof Error ? e.message : String(e));
@@ -340,7 +343,7 @@ export default function MealEditModal({ target, onClose, onSaved }: Props) {
   };
 
   const restore = (entry: HistoryEntry) => {
-    Alert.alert('この内容に戻しますか？', `${entry.savedAt} 時点（${entry.savedBy || '不明'}）`, [
+    Alert.alert('この内容に戻しますか？', `${entry.rows[0]?.updatedAt || entry.savedAt} に${entry.rows[0]?.updatedBy || '不明'}が保存した内容`, [
       { text: 'キャンセル', style: 'cancel' },
       {
         text: '戻す',
@@ -377,6 +380,11 @@ export default function MealEditModal({ target, onClose, onSaved }: Props) {
 
         {loading ? (
           <View style={styles.center}><ActivityIndicator /></View>
+        ) : target.mode === 'edit' && loaded.length === 0 ? (
+          // 推定は済んだが、記録がまだ未送信キューにあってシートに届いていない
+          <View style={styles.center}>
+            <Text style={styles.meta}>送信待ちです。通信が戻って送信されてから開いてください</Text>
+          </View>
         ) : (
           <KeyboardAvoidingView style={styles.fill} behavior="height">
             <View style={styles.photoBox}>
@@ -513,10 +521,12 @@ export default function MealEditModal({ target, onClose, onSaved }: Props) {
               {history && history.length === 0 && <Text style={styles.sheetEmpty}>以前の内容はありません</Text>}
               <FlatList
                 data={history ?? []}
-                keyExtractor={(h) => String(h.rev)}
+                keyExtractor={(_h, i) => String(i)}
                 renderItem={({ item }) => (
                   <TouchableOpacity style={styles.sheetItem} onPress={() => restore(item)}>
-                    <Text style={styles.sheetItemTitle}>{item.savedAt}（{item.savedBy || '不明'}）</Text>
+                    <Text style={styles.sheetItemTitle}>
+                      {item.rows[0]?.updatedAt || item.savedAt}（{item.rows[0]?.updatedBy || '不明'}）
+                    </Text>
                     <Text style={styles.sheetItemSub} numberOfLines={2}>
                       {[...new Set(item.rows.map((r) => r.dish))].join('・')}
                     </Text>

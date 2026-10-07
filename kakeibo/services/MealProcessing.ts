@@ -7,7 +7,8 @@
  * - レシートを登録したときに、前後 3 時間の食事でまだレシートの無いものがあればひも付け直す
  */
 
-import { SheetsInternal, getUniqueUsers } from './SheetsService';
+import { SheetsInternal, getRowsRaw, getUniqueUsers } from './SheetsService';
+import { AuthError } from './AuthService';
 import type { ReceiptItem } from '../providers/AIProvider';
 import { getCurrentUser } from './UserService';
 import {
@@ -19,7 +20,7 @@ import {
   MealConflictError,
 } from './MealService';
 import { scaleNutrients } from './Nutrients';
-import { archiveMealPhoto } from './PhotoStore';
+import { archiveMealPhoto, mealPhotoRef } from './PhotoStore';
 import * as Demo from './DemoService';
 import { ensureMealShared } from './SharedPhotos';
 
@@ -88,7 +89,12 @@ async function findReceiptNear(shotAt: number): Promise<ReceiptCandidate | null>
       byEntry.set(entryId, cand);
     }
   }
-  const list = [...byEntry.values()];
+  // 削除した支出行の品目は _items に残るので、月次シートで生きている行だけにする
+  const live = new Set<string>();
+  for (const month of monthsAround(shotAt)) {
+    for (const r of await getRowsRaw(month)) if (r.entryId) live.add(r.entryId);
+  }
+  const list = [...byEntry.values()].filter((c) => live.has(c.entryId));
   if (list.length === 0) return null;
   list.sort((a, b) => Math.abs(a.at - shotAt) - Math.abs(b.at - shotAt));
   return list[0];
@@ -160,6 +166,8 @@ export interface MealResult {
   /** 二人にまたがる食事か（写真を相手と共有する対象） */
   sharedMeal:  boolean;
   rows:        MealRow[];
+  /** 未送信に積んだうえで再サインインが要る状態になった（記録は後で届く） */
+  authFailed:  boolean;
 }
 
 /**
@@ -172,7 +180,7 @@ export async function processMealPhoto(
   shotAt: number,
   proxyUser: string | undefined,
   signal: AbortSignal,
-  opts: { keepOriginal?: (needsReview: boolean) => boolean } = {},
+  opts: { mealId?: string; keepOriginal?: (needsReview: boolean) => boolean } = {},
 ): Promise<MealResult> {
   const photographer = proxyUser ?? await getCurrentUser();
   const partner = (await getUniqueUsers()).find((u) => u !== photographer) ?? null;
@@ -197,15 +205,15 @@ export async function processMealPhoto(
   const { results, sources } = await lookupNutrition(queries, { imageBase64: base64, signal });
 
   const servings = assign(dishes, photographer, partner);
-  const mealId = newMealId();
+  const mealId = opts.mealId ?? newMealId();
   const eatenAt = epochToTimestamp(shotAt);
   const unmatched = receipt !== null && dishes.some((d, i) => d.kind !== 'home' && matches[i] === null);
   const needsReview =
     servings.some((s) => s.unsure) ||
     dishes.some((d) => d.confidence === 'low') ||
     unmatched;
-  // 確認待ちにする場合は、確認画面で見せるため元の画像も残す
-  const photoRef = archiveMealPhoto(uri, opts.keepOriginal?.(needsReview) ?? false);
+  // 写真は記録を書いてから移す（書けなかったときに画像が OCR 待ちのフォルダから消えないように）
+  const photoRef = mealPhotoRef(uri);
 
   const rows: MealRow[] = [];
   for (const s of servings) {
@@ -225,13 +233,18 @@ export async function processMealPhoto(
 
   if (needsReview) for (const r of rows) r.status = 'needs_review';
 
+  // 未送信に回っただけなら記録は届く。AuthError も未送信に積んでから投げられる
+  let authFailed = false;
   try {
     await appendMeal(rows);
   } catch (e) {
-    // 未送信に回っただけなら記録は届く
-    if (!(e instanceof Error && e.name === 'QueuedWriteError')) throw e;
+    if (e instanceof AuthError) authFailed = true;
+    else if (!(e instanceof Error && e.name === 'QueuedWriteError')) throw e;
   }
+  // 確認待ちにする場合は、確認画面で見せるため元の画像も残す
+  archiveMealPhoto(uri, opts.keepOriginal?.(needsReview) ?? false);
   return {
+    authFailed,
     mealId,
     sheetName: mealsSheetName(eatenAt),
     needsReview,
@@ -287,10 +300,18 @@ export async function linkReceiptToMeals(receipt: SavedReceipt, signal?: AbortSi
     if (food.length === 0 || at === null) return;
 
     const rows = (await Promise.all(monthsAround(at).map((m) => getMeals(m)))).flat();
-    const candidates = rows.filter((r) => {
-      const t = timestampToEpoch(r.eatenAt);
-      return !r.entryId && r.kind !== 'home' && t !== null && Math.abs(t - at) <= LINK_WINDOW_MS;
-    });
+    // 食事単位で見る。どの行にもまだレシートが無く、手で直されていない、外食・商品を含む食事だけ
+    const byMeal = new Map<string, MealRow[]>();
+    for (const r of rows) byMeal.set(r.mealId, [...(byMeal.get(r.mealId) ?? []), r]);
+    const candidates = [...byMeal.values()]
+      .filter((list) =>
+        list.every((r) => !r.entryId && r.status !== 'edited') &&
+        list.some((r) => r.kind !== 'home'))
+      .map((list) => list[0])
+      .filter((r) => {
+        const t = timestampToEpoch(r.eatenAt);
+        return t !== null && Math.abs(t - at) <= LINK_WINDOW_MS;
+      });
     if (candidates.length === 0) return;
 
     // いちばん近い食事 1 回分だけにひも付ける
@@ -305,7 +326,9 @@ export async function linkReceiptToMeals(receipt: SavedReceipt, signal?: AbortSi
     const lines: ReceiptLine[] = food.map((it, i) => ({ index: i, name: it.normalized ?? it.name, price: it.price }));
     const matches = await matchReceiptItems(receipt.store, dishNames, lines, signal);
 
-    const matchedIdx = dishIds.map((_, i) => i).filter((i) => matches[i] !== null);
+    // 自炊の品はレシートに対応付けない
+    const matchedIdx = dishIds.map((_, i) => i).filter((i) =>
+      matches[i] !== null && mealRows.find((r) => r.dishId === dishIds[i])!.kind !== 'home');
     if (matchedIdx.length === 0) return;
     const queries: NutritionQuery[] = matchedIdx.map((i) => ({
       store: receipt.store,
@@ -317,17 +340,22 @@ export async function linkReceiptToMeals(receipt: SavedReceipt, signal?: AbortSi
     const next = mealRows.map((r) => {
       const di = dishIds.indexOf(r.dishId);
       const qi = matchedIdx.indexOf(di);
-      if (qi < 0) return { ...r, entryId: receipt.entryId };
+      // 対応しなかった品は触らない（別のレシートの品かもしれない）
+      if (qi < 0) return r;
       const res = results[qi];
+      // 栄養が 1 つも取れなかったら、今の値を消さずにひも付けだけする
+      const gotAny = Object.values(res.nutrients).some((v) => v !== null);
       return {
         ...r,
         entryId: receipt.entryId,
         store:   receipt.store,
         dish:    queries[qi].name,
-        nutrients: scaleNutrients(res.nutrients, r.portion),
-        nutrientSource: res.official ? 'grounding' as const : 'estimate' as const,
-        confidence: res.official ? 'high' as const : r.confidence,
-        sources,
+        ...(gotAny ? {
+          nutrients: scaleNutrients(res.nutrients, r.portion),
+          nutrientSource: res.official ? 'grounding' as const : 'estimate' as const,
+          confidence: res.official ? 'high' as const : r.confidence,
+          sources,
+        } : {}),
       };
     });
     const user = await getCurrentUser();

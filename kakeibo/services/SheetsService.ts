@@ -12,6 +12,7 @@ import * as Crypto from 'expo-crypto';
 import type { ReceiptItem } from '../providers/AIProvider';
 import { nowLabel } from './jsonFileStore';
 import { getCurrentUserRaw } from './UserService';
+import { getItem, setItem } from './Storage';
 
 // ─── スプレッドシート設定（.env の EXPO_PUBLIC_SPREADSHEET_ID に設定） ───────
 // Google Sheets の URL から取得: https://docs.google.com/spreadsheets/d/{ID}/edit
@@ -48,11 +49,11 @@ export interface ExpenseRow {
 const HEADER_ROW: readonly string[] = [
   'timestamp', 'source', 'user', 'store', 'category',
   'amount', 'memo', 'counted_amount', 'excluded', 'confirmed', 'recurring',
-  'deleted', 'entry_id', 'rev',
+  'deleted', 'entry_id', 'rev', 'writer',
 ];
 
-/** 月次シートの列範囲（A:N = timestamp 〜 rev） */
-const MONTH_RANGE = 'A:N';
+/** 月次シートの列範囲（A:O = timestamp 〜 writer） */
+const MONTH_RANGE = 'A:O';
 
 /** 購入品目のシート名（購入した月ごと） */
 function itemsSheetName(monthSheet: string): string {
@@ -298,6 +299,7 @@ async function copyRecurringRowsToNewMonth(
     );
     if (recurringRows.length === 0) continue;
 
+    const writer = await getDeviceId();
     const shifted = recurringRows
       // 論理削除済みは固定費コピーしない
       .filter((row) => (row[11] ?? '').toString().trim().toUpperCase() !== 'TRUE')
@@ -316,6 +318,7 @@ async function copyRecurringRowsToNewMonth(
         'FALSE',        // deleted
         newEntryId(),   // entry_id（コピー元とは別の行なので振り直す）
         1,              // rev
+        writer,         // writer
       ]);
     if (shifted.length === 0) continue;
 
@@ -462,7 +465,7 @@ async function execWrite(op: WriteQueue.WriteOp): Promise<number | void> {
       await ensureSheetExists(client, sheetName);
       await client.post(
         `/values/${encodeURIComponent(sheetName)}!${MONTH_RANGE}:append`,
-        { values: [[...toSheetRow(op.entry), op.entry.entryId ?? '', 1]] },
+        { values: [[...toSheetRow(op.entry), op.entry.entryId ?? '', 1, await getDeviceId()]] },
         { params: { valueInputOption: 'RAW', insertDataOption: 'INSERT_ROWS' } },
       );
       return;
@@ -499,23 +502,31 @@ async function execWrite(op: WriteQueue.WriteOp): Promise<number | void> {
 
 /**
  * 既存の行を書き換える。同時編集の検出のため、書く前に行を読み、N 列の rev が
- * 画面に読み込んだときの値（op.baseRev）と同じか確かめる。違えば ExpenseConflictError。
+ * 画面に読み込んだときの値（op.baseRev）と同じか確かめる。
  *
- * 書くのは「その操作の列から N 列まで」の連続した範囲を 1 回の PUT で
+ * **違っていても、最後に書いたのがこの端末（O 列の writer）なら競合にしない。** 自分の直前の
+ * 書き込み（同じ行を続けて操作した・古いオフラインキャッシュから操作した・届いたのに応答が
+ * 返らずに送り直した）と食い違っているだけなので。相手が最後に書いていたときだけ
+ * ExpenseConflictError を投げる。
+ *
+ * 書くのは「その操作の列から O 列まで」の連続した範囲を 1 回の PUT で
  * （PUT は通信断でも再送してよい扱いなので、POST の batchUpdate にしない）。
  * 間に挟まる列は、いま読んだ値をそのまま書き戻す。
  *
  * 編集と削除は、上書きする直前の内容を `_history` に残す（以前の内容に戻せるように）。
+ * 書き込みが成功してから残す（送り直しのたびに履歴が増えないように）。
  */
 async function writeRowWithRev(
   client: AxiosInstance,
   op: Extract<WriteQueue.WriteOp, { rowIndex: number }>,
 ): Promise<number> {
   const r = op.rowIndex;
-  const res = await client.get(`/values/${encodeURIComponent(op.sheetName)}!A${r}:N${r}`);
+  const me = await getDeviceId();
+  const res = await client.get(`/values/${encodeURIComponent(op.sheetName)}!A${r}:O${r}`);
   const cells: string[] = res.data.values?.[0] ?? [];
   const currentRev = Number(cells[13]) || 0;
-  if (op.baseRev !== undefined && !op.force && currentRev !== op.baseRev) {
+  const lastWriter = cells[14] ?? '';
+  if (op.baseRev !== undefined && !op.force && currentRev !== op.baseRev && lastWriter !== me) {
     throw new ExpenseConflictError(currentRev, cells.length > 0 ? parseRow(cells, r, op.sheetName) : null);
   }
   const rev = currentRev + 1;
@@ -525,37 +536,56 @@ async function writeRowWithRev(
   let values: (string | number)[];
   switch (op.kind) {
     case 'updateRow':
-      range  = `A${r}:N${r}`;
-      values = [...toSheetRow(op.entry), cell(12), rev];
+      range  = `A${r}:O${r}`;
+      values = [...toSheetRow(op.entry), cell(12), rev, me];
       break;
     case 'updateFlags':
-      range  = `H${r}:N${r}`;
+      range  = `H${r}:O${r}`;
       values = [
         op.patch.countedAmount,
         op.patch.excluded  ? 'TRUE' : 'FALSE',
         op.patch.confirmed ? 'TRUE' : 'FALSE',
-        cell(10), cell(11), cell(12), rev,
+        cell(10), cell(11), cell(12), rev, me,
       ];
       break;
     case 'setRecurring':
-      range  = `K${r}:N${r}`;
-      values = [op.recurring ? 'TRUE' : 'FALSE', cell(11), cell(12), rev];
+      range  = `K${r}:O${r}`;
+      values = [op.recurring ? 'TRUE' : 'FALSE', cell(11), cell(12), rev, me];
       break;
     case 'markDeleted':
-      range  = `L${r}:N${r}`;
-      values = ['TRUE', cell(12), rev];
+      range  = `L${r}:O${r}`;
+      values = ['TRUE', cell(12), rev, me];
       break;
   }
 
-  if ((op.kind === 'updateRow' || op.kind === 'markDeleted') && cells.length > 0) {
-    await appendHistoryRow(`entry:${op.sheetName}:${r}`, currentRev, op.sheetName, JSON.stringify(cells));
-  }
   await client.put(
     `/values/${encodeURIComponent(op.sheetName)}!${range}`,
     { values: [values] },
     { params: { valueInputOption: 'RAW' } },
   );
+  if ((op.kind === 'updateRow' || op.kind === 'markDeleted') && cells.length > 0) {
+    await appendHistoryRow(`entry:${op.sheetName}:${r}`, currentRev, op.sheetName, JSON.stringify(cells));
+  }
   return rev;
+}
+
+// ─── この端末の識別子（O 列 writer） ─────────────────────────────────────────
+
+const DEVICE_ID_KEY = 'device_id';
+let deviceIdCache: string | null = null;
+
+/** 端末ごとに一度だけ作る ID。同時編集の検出で「最後に書いたのが自分か」を見るのに使う */
+export async function getDeviceId(): Promise<string> {
+  if (deviceIdCache) return deviceIdCache;
+  const saved = await getItem(DEVICE_ID_KEY);
+  if (saved) {
+    deviceIdCache = saved;
+    return saved;
+  }
+  const id = newEntryId();
+  await setItem(DEVICE_ID_KEY, id);
+  deviceIdCache = id;
+  return id;
 }
 
 /** ほかの端末が先にこの行を変更していた */
@@ -598,6 +628,8 @@ export interface ExpenseHistoryEntry {
 
 /** 支出行の過去の内容（新しい順） */
 export async function getExpenseHistory(sheetName: string, rowIndex: number): Promise<ExpenseHistoryEntry[]> {
+  // デモ中は実データ（店名・金額）を見せない
+  if (await Demo.isDemo()) return [];
   const client = await createClient();
   const names = await listSheetNames(client, true);
   if (!names.includes(HISTORY_SHEET)) return [];
@@ -685,8 +717,17 @@ export async function flushWriteQueue(): Promise<FlushResult> {
 
     let sent = 0;
     let authError: AuthError | null = null;
+    // 競合で止めた行。同じ行の後続を先に送ると、上書きを選んだときに順番が崩れるので送らない
+    const blocked = new Set<string>();
+    const rowKey = (op: WriteQueue.WriteOp) => ('rowIndex' in op ? `${op.sheetName}:${op.rowIndex}` : null);
     for (const item of WriteQueue.list()) {
-      if (item.permanent) continue; // 送り直しても直らないと分かっているものは飛ばす
+      const key = rowKey(item.op);
+      if (item.permanent) {
+        // 送り直しても直らないと分かっているものは飛ばす
+        if (key && WriteQueue.isConflict(item)) blocked.add(key);
+        continue;
+      }
+      if (key && blocked.has(key)) continue;
       try {
         const rev = await execWrite(item.op);
         WriteQueue.remove(item.id);
@@ -699,6 +740,7 @@ export async function flushWriteQueue(): Promise<FlushResult> {
         // ほかの行の項目は順番に影響しないので先へ進む
         if (e instanceof ExpenseConflictError) {
           WriteQueue.markAttempt(item.id, `${WriteQueue.CONFLICT_PREFIX}: ほかの端末で先に変更されています`, true);
+          if (key) blocked.add(key);
           continue;
         }
         WriteQueue.markAttempt(item.id, describeError(e), !isQueueable(e));
@@ -774,6 +816,28 @@ export async function appendRow(entry: ExpenseRow): Promise<string> {
     }
   }
   return entryId;
+}
+
+/**
+ * 指定した ID の支出行のうち、既にシートにある（または未送信キューに積まれている）ものを返す。
+ * 登録の途中でアプリが終了されたあと、同じ行を二重に追加しないために使う。
+ */
+export async function existingEntryIds(rows: ExpenseRow[]): Promise<Set<string>> {
+  const ids = new Set(rows.map((r) => r.entryId).filter((x): x is string => !!x));
+  const found = new Set<string>();
+  for (const q of WriteQueue.list()) {
+    if (q.op.kind === 'append' && q.op.entry.entryId && ids.has(q.op.entry.entryId)) found.add(q.op.entry.entryId);
+  }
+  const client = await createClient();
+  const names = await listSheetNames(client, true);
+  for (const sheet of new Set(rows.map((r) => sheetNameFromTimestamp(r.timestamp)))) {
+    if (!names.includes(sheet)) continue;
+    const res = await client.get(`/values/${encodeURIComponent(sheet)}!M:M`);
+    for (const c of (res.data.values ?? []) as string[][]) {
+      if (c[0] && ids.has(c[0])) found.add(c[0]);
+    }
+  }
+  return found;
 }
 
 /** 品目の追記操作を作る。食品以外も含めて全部残す（家計簿側の検索・集計にも使う） */
@@ -1374,9 +1438,19 @@ export async function registerUser(name: string, previous?: string): Promise<voi
   const res = await client.get(`/values/${encodeURIComponent(USERS_SHEET)}!A:A`);
   const rows: string[][] = res.data.values ?? [];
   const names = rows.map((r) => (r?.[0] ?? '').trim());
-  if (names.includes(trimmed)) return;
+  const prevIndex = previous && previous.trim() !== trimmed ? names.indexOf(previous.trim()) : -1;
+  if (names.includes(trimmed)) {
+    // 既にある名前に変えた。旧名が代理入力の候補に残らないよう空にする
+    if (prevIndex > 0) {
+      await client.put(
+        `/values/${encodeURIComponent(USERS_SHEET)}!A${prevIndex + 1}:B${prevIndex + 1}`,
+        { values: [['', '']] },
+        { params: { valueInputOption: 'RAW' } },
+      );
+    }
+    return;
+  }
 
-  const prevIndex = previous ? names.indexOf(previous.trim()) : -1;
   if (prevIndex > 0) {
     await client.put(
       `/values/${encodeURIComponent(USERS_SHEET)}!A${prevIndex + 1}:B${prevIndex + 1}`,

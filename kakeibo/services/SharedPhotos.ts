@@ -23,6 +23,8 @@ const HEADER = ['photo_id', 'meal_id', 'entry_id', 'kind', 'shared_by', 'shared_
 const INDEX_RANGE = 'A:I';
 const CHUNK_SIZE = 40_000;
 const MAX_CHUNKS = 25;
+/** 目録 9 列 ＋ チャンク 25 列 */
+const COLUMN_COUNT = 9 + MAX_CHUNKS;
 /** 1 行ぶん（目録 A:I ＋ チャンク J 列から 25 列） */
 const ROW_RANGE = (row: number) => `A${row}:AH${row}`;
 
@@ -52,8 +54,15 @@ async function ensureSheet(): Promise<void> {
   await SheetsInternal.writeHeaderRow(client, SHEET, HEADER);
   const sheetId = await SheetsInternal.fetchSheetId(client, SHEET);
   if (sheetId === null) return;
+  // 新しいシートは既定で 26 列（A〜Z）しか無い。チャンクを置く AH 列まで広げておかないと、
+  // 範囲を AH まで指定した読み出し・消去が「グリッドの範囲外」で失敗する
   await client.post(':batchUpdate', {
-    requests: [{ updateSheetProperties: { properties: { sheetId, hidden: true }, fields: 'hidden' } }],
+    requests: [{
+      updateSheetProperties: {
+        properties: { sheetId, hidden: true, gridProperties: { columnCount: COLUMN_COUNT } },
+        fields: 'hidden,gridProperties.columnCount',
+      },
+    }],
   });
 }
 
@@ -63,7 +72,10 @@ export async function listShared(): Promise<SharedPhoto[]> {
   const client = await SheetsInternal.createClient();
   const names = await SheetsInternal.listSheetNames(client, true);
   if (!names.includes(SHEET)) return [];
-  const res = await client.get(`/values/${encodeURIComponent(SHEET)}!${INDEX_RANGE}`);
+  // 日時はエポックミリ秒の数値で入れている。既定の表示形式で読むと指数表記に丸められうるので生の値で読む
+  const res = await client.get(`/values/${encodeURIComponent(SHEET)}!${INDEX_RANGE}`, {
+    params: { valueRenderOption: 'UNFORMATTED_VALUE' },
+  });
   const values: string[][] = res.data.values ?? [];
   const out: SharedPhoto[] = [];
   values.forEach((c, i) => {

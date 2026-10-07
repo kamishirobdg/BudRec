@@ -361,6 +361,8 @@ export default function SummaryScreen({ onSignedOut }: Props) {
   const handleLastBatchCommit = async (kept: ExpenseRow[], removed: ExpenseRow[]) => {
     setLastBatchBusy(true);
     let changed = 0;
+    // ほかの端末が先に変更していた行は保存せずに数だけ伝える（残りの行は保存を続ける）
+    let conflicts = 0;
 
     try {
       for (const row of kept) {
@@ -373,6 +375,7 @@ export default function SummaryScreen({ onSignedOut }: Props) {
           await updateRow(row.sheetName, row.rowIndex, row);
           changed++;
         } catch (e) {
+          if (e instanceof ExpenseConflictError) { conflicts++; continue; }
           if (!(e instanceof QueuedWriteError)) throw e;
           changed++; // 端末に退避済み。未送信バナーで気づける
         }
@@ -384,6 +387,7 @@ export default function SummaryScreen({ onSignedOut }: Props) {
           await markRowDeleted(row.sheetName, row.rowIndex, { baseRev: row.rev });
           changed++;
         } catch (e) {
+          if (e instanceof ExpenseConflictError) { conflicts++; continue; }
           if (!(e instanceof QueuedWriteError)) throw e;
           changed++;
         }
@@ -393,7 +397,13 @@ export default function SummaryScreen({ onSignedOut }: Props) {
       if (kept.length > 0) LastBatch.saveLastBatch(kept);
 
       setLastBatchRows(null);
-      if (changed > 0) loadRows(currentRange);
+      if (changed > 0 || conflicts > 0) loadRows(currentRange);
+      if (conflicts > 0) {
+        Alert.alert(
+          'ほかの端末で先に変更されています',
+          `${conflicts} 件は保存していません。最新の内容を確認してから直してください。`,
+        );
+      }
     } catch (e) {
       if (e instanceof AuthError) { onSignedOut(); return; }
       Alert.alert('保存失敗', e instanceof Error ? e.message : String(e));
@@ -1413,7 +1423,7 @@ function EditEntryModal({
 
   /** 過去の内容で上書きする（戻す操作も 1 回の保存として扱い、今の内容は履歴に残る） */
   const restore = (h: ExpenseHistoryEntry) => {
-    Alert.alert('この内容に戻しますか？', `${h.savedAt} 時点（${h.savedBy || '不明'}）`, [
+    Alert.alert('この内容に戻しますか？', `${h.savedAt} に${h.savedBy || '不明'}が上書きする前の内容`, [
       { text: 'キャンセル', style: 'cancel' },
       {
         text: '戻す',
@@ -1594,10 +1604,10 @@ function EditEntryModal({
             )}
             <FlatList
               data={history ?? []}
-              keyExtractor={(h) => `${h.rev}-${h.savedAt}`}
+              keyExtractor={(_h, i) => String(i)}
               renderItem={({ item: h }) => (
                 <TouchableOpacity style={styles.modalItem} onPress={() => restore(h)}>
-                  <Text style={styles.modalItemText}>{h.savedAt}（{h.savedBy || '不明'}）</Text>
+                  <Text style={styles.modalItemText}>{h.savedAt} に{h.savedBy || '不明'}が上書きする前</Text>
                   <Text style={styles.historySub}>
                     {h.row.store || '(店名なし)'}  ¥{h.row.amount.toLocaleString()}  {h.row.category}
                   </Text>

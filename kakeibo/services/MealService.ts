@@ -13,6 +13,7 @@ import { SheetsInternal, appendHistoryRow, newEntryId } from './SheetsService';
 import { nowLabel } from './jsonFileStore';
 import { Nutrients, sanitizeNutrients } from './Nutrients';
 import * as Demo from './DemoService';
+import * as WriteQueue from './WriteQueueService';
 
 export type MealKind       = 'eat_out' | 'packaged' | 'home';
 export type MealStatus     = 'estimated' | 'needs_review' | 'edited';
@@ -153,6 +154,14 @@ export async function getMeal(sheetName: string, mealId: string): Promise<MealRo
   return (await readSheet(sheetName)).filter((r) => r.mealId === mealId && !r.deleted);
 }
 
+/** その食事がもう記録されているか（未送信キューに積んであるものを含む） */
+export async function mealExists(sheetName: string, mealId: string): Promise<boolean> {
+  const queued = WriteQueue.list().some((q) =>
+    q.op.kind === 'appendRaw' && q.op.sheetName === sheetName && q.op.rows.some((r) => r[0] === mealId));
+  if (queued) return true;
+  return (await getMeal(sheetName, mealId)).length > 0;
+}
+
 export function mealRev(rows: MealRow[]): number {
   return rows.reduce((m, r) => Math.max(m, r.rev), 0);
 }
@@ -267,7 +276,8 @@ export interface HistoryEntry {
 }
 
 async function appendHistory(key: string, rev: number, sheet: string, rows: MealRow[]): Promise<void> {
-  const snapshot = rows.map(({ rowIndex: _r, sheetName: _s, ...rest }) => rest);
+  // 参照 URL は品ごとに重複していて大きい。1 セル 5 万文字に収まるよう履歴には残さない
+  const snapshot = rows.map(({ rowIndex: _r, sheetName: _s, sources: _src, ...rest }) => ({ ...rest, sources: [] }));
   await appendHistoryRow(key, rev, sheet, JSON.stringify(snapshot));
 }
 

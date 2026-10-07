@@ -48,6 +48,12 @@ interface ReceiptMeta {
   /** 食事の `review` のとき、推定済みの食事の ID と、その食事が入っているシート */
   mealId?:    string;
   mealSheet?: string;
+  /**
+   * 登録の途中（ID を振った行を書き込み始めた）。この状態で残っていたら、書き込みの途中で
+   * アプリが終了されたので、既に書けた行を飛ばして続きから登録する（二重登録を防ぐ）。
+   * レシートは `rows` に ID 付きの行、食事は `mealId` に振った ID を持つ。
+   */
+  saving?:    boolean;
 }
 
 export interface ReceiptItem extends ReceiptMeta {
@@ -107,7 +113,9 @@ export function readReceipt(uri: string): string {
 export function setStatus(
   uri: string,
   status: ReceiptStatus,
-  extra: { error?: string; rows?: ExpenseRow[]; notBefore?: number; mealId?: string; mealSheet?: string } = {},
+  extra: {
+    error?: string; rows?: ExpenseRow[]; notBefore?: number; mealId?: string; mealSheet?: string; saving?: boolean;
+  } = {},
 ): void {
   // 破棄済みの画像に状態だけ残さない
   if (!new File(uri).exists) return;

@@ -66,17 +66,27 @@ export function receiptPhotoUri(entryId: string | undefined): string | null {
 export function archiveMealPhoto(uri: string, keepOriginal = false): string | null {
   try {
     const src = new File(uri);
-    if (!src.exists) return null;
+    const ref = mealPhotoRef(uri);
+    if (!src.exists) return localUri(ref) ? ref : null;
     const dir = new Directory(Paths.document, ...MEAL_DIR);
     if (!dir.exists) dir.create({ intermediates: true, idempotent: true });
-    const name = src.name;
+    // 確認待ちでコピー済みなど、同じ名前のファイルが既にあればそれを使う（上書きはできない）
+    if (new File(dir, src.name).exists) {
+      if (!keepOriginal) src.delete();
+      return ref;
+    }
     if (keepOriginal) src.copy(dir);
     else src.move(dir);
-    return `local:${MEAL_DIR.join('/')}/${name}`;
+    return ref;
   } catch (e) {
     console.warn('[PhotoStore] 食事の写真を残せなかった:', e instanceof Error ? e.message : e);
     return null;
   }
+}
+
+/** 食事の写真を保存先へ移したときの参照（移す前に記録へ書くため、先に決められるようにしておく） */
+export function mealPhotoRef(uri: string): string {
+  return `local:${MEAL_DIR.join('/')}/${new File(uri).name}`;
 }
 
 /** `local:` の参照を、この端末のファイル URI にする（無ければ null） */

@@ -24,7 +24,9 @@ import { AuthError } from './AuthService';
 import { CancelledError, QuotaExceededError } from '../providers/AIProvider';
 import * as ReceiptQueue from './ReceiptQueueService';
 import { extractRows, saveReceiptRows } from './ReceiptProcessing';
-import { linkReceiptToMeals, processMealPhoto } from './MealProcessing';
+import { epochToTimestamp, linkReceiptToMeals, processMealPhoto } from './MealProcessing';
+import { mealExists, mealsSheetName, newMealId } from './MealService';
+import { existingEntryIds, newEntryId } from './SheetsService';
 import { ensureMealShared } from './SharedPhotos';
 import type { ExpenseRow } from './SheetsService';
 
@@ -195,6 +197,9 @@ async function processOne(item: ReceiptQueue.ReceiptItem): Promise<Outcome> {
       try {
         if (item.kind === 'meal') return await processMeal(item, base64, abort.signal);
 
+        // 前回、登録の途中でアプリが終了されていた。書けた行を飛ばして続きから登録する
+        if (item.saving && item.rows && item.rows.length > 0) return await resumeReceiptSave(item);
+
         const rows = await extractRows(base64, item.proxyUser, abort.signal);
         // OCR が返った直後に中止された場合。ここを過ぎたら書き込みは最後まで行う
         if (abort.signal.aborted) return cancelled();
@@ -203,7 +208,10 @@ async function processOne(item: ReceiptQueue.ReceiptItem): Promise<Outcome> {
           ReceiptQueue.setStatus(item.uri, 'review', { rows });
           return 'done';
         }
-        const { message, entryIds, saved } = await saveReceiptRows(rows);
+        // ID を振ってから書き始めたことを残す（途中で終了されても二重に登録しないため）
+        const withIds = rows.map((r) => ({ ...r, entryId: r.entryId || newEntryId() }));
+        ReceiptQueue.setStatus(item.uri, 'queued', { rows: withIds, saving: true });
+        const { message, entryIds, saved } = await saveReceiptRows(withIds);
         ReceiptQueue.completeReceipt(item.uri, entryIds);
         emit({ type: 'saved', message });
         await linkSavedReceipts(saved);
@@ -227,12 +235,42 @@ async function processOne(item: ReceiptQueue.ReceiptItem): Promise<Outcome> {
   }
 }
 
+/** 登録の途中で終了されたレシートの続き。既に書けた行（未送信キューに積んだものを含む）は飛ばす */
+async function resumeReceiptSave(item: ReceiptQueue.ReceiptItem): Promise<Outcome> {
+  const rows = item.rows ?? [];
+  const existing = await existingEntryIds(rows);
+  const remaining = rows.filter((r) => !existing.has(r.entryId ?? ''));
+  let saved = rows.filter((r) => existing.has(r.entryId ?? ''));
+  let message = '記録しました';
+  if (remaining.length > 0) {
+    const res = await saveReceiptRows(remaining);
+    saved = [...saved, ...res.saved];
+    message = res.message;
+  }
+  ReceiptQueue.completeReceipt(item.uri, saved.map((r) => r.entryId!).filter(Boolean));
+  emit({ type: 'saved', message });
+  await linkSavedReceipts(saved);
+  return 'done';
+}
+
 /**
  * 食事写真を 1 枚処理する。判別に困ったときは `review` にして「要確認」に出す
  * （画像は確認が済むまで残す）。二人にまたがる食事なら写真を相手と共有する。
  */
 async function processMeal(item: ReceiptQueue.ReceiptItem, base64: string, signal: AbortSignal): Promise<Outcome> {
-  const r = await processMealPhoto(item.uri, base64, item.shotAt ?? Date.now(), item.proxyUser, signal, {
+  const shotAt = item.shotAt ?? Date.now();
+  // 前回、記録の途中で終了されていた。もう記録できていれば片付けるだけにする（二重に記録しない）
+  if (item.saving && item.mealId) {
+    if (await mealExists(mealsSheetName(epochToTimestamp(shotAt)), item.mealId)) {
+      ReceiptQueue.deleteReceipt(item.uri);
+      return 'done';
+    }
+  }
+  const mealId = item.saving && item.mealId ? item.mealId : newMealId();
+  ReceiptQueue.setStatus(item.uri, 'queued', { mealId, saving: true });
+
+  const r = await processMealPhoto(item.uri, base64, shotAt, item.proxyUser, signal, {
+    mealId,
     keepOriginal: (needsReview) => needsReview,
   });
   if (r.needsReview) {
@@ -248,6 +286,8 @@ async function processMeal(item: ReceiptQueue.ReceiptItem, base64: string, signa
       dishes.slice(0, 3).join('・') + (dishes.length > 3 ? ` ほか ${dishes.length - 3} 品` : ''),
     ].join('\n'),
   });
+  // 未送信に積んだうえで再サインインが要る状態になった。記録は後で届くので、ここで止める
+  if (r.authFailed) return 'auth-failed';
   if (r.sharedMeal) await ensureMealShared(r.rows, r.rows[0]?.updatedBy ?? '');
   return 'done';
 }

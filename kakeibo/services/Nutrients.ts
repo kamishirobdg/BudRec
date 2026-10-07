@@ -104,6 +104,7 @@ export function nutrientDef(key: string): NutrientDef | undefined {
   return NUTRIENTS.find((n) => n.key === key);
 }
 
+/** 保存し直すたびに「行の値 ÷ 割合」で 1 品全体に戻すので、丸めすぎると小さい値がずれていく */
 function round(v: number): number {
-  return Math.round(v * 100) / 100;
+  return Math.round(v * 10_000) / 10_000;
 }

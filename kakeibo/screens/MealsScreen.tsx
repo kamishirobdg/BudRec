@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -48,10 +48,14 @@ export default function MealsScreen() {
   const [target, setTarget]     = useState<MealTarget | null>(null);
   const [deferred, setDeferred] = useState(0);
 
+  // 月を素早く切り替えたとき、前の月の遅れて返った結果で上書きしない
+  const requestSeq = useRef(0);
   const load = useCallback(async () => {
+    const seq = ++requestSeq.current;
     setLoading(true);
     try {
       const [me, users, meals] = await Promise.all([getCurrentUser(), getUniqueUsers(), getMeals(month)]);
+      if (seq !== requestSeq.current) return;
       setPeople([me, ...users.filter((u) => u !== me)]);
       setPerson((p) => p || me);
       setRows(meals);
