@@ -17,6 +17,7 @@ import { getCurrentUserRaw, isUserNameSet } from './services/UserService';
 import { runGmailImport } from './services/GmailService';
 import { flushWriteQueue, registerUser } from './services/SheetsService';
 import { loadConfig as loadDemoConfig } from './services/DemoService';
+import { flushPendingPurchases } from './services/FoodService';
 import * as OcrWorker from './services/OcrWorker';
 import { registerBackgroundOcr } from './services/BackgroundOcr';
 
@@ -109,7 +110,7 @@ function AppContent() {
 
   /**
    * 通信が戻ったであろうタイミングでの同期。
-   * 未送信の書き込みを先に片付けてから Gmail 取り込みを走らせる
+   * 未送信の書き込み・未記録の購入を先に片付けてから Gmail 取り込みを走らせる
    * （逆順だと取り込みのリクエストで枠を使い切って未送信が残りやすい）。
    */
   const syncPending = () => {
@@ -123,7 +124,8 @@ function AppContent() {
           if (!ok) setSignedIn(false);
         }
       })
-      .finally(() => maybeRunGmailImport());
+      // 圏外で記録できなかった購入回数も、Gmail 取り込みが同じ品目を書く前に記録する
+      .finally(() => flushPendingPurchases().finally(() => maybeRunGmailImport()));
   };
 
   // サインイン直後に実行（ユーザー名が設定されるまでは取り込みを走らせない）

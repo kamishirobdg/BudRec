@@ -9,7 +9,7 @@
  */
 
 import { SheetsInternal, newEntryId } from './SheetsService';
-import { nowLabel } from './jsonFileStore';
+import { nowLabel, readJsonArray, removeFile, writeJson } from './jsonFileStore';
 import { getItem, setItem } from './Storage';
 import { Nutrients, sanitizeNutrients } from './Nutrients';
 import { researchFoods, FoodQuery, FoodNutrition } from '../providers/GeminiMeal';
@@ -190,39 +190,82 @@ function newFood(key: string, name: string, chain: string): Food {
 }
 
 /**
+ * 記録できなかった購入（圏外で登録したレシートなど）。通信が戻ったら `flushPendingPurchases` で記録する。
+ * 読んで足して書く処理なので、行の追記と違って未送信キューには積めない。
+ */
+const PENDING_FILE = 'pending-purchases.json';
+/** 溜めすぎない（ずっと送れないときに端末のファイルが膨らみ続けないように） */
+const PENDING_MAX = 200;
+
+interface PendingPurchase {
+  id:    string;
+  items: ReceiptItem[];
+}
+
+/**
  * レシート・メールの品目を登録したときに呼ぶ。購入回数と価格を記録する（栄養は後で調べる）。
- * 失敗しても投げない（登録は済んでいる）。
+ * 失敗しても投げない（登録は済んでいる）。記録できなかった分は端末に残して後で記録する。
  */
 export async function recordPurchases(items: ReceiptItem[]): Promise<void> {
+  if (await Demo.isDemo()) return;
+  const food = items.filter((it) => it.kind && it.kind !== 'non_food');
+  if (food.length === 0) return;
   try {
-    if (await Demo.isDemo()) return;
-    const food = items.filter((it) => it.kind && it.kind !== 'non_food');
-    if (food.length === 0) return;
-    const foods = await loadFoods(true);
-    const updates = new Map<string, Food>();
-    const appends = new Map<string, Food>();
-    for (const it of food) {
-      const name = it.normalized ?? it.name;
-      const key = foodKey(name);
-      const base = updates.get(key) ?? appends.get(key) ?? foods.get(key) ?? newFood(key, name, '');
-      const next: Food = {
-        ...base,
-        kind: it.kind ?? base.kind,
-        storage: it.storage ?? base.storage,
-        shelfDays: it.shelfDays ?? base.shelfDays,
-        pieces: it.pieces ?? base.pieces,
-        content: it.quantity ? `${it.quantity}${it.unit ?? ''}` : base.content,
-        purchaseCount: base.purchaseCount + 1,
-        lastPrice: it.price || base.lastPrice,
-        prices: it.price ? [...base.prices, it.price] : base.prices,
-      };
-      if (next.rowIndex > 0) updates.set(key, next);
-      else appends.set(key, next);
-    }
-    await writeFoods([...updates.values()], [...appends.values()], 'purchase');
+    await writePurchases(food);
   } catch (e) {
-    console.warn('[Food] 購入の記録に失敗:', e instanceof Error ? e.message : e);
+    console.warn('[Food] 購入の記録に失敗。後で記録する:', e instanceof Error ? e.message : e);
+    const pending = readJsonArray<PendingPurchase>(PENDING_FILE);
+    writeJson(PENDING_FILE, [...pending, { id: newEntryId(), items: food }].slice(-PENDING_MAX));
   }
+}
+
+let flushing: Promise<void> | null = null;
+
+/** 記録できなかった購入をまとめて記録する（App の同期で呼ぶ）。失敗したら残して次回に回す */
+export function flushPendingPurchases(): Promise<void> {
+  flushing ??= (async () => {
+    try {
+      if (await Demo.isDemo()) return;
+      const pending = readJsonArray<PendingPurchase>(PENDING_FILE);
+      if (pending.length === 0) return;
+      await writePurchases(pending.flatMap((p) => p.items));
+      // 記録している間に増えた分は残す
+      const done = new Set(pending.map((p) => p.id));
+      const rest = readJsonArray<PendingPurchase>(PENDING_FILE).filter((p) => !done.has(p.id));
+      if (rest.length > 0) writeJson(PENDING_FILE, rest);
+      else removeFile(PENDING_FILE);
+    } catch (e) {
+      console.warn('[Food] 未記録の購入を記録できなかった:', e instanceof Error ? e.message : e);
+    } finally {
+      flushing = null;
+    }
+  })();
+  return flushing;
+}
+
+async function writePurchases(food: ReceiptItem[]): Promise<void> {
+  const foods = await loadFoods(true);
+  const updates = new Map<string, Food>();
+  const appends = new Map<string, Food>();
+  for (const it of food) {
+    const name = it.normalized ?? it.name;
+    const key = foodKey(name);
+    const base = updates.get(key) ?? appends.get(key) ?? foods.get(key) ?? newFood(key, name, '');
+    const next: Food = {
+      ...base,
+      kind: it.kind ?? base.kind,
+      storage: it.storage ?? base.storage,
+      shelfDays: it.shelfDays ?? base.shelfDays,
+      pieces: it.pieces ?? base.pieces,
+      content: it.quantity ? `${it.quantity}${it.unit ?? ''}` : base.content,
+      purchaseCount: base.purchaseCount + 1,
+      lastPrice: it.price || base.lastPrice,
+      prices: it.price ? [...base.prices, it.price] : base.prices,
+    };
+    if (next.rowIndex > 0) updates.set(key, next);
+    else appends.set(key, next);
+  }
+  await writeFoods([...updates.values()], [...appends.values()], 'purchase');
 }
 
 /** 調べた栄養を保存する（無ければ作る） */
