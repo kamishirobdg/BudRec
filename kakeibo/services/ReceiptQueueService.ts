@@ -13,6 +13,7 @@
 
 import { Directory, File, Paths } from 'expo-file-system';
 import type { ExpenseRow } from './SheetsService';
+import type { StoredAnalysis } from './MealProcessing';
 import { readJsonArray, writeJson } from './jsonFileStore';
 import { archiveReceiptPhoto } from './PhotoStore';
 
@@ -24,8 +25,8 @@ const META_FILE = 'receipt-meta.json';
  * - `deferred` … 無料枠切れで推定待ち。`notBefore` を過ぎたら自動で `queued` に戻る
  * - `stopped`  … 中止した。自動では処理しない
  * - `failed`   … OCR が 2 回失敗した。自動では処理しない
- * - `review`   … 確認待ち（レシートは 2 件以上読めたとき `rows` に読み取り結果、
- *                食事は判別に困ったとき `mealId` に推定結果の食事）
+ * - `review`   … 2 件以上のレシートが読めたので保存前の確認待ち（`rows` に読み取り結果）。
+ *                料理の確認待ちは食事の記録側（`_meals` の needs_review）で扱う
  */
 export type ReceiptStatus = 'queued' | 'deferred' | 'stopped' | 'failed' | 'review';
 
@@ -45,15 +46,11 @@ interface ReceiptMeta {
   rows?:      ExpenseRow[];
   /** `deferred` のとき、処理し直してよい時刻（エポックミリ秒） */
   notBefore?: number;
-  /** 食事の `review` のとき、推定済みの食事の ID と、その食事が入っているシート */
-  mealId?:    string;
-  mealSheet?: string;
   /**
-   * 登録の途中（ID を振った行を書き込み始めた）。この状態で残っていたら、書き込みの途中で
-   * アプリが終了されたので、既に書けた行を飛ばして続きから登録する（二重登録を防ぐ）。
-   * レシートは `rows` に ID 付きの行、食事は `mealId` に振った ID を持つ。
+   * 振り分けの結果（ID を振った支出行・料理・食事の ID）。書き込みを始める前に残しておき、
+   * 途中でアプリが終了されたら、Gemini を呼び直さず書けていないものだけ続きから書く（二重登録を防ぐ）。
    */
-  saving?:    boolean;
+  analysis?:  StoredAnalysis;
 }
 
 export interface ReceiptItem extends ReceiptMeta {
@@ -113,9 +110,7 @@ export function readReceipt(uri: string): string {
 export function setStatus(
   uri: string,
   status: ReceiptStatus,
-  extra: {
-    error?: string; rows?: ExpenseRow[]; notBefore?: number; mealId?: string; mealSheet?: string; saving?: boolean;
-  } = {},
+  extra: { error?: string; rows?: ExpenseRow[]; notBefore?: number; analysis?: StoredAnalysis } = {},
 ): void {
   // 破棄済みの画像に状態だけ残さない
   if (!new File(uri).exists) return;

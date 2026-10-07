@@ -10,6 +10,7 @@ import { getCurrentUser } from './UserService';
 import * as CategoryService from './CategoryService';
 import * as LastBatch from './LastBatchService';
 import * as Demo from './DemoService';
+import { recordPurchases } from './FoodService';
 import { getProvider } from '../providers';
 import type { ReceiptData } from '../providers';
 
@@ -38,6 +39,15 @@ export interface SaveResult {
   entryIds: string[];
   /** 書き込めた行（ID・品目付き）。食事とのひも付けに使う */
   saved:    ExpenseRow[];
+}
+
+/** 読み取ったレシートを書き込み用の行にする（金額を読めなかったものは捨てる） */
+export async function rowsFromReceipts(receipts: ReceiptData[], proxyUser: string | undefined): Promise<ExpenseRow[]> {
+  const valid = receipts.filter((r) => r.amount > 0);
+  if (valid.length === 0) return [];
+  const user   = proxyUser ?? await getCurrentUser();
+  const source = proxyUser ? 'proxy_camera' : 'camera';
+  return valid.map((data) => toExpenseRow(data, user, source));
 }
 
 /**
@@ -70,6 +80,8 @@ export async function saveReceiptRows(rows: ExpenseRow[]): Promise<SaveResult> {
   }
 
   if (saved.length === 0) throw new Error('スプレッドシートに書き込めませんでした');
+  // 食品データに購入回数と価格を記録する（栄養は空き時間に調べる）
+  await recordPurchases(saved.flatMap((r) => r.items ?? []));
   // 一覧の「前回の登録」から後で見直せるようにする。
   // デモ中は appendRow がメモリ上のオーバーレイに積むだけで実データは書かれないが、
   // saved にはマスク前の実データ（店名・金額）が入っているため、

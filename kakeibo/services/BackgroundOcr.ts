@@ -22,6 +22,7 @@ TaskManager.defineTask(TASK_NAME, async () => {
     // サインイン前・ユーザー名の設定前は、App と同じく処理しない
     if (!(await isSignedIn()) || !(await isUserNameSet())) return BackgroundTask.BackgroundTaskResult.Success;
     await OcrWorker.runPending();
+    await OcrWorker.researchIdle();
     return BackgroundTask.BackgroundTaskResult.Success;
   } catch (e) {
     console.warn('[BackgroundOcr] 失敗:', e instanceof Error ? e.message : e);

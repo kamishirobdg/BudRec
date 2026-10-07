@@ -23,11 +23,15 @@ import BackgroundService from 'react-native-background-actions';
 import { AuthError } from './AuthService';
 import { CancelledError, QuotaExceededError } from '../providers/AIProvider';
 import * as ReceiptQueue from './ReceiptQueueService';
-import { extractRows, saveReceiptRows } from './ReceiptProcessing';
-import { epochToTimestamp, linkReceiptToMeals, processMealPhoto } from './MealProcessing';
-import { mealExists, mealsSheetName, newMealId } from './MealService';
-import { existingEntryIds, newEntryId } from './SheetsService';
+import { saveReceiptRows } from './ReceiptProcessing';
+import {
+  MealResult, StoredAnalysis, analyzeCapturedPhoto, epochToTimestamp, linkReceiptToMeals, receiptCandidateOf, recordMeal,
+} from './MealProcessing';
+import { archiveMealPhoto, mealPhotoRef } from './PhotoStore';
+import { mealExists, mealsSheetName } from './MealService';
+import { existingEntryIds } from './SheetsService';
 import { ensureMealShared } from './SharedPhotos';
+import { researchSomePending } from './FoodService';
 import type { ExpenseRow } from './SheetsService';
 
 export type WorkerEvent =
@@ -70,8 +74,8 @@ export function getProgress(): WorkerProgress {
 }
 
 /** 画像を OCR 待ちに積んで処理を始める */
-export function enqueue(base64: string, proxyUser?: string, kind: ReceiptQueue.PhotoKind = 'receipt'): void {
-  const uri = ReceiptQueue.saveReceipt(base64, proxyUser, kind);
+export function enqueue(base64: string, proxyUser?: string): void {
+  const uri = ReceiptQueue.saveReceipt(base64, proxyUser);
   // 無料枠切れで止まっている間は、送っても通らないので同じ時刻まで待たせる
   const waitUntil = ReceiptQueue.nextDeferredAt();
   if (waitUntil !== null && waitUntil > Date.now()) {
@@ -116,6 +120,26 @@ export async function runPending(): Promise<void> {
     const p = loopPromise;
     await p;
     if (loopPromise === p) break;
+  }
+}
+
+let researching = false;
+
+/**
+ * 空き時間に食品データの栄養を少しずつ調べる（1 日の上限あり）。OCR が動いていれば何もしない。
+ * 無料枠切れになったらその日は止める。失敗しても投げない。
+ */
+export async function researchIdle(): Promise<void> {
+  if (running || researching) return;
+  researching = true;
+  try {
+    for (let i = 0; i < 6 && !running && queuedCount() === 0; i++) {
+      if (!(await researchSomePending())) break;
+    }
+  } catch (e) {
+    if (!(e instanceof QuotaExceededError)) console.warn('[OcrWorker] 食品データの調査に失敗:', e instanceof Error ? e.message : e);
+  } finally {
+    researching = false;
   }
 }
 
@@ -193,29 +217,22 @@ async function processOne(item: ReceiptQueue.ReceiptItem): Promise<Outcome> {
       return 'done';
     }
 
+    // 前回、書き込みの途中で終了されていれば、振り分けの結果が残っている。Gemini を呼び直さず続きから書く
+    let analysis: StoredAnalysis | null = item.analysis ?? null;
     for (let attempt = 0; ; attempt++) {
       try {
-        if (item.kind === 'meal') return await processMeal(item, base64, abort.signal);
-
-        // 前回、登録の途中でアプリが終了されていた。書けた行を飛ばして続きから登録する
-        if (item.saving && item.rows && item.rows.length > 0) return await resumeReceiptSave(item);
-
-        const rows = await extractRows(base64, item.proxyUser, abort.signal);
-        // OCR が返った直後に中止された場合。ここを過ぎたら書き込みは最後まで行う
-        if (abort.signal.aborted) return cancelled();
-        if (rows.length > 1) {
-          // 誤読が起きやすいので保存前に見せる
-          ReceiptQueue.setStatus(item.uri, 'review', { rows });
-          return 'done';
+        if (!analysis) {
+          analysis = await analyzeCapturedPhoto(base64, item.proxyUser, abort.signal);
+          // 読み取りが返った直後に中止された場合。ここを過ぎたら書き込みは最後まで行う
+          if (abort.signal.aborted) return cancelled();
+          if (analysis.receiptRows.length === 0 && analysis.dishes.length === 0) {
+            analysis = null;
+            throw new Error('レシートも料理・食品も読み取れませんでした');
+          }
+          // ID を振った結果を残してから書き始める（途中で終了されても二重に登録しないため）
+          ReceiptQueue.setStatus(item.uri, 'queued', { analysis });
         }
-        // ID を振ってから書き始めたことを残す（途中で終了されても二重に登録しないため）
-        const withIds = rows.map((r) => ({ ...r, entryId: r.entryId || newEntryId() }));
-        ReceiptQueue.setStatus(item.uri, 'queued', { rows: withIds, saving: true });
-        const { message, entryIds, saved } = await saveReceiptRows(withIds);
-        ReceiptQueue.completeReceipt(item.uri, entryIds);
-        emit({ type: 'saved', message });
-        await linkSavedReceipts(saved);
-        return 'done';
+        return await writeAnalysis(item, analysis, abort.signal);
       } catch (e) {
         if (e instanceof AuthError) return 'auth-failed';
         if (e instanceof CancelledError || abort.signal.aborted) return cancelled();
@@ -224,7 +241,7 @@ async function processOne(item: ReceiptQueue.ReceiptItem): Promise<Outcome> {
           ReceiptQueue.setStatus(item.uri, 'failed', { error: e instanceof Error ? e.message : String(e) });
           return 'done';
         }
-        console.warn('[OcrWorker] OCR 1回目失敗、リトライ:', e);
+        console.warn('[OcrWorker] 1回目失敗、リトライ:', e);
         await new Promise((r) => setTimeout(r, 1000));
         if (abort.signal.aborted) return cancelled();
       }
@@ -235,60 +252,56 @@ async function processOne(item: ReceiptQueue.ReceiptItem): Promise<Outcome> {
   }
 }
 
-/** 登録の途中で終了されたレシートの続き。既に書けた行（未送信キューに積んだものを含む）は飛ばす */
-async function resumeReceiptSave(item: ReceiptQueue.ReceiptItem): Promise<Outcome> {
-  const rows = item.rows ?? [];
-  const existing = await existingEntryIds(rows);
-  const remaining = rows.filter((r) => !existing.has(r.entryId ?? ''));
-  let saved = rows.filter((r) => existing.has(r.entryId ?? ''));
-  let message = '記録しました';
-  if (remaining.length > 0) {
-    const res = await saveReceiptRows(remaining);
-    saved = [...saved, ...res.saved];
-    message = res.message;
-  }
-  ReceiptQueue.completeReceipt(item.uri, saved.map((r) => r.entryId!).filter(Boolean));
-  emit({ type: 'saved', message });
-  await linkSavedReceipts(saved);
-  return 'done';
-}
-
 /**
- * 食事写真を 1 枚処理する。判別に困ったときは `review` にして「要確認」に出す
- * （画像は確認が済むまで残す）。二人にまたがる食事なら写真を相手と共有する。
+ * 振り分けた結果を書く。何度呼ばれても同じ結果になるように、書けているものは飛ばす
+ * （支出行は ID がシート・未送信キューにあるか、食事は meal_id があるかで見る）。
+ *
+ * - レシート 1 件 → 登録。2 件以上 → 保存前の確認（「要確認」）
+ * - 料理・食品 → 食事として記録（同じ写真のレシートがあればそれにひも付ける）
+ * - 写真: 食事の写真としてコピーを残し、レシートとして登録したものはレシートの写真として移す
  */
-async function processMeal(item: ReceiptQueue.ReceiptItem, base64: string, signal: AbortSignal): Promise<Outcome> {
+async function writeAnalysis(item: ReceiptQueue.ReceiptItem, a: StoredAnalysis, signal: AbortSignal): Promise<Outcome> {
   const shotAt = item.shotAt ?? Date.now();
-  // 前回、記録の途中で終了されていた。もう記録できていれば片付けるだけにする（二重に記録しない）
-  if (item.saving && item.mealId) {
-    if (await mealExists(mealsSheetName(epochToTimestamp(shotAt)), item.mealId)) {
-      ReceiptQueue.deleteReceipt(item.uri);
-      return 'done';
+  const messages: string[] = [];
+
+  let saved: ExpenseRow[] = [];
+  if (a.receiptRows.length === 1) {
+    const existing = await existingEntryIds(a.receiptRows);
+    saved = a.receiptRows.filter((r) => existing.has(r.entryId ?? ''));
+    const remaining = a.receiptRows.filter((r) => !existing.has(r.entryId ?? ''));
+    if (remaining.length > 0) {
+      const res = await saveReceiptRows(remaining);
+      saved = [...saved, ...res.saved];
+      messages.push(res.message);
     }
   }
-  const mealId = item.saving && item.mealId ? item.mealId : newMealId();
-  ReceiptQueue.setStatus(item.uri, 'queued', { mealId, saving: true });
 
-  const r = await processMealPhoto(item.uri, base64, shotAt, item.proxyUser, signal, {
-    mealId,
-    keepOriginal: (needsReview) => needsReview,
-  });
-  if (r.needsReview) {
-    ReceiptQueue.setStatus(item.uri, 'review', { mealId: r.mealId, mealSheet: r.sheetName });
+  let meal: MealResult | null = null;
+  if (a.dishes.length > 0 && !(await mealExists(mealsSheetName(epochToTimestamp(shotAt)), a.mealId))) {
+    meal = await recordMeal(a, shotAt, mealPhotoRef(item.uri), saved[0] ? receiptCandidateOf(saved[0]) : null, signal);
+    archiveMealPhoto(item.uri, true);
+    const dishes = [...new Set(meal.rows.map((x) => x.dish))];
+    messages.push([
+      meal.needsReview ? '食事を記録しました（要確認）' : '食事を記録しました',
+      dishes.slice(0, 3).join('・') + (dishes.length > 3 ? ` ほか ${dishes.length - 3} 品` : ''),
+    ].join('\n'));
+  }
+
+  if (a.receiptRows.length > 1) {
+    // 誤読が起きやすいので保存前に見せる
+    ReceiptQueue.setStatus(item.uri, 'review', { rows: a.receiptRows });
+  } else if (saved.length > 0) {
+    ReceiptQueue.completeReceipt(item.uri, saved.map((r) => r.entryId!).filter(Boolean));
   } else {
+    // 食事だけの写真。保存先にコピー済みなので OCR 待ちのフォルダからは消す
     ReceiptQueue.deleteReceipt(item.uri);
   }
-  const dishes = [...new Set(r.rows.map((x) => x.dish))];
-  emit({
-    type: 'saved',
-    message: [
-      r.needsReview ? '食事を記録しました（要確認）' : '食事を記録しました',
-      dishes.slice(0, 3).join('・') + (dishes.length > 3 ? ` ほか ${dishes.length - 3} 品` : ''),
-    ].join('\n'),
-  });
+
+  if (messages.length > 0) emit({ type: 'saved', message: messages.join('\n') });
+  if (saved.length > 0) await linkSavedReceipts(saved);
   // 未送信に積んだうえで再サインインが要る状態になった。記録は後で届くので、ここで止める
-  if (r.authFailed) return 'auth-failed';
-  if (r.sharedMeal) await ensureMealShared(r.rows, r.rows[0]?.updatedBy ?? '');
+  if (meal?.authFailed) return 'auth-failed';
+  if (meal?.sharedMeal) await ensureMealShared(meal.rows, meal.rows[0]?.updatedBy ?? '');
   return 'done';
 }
 

@@ -15,6 +15,7 @@
 import axios from 'axios';
 import { AuthError, getAccessToken, refreshAccessTokenNow } from './AuthService';
 import { withRetry } from './httpRetry';
+import { recordPurchases } from './FoodService';
 import {
   appendRow,
   ExpenseRow,
@@ -177,6 +178,7 @@ export async function runGmailImport(): Promise<void> {
           items:         data.items,
         };
         await appendRow(row);
+        await recordPurchases(data.items ?? []);
         await markGmailMessageProcessed(ref.id, 'ok');
         imported++;
       } catch (e) {

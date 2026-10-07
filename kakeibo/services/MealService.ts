@@ -21,8 +21,20 @@ export type NutrientSource = 'grounding' | 'food_table' | 'estimate';
 export type Confidence     = 'high' | 'medium' | 'low';
 
 export interface ItemRef {
-  itemId:    string;
-  usedRatio: number;
+  itemId:     string;
+  /** 個数で数えない品目の、残りに対して使った割合 */
+  usedRatio?:  number;
+  /** 個数で数える品目の、食べた個数 */
+  usedPieces?: number;
+}
+
+/** 在庫のうち見分けられなかった候補（ユーザーに選んでもらう） */
+export interface ItemChoice {
+  itemId: string;
+  name:   string;
+  store:  string;
+  /** 'M/D' */
+  bought: string;
 }
 
 export interface MealRow {
@@ -51,6 +63,8 @@ export interface MealRow {
   sources:        string[];
   updatedBy:      string;
   updatedAt:      string;
+  /** 在庫のどれか見分けられなかったときの候補。選ばれるまで在庫の残りは減らさない */
+  choices:        ItemChoice[];
   deleted?:       boolean;
   rowIndex?:      number;
   sheetName?:     string;
@@ -59,9 +73,9 @@ export interface MealRow {
 export const MEALS_HEADER = [
   'meal_id', 'dish_id', 'eaten_at', 'user', 'kind', 'store', 'dish', 'portion', 'nutrients',
   'nutrient_source', 'confidence', 'entry_id', 'item_refs', 'status', 'assigned_by', 'photo_refs',
-  'rev', 'sources', 'updated_by', 'updated_at', 'deleted',
+  'rev', 'sources', 'updated_by', 'updated_at', 'deleted', 'choices',
 ];
-const MEALS_RANGE = 'A:U';
+const MEALS_RANGE = 'A:V';
 
 const HISTORY_SHEET = '_history';
 
@@ -91,6 +105,7 @@ function toCells(r: MealRow): (string | number)[] {
     JSON.stringify(r.nutrients), r.nutrientSource, r.confidence, r.entryId,
     JSON.stringify(r.itemRefs), r.status, r.assignedBy, JSON.stringify(r.photoRefs),
     r.rev, JSON.stringify(r.sources), r.updatedBy, r.updatedAt, r.deleted ? 'TRUE' : 'FALSE',
+    JSON.stringify(r.choices ?? []),
   ];
 }
 
@@ -127,6 +142,7 @@ function fromCells(c: string[], rowIndex: number, sheetName: string): MealRow {
     updatedBy:      c[18] ?? '',
     updatedAt:      c[19] ?? '',
     deleted:        (c[20] ?? '').toString().toUpperCase() === 'TRUE',
+    choices:        parseJsonCell<ItemChoice[]>(c[21], []),
     rowIndex,
     sheetName,
   };
@@ -229,7 +245,7 @@ export async function saveMeal(
     const row: MealRow = { ...r, mealId, rev, updatedBy: savedBy, updatedAt: now, deleted: false };
     const existing = currentByKey.get(keyOf(r));
     if (existing?.rowIndex) {
-      updates.push({ range: `'${sheetName}'!A${existing.rowIndex}:U${existing.rowIndex}`, values: [toCells(row)] });
+      updates.push({ range: `'${sheetName}'!A${existing.rowIndex}:V${existing.rowIndex}`, values: [toCells(row)] });
       saved.push({ ...row, rowIndex: existing.rowIndex, sheetName });
     } else {
       appends.push(toCells(row));
@@ -240,7 +256,7 @@ export async function saveMeal(
   for (const r of current) {
     if (nextKeys.has(keyOf(r)) || !r.rowIndex) continue;
     const row: MealRow = { ...r, rev, updatedBy: savedBy, updatedAt: now, deleted: true };
-    updates.push({ range: `'${sheetName}'!A${r.rowIndex}:U${r.rowIndex}`, values: [toCells(row)] });
+    updates.push({ range: `'${sheetName}'!A${r.rowIndex}:V${r.rowIndex}`, values: [toCells(row)] });
   }
 
   if (updates.length > 0) {

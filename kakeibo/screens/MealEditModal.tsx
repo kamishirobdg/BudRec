@@ -15,7 +15,7 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 import MealPhotos from '../components/MealPhotos';
 import {
-  Correction, HistoryEntry, MealConflictError, MealKind, MealRow,
+  Correction, HistoryEntry, ItemChoice, MealConflictError, MealKind, MealRow,
   deleteMeal, getMeal, getMealHistory, logCorrections, mealRev, mealsSheetName, newMealId, saveMeal,
 } from '../services/MealService';
 import { Nutrients, scaleNutrients, sanitizeNutrients } from '../services/Nutrients';
@@ -25,6 +25,8 @@ import { getUniqueUsers } from '../services/SheetsService';
 import { epochToTimestamp } from '../services/MealProcessing';
 import { archiveMealPhoto, mealPhotoRef } from '../services/PhotoStore';
 import { ensureMealShared, markSettled } from '../services/SharedPhotos';
+import { researchNow } from '../services/FoodService';
+import { consume } from '../services/InventoryService';
 
 export type MealTarget =
   | { mode: 'edit'; sheetName: string; mealId: string }
@@ -60,6 +62,12 @@ interface DishDraft {
   sources:        string[];
   assignedBy:     MealRow['assignedBy'];
   isNew:          boolean;
+  /** 在庫のどれか見分けられなかった候補。選ぶまで在庫は減らしていない */
+  choices:        ItemChoice[];
+  /** 候補から選んだ在庫（'none' は「どれでもない」） */
+  chosen:         string | null;
+  /** 「栄養を調べ直す」で栄養を差し替えた */
+  refreshed:      boolean;
 }
 
 const RATIOS = [0.5, 0.6, 0.7, 0.4, 0.3];
@@ -91,6 +99,9 @@ function toDrafts(rows: MealRow[]): DishDraft[] {
       sources: first.sources,
       assignedBy: first.assignedBy,
       isNew: false,
+      choices: first.choices ?? [],
+      chosen: null,
+      refreshed: false,
     };
   });
 }
@@ -163,7 +174,8 @@ export default function MealEditModal({ target, onClose, onSaved }: Props) {
   const entryIds = [...new Set(loaded.map((r) => r.entryId).filter(Boolean))];
   const changed =
     drafts.length !== toDrafts(loaded).length ||
-    drafts.some((d) => d.isNew || d.dish.trim() !== d.originalDish || eatersKey(d.eaters) !== eatersKey(d.originalEaters));
+    drafts.some((d) => d.isNew || d.refreshed || d.chosen !== null || d.dish.trim() !== d.originalDish
+      || eatersKey(d.eaters) !== eatersKey(d.originalEaters));
   const needsReview = loaded.some((r) => r.status === 'needs_review');
 
   const update = (dishId: string, patch: Partial<DishDraft>) =>
@@ -176,7 +188,7 @@ export default function MealEditModal({ target, onClose, onSaved }: Props) {
       dishId: newMealId(), dish: name, originalDish: '', kind: prev[0]?.kind ?? 'home', store: prev[0]?.store ?? '',
       eaters: [{ user: me, portion: 1 }], originalEaters: [], whole: sanitizeNutrients({}),
       nutrientSource: 'estimate', confidence: 'low', entryId: prev[0]?.entryId ?? '', itemRefs: [], sources: [],
-      assignedBy: 'manual', isNew: true,
+      assignedBy: 'manual', isNew: true, choices: [], chosen: null, refreshed: false,
     }]);
     setNewDish('');
   };
@@ -210,14 +222,47 @@ export default function MealEditModal({ target, onClose, onSaved }: Props) {
   const buildRows = (list: DishDraft[], photoRef: string | null): MealRow[] =>
     list.flatMap((d) => {
       const manual = d.isNew || eatersKey(d.eaters) !== eatersKey(d.originalEaters) || d.dish.trim() !== d.originalDish;
+      const resolved = resolveChoice(d);
       return d.eaters.map((e): MealRow => ({
         mealId, dishId: d.dishId, eatenAt, user: e.user, kind: d.kind, store: d.store,
         dish: d.dish.trim(), portion: e.portion, nutrients: scaleNutrients(d.whole, e.portion),
-        nutrientSource: d.nutrientSource, confidence: d.confidence, entryId: d.entryId, itemRefs: d.itemRefs,
-        status: 'edited', assignedBy: manual ? 'manual' : d.assignedBy,
+        nutrientSource: d.nutrientSource, confidence: d.confidence, entryId: d.entryId, itemRefs: resolved.itemRefs,
+        // 見分けられなかった在庫を選ぶまでは確認待ちのまま
+        status: resolved.choices.length > 0 ? 'needs_review' : 'edited', assignedBy: manual ? 'manual' : d.assignedBy,
         photoRefs: photoRef ? [photoRef] : photoRefs, rev: 0, sources: d.sources, updatedBy: me, updatedAt: '',
+        choices: resolved.choices,
       }));
     });
+
+  /** 候補から選んだら、その在庫を使ったことにする（量は推定のまま） */
+  const resolveChoice = (d: DishDraft): { itemRefs: MealRow['itemRefs']; choices: ItemChoice[] } => {
+    if (!d.chosen) return { itemRefs: d.itemRefs, choices: d.choices };
+    if (d.chosen === 'none') return { itemRefs: [], choices: [] };
+    const amount = d.itemRefs[0] ?? { itemId: d.chosen };
+    return { itemRefs: [{ ...amount, itemId: d.chosen }], choices: [] };
+  };
+
+  /** 栄養を調べ直す（リニューアルなどで明らかに違うとき） */
+  const reresearch = async (d: DishDraft) => {
+    try {
+      const food = await researchNow({
+        name: d.dish.trim(), chain: d.kind === 'eat_out' ? d.store : '', kind: d.kind, content: '',
+      });
+      if (!food || !Object.values(food.nutrients).some((v) => v !== null)) {
+        Alert.alert('見つかりませんでした');
+        return;
+      }
+      update(d.dishId, {
+        whole: food.nutrients,
+        nutrientSource: food.source === 'grounding' ? 'grounding' : 'estimate',
+        confidence: food.source === 'grounding' ? 'high' : 'low',
+        sources: food.sources,
+        refreshed: true,
+      });
+    } catch (e) {
+      Alert.alert('調べられませんでした', e instanceof Error ? e.message : String(e));
+    }
+  };
 
   const corrections = (list: DishDraft[]): Correction[] =>
     list.flatMap((d): Correction[] => {
@@ -293,6 +338,10 @@ export default function MealEditModal({ target, onClose, onSaved }: Props) {
       const saved = await persist(buildRows(list, photoRef), baseRev);
       if (!saved) return;
       if (target.mode === 'new') archiveMealPhoto(target.photoUri);
+      // 候補から選んだ在庫の残りを、ここで初めて減らす
+      await consume(list
+        .filter((d) => d.chosen && d.chosen !== 'none')
+        .map((d) => ({ itemId: d.chosen!, pieces: d.itemRefs[0]?.usedPieces, ratio: d.itemRefs[0]?.usedRatio })));
       await logCorrections(corrections(list));
       // 共有してから確定日時を書く（この保存で新しく共有した写真にも 7 日の期限を付ける）
       await ensureMealShared(saved, me);
@@ -417,6 +466,33 @@ export default function MealEditModal({ target, onClose, onSaved }: Props) {
                         <Text style={styles.remove}>削除</Text>
                       </TouchableOpacity>
                     </View>
+                    {d.choices.length > 0 && (
+                      <View style={styles.choiceBox}>
+                        <Text style={styles.choiceTitle}>どれですか？</Text>
+                        <View style={styles.chips}>
+                          {d.choices.map((c) => (
+                            <Chip
+                              key={c.itemId}
+                              small
+                              label={`${c.name}（${c.store} ${c.bought}）`}
+                              active={d.chosen === c.itemId}
+                              onPress={() => update(d.dishId, { chosen: c.itemId, dish: c.name })}
+                            />
+                          ))}
+                          <Chip
+                            small
+                            label="どれでもない"
+                            active={d.chosen === 'none'}
+                            onPress={() => update(d.dishId, { chosen: 'none' })}
+                          />
+                        </View>
+                      </View>
+                    )}
+                    {!d.isNew && (
+                      <TouchableOpacity onPress={() => reresearch(d)}>
+                        <Text style={styles.reresearch}>栄養を調べ直す</Text>
+                      </TouchableOpacity>
+                    )}
                     {d.isNew ? (
                       <View style={styles.chips}>
                         {(['eat_out', 'packaged', 'home'] as const).map((k) => (
@@ -585,6 +661,9 @@ const styles = StyleSheet.create({
   chipText:       { fontSize: 13, color: '#374151', fontWeight: '600' },
   chipTextActive: { color: '#fff' },
   ratioLegend:    { fontSize: 12, color: '#6b7280' },
+  choiceBox:      { gap: 6, backgroundColor: '#fffbeb', borderRadius: 10, padding: 10 },
+  choiceTitle:    { fontSize: 13, color: '#b45309', fontWeight: '700' },
+  reresearch:     { fontSize: 12, color: '#2563eb', fontWeight: '600' },
   addRow:    { flexDirection: 'row', gap: 8 },
   addInput: {
     flex: 1, backgroundColor: '#fff', borderRadius: 12, paddingHorizontal: 14, paddingVertical: 10,

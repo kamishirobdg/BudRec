@@ -7,20 +7,23 @@
  * - レシートを登録したときに、前後 3 時間の食事でまだレシートの無いものがあればひも付け直す
  */
 
-import { SheetsInternal, getRowsRaw, getUniqueUsers } from './SheetsService';
+import { SheetsInternal, ExpenseRow, getRowsRaw, getUniqueUsers, newEntryId } from './SheetsService';
 import { AuthError } from './AuthService';
 import type { ReceiptItem } from '../providers/AIProvider';
 import { getCurrentUser } from './UserService';
 import {
-  identifyDishes, lookupNutrition, matchReceiptItems,
-  IdentifiedDish, NutritionQuery, NutritionResult, ReceiptLine,
+  analyzePhoto, lookupNutrition, matchReceiptItems,
+  IdentifiedDish, InventoryLine, NutritionQuery, NutritionResult, ReceiptLine, UsedItem,
 } from '../providers/GeminiMeal';
+import { listInventory, remainLabel, consume, InventoryItem } from './InventoryService';
+import { foodKey, freshNutrition, loadFoods, saveResearched } from './FoodService';
+import { rowsFromReceipts } from './ReceiptProcessing';
+import * as CategoryService from './CategoryService';
 import {
-  MealRow, Confidence, appendMeal, getMeals, mealRev, mealsSheetName, newMealId, recentCorrections, saveMeal,
-  MealConflictError,
+  MealRow, Confidence, ItemChoice, ItemRef, appendMeal, getMeals, mealRev, mealsSheetName, newMealId,
+  recentCorrections, saveMeal, MealConflictError,
 } from './MealService';
 import { scaleNutrients } from './Nutrients';
-import { archiveMealPhoto, mealPhotoRef } from './PhotoStore';
 import * as Demo from './DemoService';
 import { ensureMealShared } from './SharedPhotos';
 
@@ -60,7 +63,7 @@ function monthsAround(ms: number): string[] {
 
 // ─── レシートの品目 ───────────────────────────────────────────────────────────
 
-interface ReceiptCandidate {
+export interface ReceiptCandidate {
   entryId:   string;
   store:     string;
   timestamp: string;
@@ -77,7 +80,7 @@ async function findReceiptNear(shotAt: number): Promise<ReceiptCandidate | null>
   for (const month of monthsAround(shotAt)) {
     const sheet = `_items_${month}`;
     if (!names.includes(sheet)) continue;
-    const res = await client.get(`/values/${encodeURIComponent(sheet)}!A:N`);
+    const res = await client.get(`/values/${encodeURIComponent(sheet)}!A:S`);
     const values: string[][] = res.data.values ?? [];
     for (const c of values.slice(1)) {
       const entryId = c[1] ?? '';
@@ -157,7 +160,77 @@ function assign(dishes: IdentifiedDish[], photographer: string, partner: string 
   return servings;
 }
 
-// ─── 食事写真の処理 ───────────────────────────────────────────────────────────
+
+// ─── 写真の振り分け ───────────────────────────────────────────────────────────
+
+/** 在庫の候補（振り分けの指示文に渡した順。料理の used / choices の index はこの並び） */
+export interface InventoryRef {
+  index:           number;
+  itemId:          string;
+  name:            string;
+  store:           string;
+  bought:          string;
+  pieces:          number | null;
+  remaining:       number;
+  remainingPieces: number | null;
+}
+
+/**
+ * 振り分けの結果。画像の状態ファイルに保存しておき、書き込みの途中でアプリが終了されても
+ * Gemini を呼び直さずに続きから書けるようにする（ID は先に振ってある）。
+ */
+export interface StoredAnalysis {
+  /** ID 付きの支出行（レシートが写っていなければ空） */
+  receiptRows:  ExpenseRow[];
+  dishes:       IdentifiedDish[];
+  inventory:    InventoryRef[];
+  mealId:       string;
+  photographer: string;
+  partner:      string | null;
+}
+
+/** 在庫の候補として振り分けに渡す件数の上限（指示文が長くなりすぎないように） */
+const MAX_INVENTORY = 80;
+
+/**
+ * 撮った写真を 1 回の呼び出しでレシートと料理・食品に振り分けて読む。
+ * QuotaExceededError / CancelledError はそのまま投げる。
+ */
+export async function analyzeCapturedPhoto(
+  base64: string,
+  proxyUser: string | undefined,
+  signal: AbortSignal,
+): Promise<StoredAnalysis> {
+  const photographer = proxyUser ?? await getCurrentUser();
+  const partner = (await getUniqueUsers()).find((u) => u !== photographer) ?? null;
+  const corrections = (await recentCorrections(20))
+    .map((c) => `${c.context}: ${fieldLabel(c.field)}を「${c.before}」→「${c.after}」に修正`);
+
+  let stock: InventoryItem[] = [];
+  try {
+    stock = (await listInventory(false)).slice(0, MAX_INVENTORY);
+  } catch (e) {
+    console.warn('[Meal] 在庫を読めなかった:', e instanceof Error ? e.message : e);
+  }
+  const inventory: InventoryRef[] = stock.map((it, index) => ({
+    index, itemId: it.itemId, name: it.name, store: it.store,
+    bought: `${new Date(it.purchasedMs).getMonth() + 1}/${new Date(it.purchasedMs).getDate()}`,
+    pieces: it.pieces, remaining: it.remaining, remainingPieces: it.remainingPieces,
+  }));
+  const lines: InventoryLine[] = stock.map((it, index) => ({
+    index, name: it.name, store: it.store, bought: inventory[index].bought,
+    storage: it.storage === 'chilled' ? '冷蔵' : it.storage === 'frozen' ? '冷凍' : it.storage === 'ambient' ? '常温' : '',
+    remain: remainLabel(it),
+  }));
+
+  const categories = await CategoryService.getCategories();
+  const res = await analyzePhoto(base64, categories, { photographer, partner, corrections, inventory: lines }, signal);
+  const receiptRows = (await rowsFromReceipts(res.receipts, proxyUser))
+    .map((r) => ({ ...r, entryId: newEntryId() }));
+  return { receiptRows, dishes: res.dishes, inventory, mealId: newMealId(), photographer, partner };
+}
+
+// ─── 食事の記録 ───────────────────────────────────────────────────────────────
 
 export interface MealResult {
   mealId:      string;
@@ -170,67 +243,105 @@ export interface MealResult {
   authFailed:  boolean;
 }
 
+/** 使った在庫の量を「1 パック（入り数ぶん）のうちの割合」にする */
+function packageFraction(ref: InventoryRef, used: UsedItem): number {
+  if (ref.pieces && used.pieces) return used.pieces / ref.pieces;
+  return (used.ratio ?? 0) * ref.remaining;
+}
+
 /**
- * 食事写真を 1 枚処理して記録する。写真は端末の保存先へ移す。
- * QuotaExceededError / CancelledError / AuthError はそのまま投げる（OcrWorker が扱う）。
+ * 振り分けで見つかった料理・食品を食事として記録する。
+ * @param receipt 同じ写真に写っていて登録したレシート（あればそれにひも付ける。無ければ前後 3 時間から探す）
  */
-export async function processMealPhoto(
-  uri: string,
-  base64: string,
+export async function recordMeal(
+  a: StoredAnalysis,
   shotAt: number,
-  proxyUser: string | undefined,
+  photoRef: string | null,
+  receipt: ReceiptCandidate | null,
   signal: AbortSignal,
-  opts: { mealId?: string; keepOriginal?: (needsReview: boolean) => boolean } = {},
 ): Promise<MealResult> {
-  const photographer = proxyUser ?? await getCurrentUser();
-  const partner = (await getUniqueUsers()).find((u) => u !== photographer) ?? null;
-
-  const corrections = (await recentCorrections(20))
-    .map((c) => `${c.context}: ${fieldLabel(c.field)}を「${c.before}」→「${c.after}」に修正`);
-
-  const dishes = await identifyDishes(base64, { photographer, partner, corrections }, signal);
-  if (dishes.length === 0) throw new Error('料理を判別できませんでした');
-
-  // 既にレシートがあればひも付ける（無ければ、後でレシートを登録したときに付け直す）
-  const receipt = dishes.some((d) => d.kind !== 'home') ? await findReceiptNear(shotAt) : null;
-  const matches = receipt
-    ? await matchReceiptItems(receipt.store, dishes.map((d) => d.name), receipt.lines, signal)
+  const { dishes, inventory, mealId, photographer, partner } = a;
+  const linked = receipt ?? (dishes.some((d) => d.kind !== 'home' && d.used.length === 0) ? await findReceiptNear(shotAt) : null);
+  const matches = linked
+    ? await matchReceiptItems(linked.store, dishes.map((d) => d.name), linked.lines, signal)
     : dishes.map(() => null);
+  const nameOf = (i: number) => (matches[i] !== null && linked ? linked.lines[matches[i]!].name : dishes[i].name);
+  const storeOf = (i: number) => (dishes[i].kind !== 'home' && linked && matches[i] !== null ? linked.store : '');
 
-  const queries: NutritionQuery[] = dishes.map((d, i) => ({
-    store: d.kind !== 'home' ? receipt?.store ?? '' : '',
-    name:  matches[i] !== null ? receipt!.lines[matches[i]!].name : d.name,
-    kind:  d.kind,
-  }));
-  const { results, sources } = await lookupNutrition(queries, { imageBase64: base64, signal });
+  // 栄養: 食品データにあればそれを使い、無いものだけまとめて調べる
+  const foods = await loadFoods();
+  const whole: (NutritionResult | null)[] = dishes.map((d, i) => {
+    // 家にある商品を食べた（1 品だけ・見分けられている）→ 食品データ × 食べた割合
+    if (d.kind === 'packaged' && d.used.length === 1 && d.choices.length === 0) {
+      const ref = inventory[d.used[0].index];
+      const food = ref && freshNutrition(foods.get(foodKey(ref.name)));
+      if (food && food.basis === 'package') {
+        return { nutrients: scaleNutrients(food.nutrients, packageFraction(ref, d.used[0])), official: food.source === 'grounding' };
+      }
+    }
+    if (d.kind !== 'home' && d.used.length === 0) {
+      const food = freshNutrition(foods.get(foodKey(nameOf(i), d.kind === 'eat_out' ? storeOf(i) : '')));
+      if (food && food.basis === 'package') return { nutrients: food.nutrients, official: food.source === 'grounding' };
+    }
+    return null;
+  });
+  const todo = dishes.map((_, i) => i).filter((i) => whole[i] === null);
+  let sources: string[] = [];
+  if (todo.length > 0) {
+    const queries: NutritionQuery[] = todo.map((i) => {
+      const d = dishes[i];
+      const used = d.used
+        .map((u) => inventory[u.index] && `${inventory[u.index].name} ${u.pieces ? `${u.pieces}個` : `約${Math.round(packageFraction(inventory[u.index], u) * 100)}%`}`)
+        .filter(Boolean);
+      return {
+        store: storeOf(i),
+        name:  used.length > 0 ? `${nameOf(i)}（使った食材: ${used.join('、')}）` : nameOf(i),
+        kind:  d.kind,
+      };
+    });
+    const res = await lookupNutrition(queries, { signal });
+    sources = res.sources;
+    todo.forEach((i, k) => { whole[i] = res.results[k]; });
+    // 外食のメニュー・家の外で買った商品は食品データに足す（次からは調べずに済む）
+    await saveResearched(todo
+      .map((i, k) => ({ i, k }))
+      .filter(({ i }) => dishes[i].kind !== 'home' && dishes[i].used.length === 0)
+      .map(({ i, k }) => ({
+        query: { name: nameOf(i), chain: dishes[i].kind === 'eat_out' ? storeOf(i) : '', kind: dishes[i].kind, content: '' },
+        result: { nutrients: res.results[k].nutrients, basis: 'package' as const, official: res.results[k].official },
+        sources: res.sources,
+      })),
+    ).catch((e) => console.warn('[Meal] 食品データに足せなかった:', e instanceof Error ? e.message : e));
+  }
 
   const servings = assign(dishes, photographer, partner);
-  const mealId = opts.mealId ?? newMealId();
   const eatenAt = epochToTimestamp(shotAt);
-  const unmatched = receipt !== null && dishes.some((d, i) => d.kind !== 'home' && matches[i] === null);
+  const unmatched = linked !== null && dishes.some((d, i) => d.kind !== 'home' && d.used.length === 0 && matches[i] === null);
   const needsReview =
     servings.some((s) => s.unsure) ||
-    dishes.some((d) => d.confidence === 'low') ||
+    dishes.some((d) => d.confidence === 'low' || d.choices.length > 0) ||
     unmatched;
-  // 写真は記録を書いてから移す（書けなかったときに画像が OCR 待ちのフォルダから消えないように）
-  const photoRef = mealPhotoRef(uri);
 
   const rows: MealRow[] = [];
   for (const s of servings) {
     const d = dishes[s.dishIndex];
-    const r = results[s.dishIndex];
     const dishId = newMealId();
+    const itemRefs: ItemRef[] = d.used
+      .filter((u) => inventory[u.index])
+      .map((u) => ({ itemId: inventory[u.index].itemId, usedPieces: u.pieces, usedRatio: u.ratio }));
+    const choices: ItemChoice[] = d.choices
+      .filter((c) => inventory[c])
+      .map((c) => ({ itemId: inventory[c].itemId, name: inventory[c].name, store: inventory[c].store, bought: inventory[c].bought }));
     for (const e of s.eaters) {
       rows.push(buildRow({
         mealId, dishId, eatenAt, user: e.user, portion: e.portion,
-        dish: queries[s.dishIndex].name, kind: d.kind, store: queries[s.dishIndex].store,
-        result: r, dishConfidence: d.confidence,
-        entryId: matches[s.dishIndex] !== null ? receipt!.entryId : '',
-        photoRef, sources, updatedBy: photographer,
+        dish: nameOf(s.dishIndex), kind: d.kind, store: storeOf(s.dishIndex),
+        result: whole[s.dishIndex]!, dishConfidence: d.confidence,
+        entryId: d.kind !== 'home' && matches[s.dishIndex] !== null && linked ? linked.entryId : '',
+        photoRef, sources, updatedBy: photographer, itemRefs, choices,
       }));
     }
   }
-
   if (needsReview) for (const r of rows) r.status = 'needs_review';
 
   // 未送信に回っただけなら記録は届く。AuthError も未送信に積んでから投げられる
@@ -241,15 +352,34 @@ export async function processMealPhoto(
     if (e instanceof AuthError) authFailed = true;
     else if (!(e instanceof Error && e.name === 'QueuedWriteError')) throw e;
   }
-  // 確認待ちにする場合は、確認画面で見せるため元の画像も残す
-  archiveMealPhoto(uri, opts.keepOriginal?.(needsReview) ?? false);
+
+  // 在庫の残りを減らす。どれか見分けられなかった品は、選んでもらってから減らす
+  await consume(dishes
+    .filter((d) => d.choices.length === 0)
+    .flatMap((d) => d.used
+      .filter((u) => inventory[u.index])
+      .map((u) => ({ itemId: inventory[u.index].itemId, pieces: u.pieces, ratio: u.ratio }))));
+
   return {
-    authFailed,
     mealId,
     sheetName: mealsSheetName(eatenAt),
     needsReview,
     sharedMeal: new Set(rows.map((r) => r.user)).size > 1,
     rows,
+    authFailed,
+  };
+}
+
+/** 同じ写真に写っていたレシートを、食事のひも付け先の形にする */
+export function receiptCandidateOf(row: ExpenseRow): ReceiptCandidate | null {
+  const food = (row.items ?? []).filter((it) => it.kind !== 'non_food');
+  if (!row.entryId || food.length === 0) return null;
+  return {
+    entryId: row.entryId,
+    store: row.store,
+    timestamp: row.timestamp,
+    at: timestampToEpoch(row.timestamp) ?? 0,
+    lines: food.map((it, index) => ({ index, name: it.normalized ?? it.name, price: it.price })),
   };
 }
 
@@ -258,6 +388,7 @@ function buildRow(p: {
   dish: string; kind: IdentifiedDish['kind']; store: string;
   result: NutritionResult; dishConfidence: IdentifiedDish['confidence'];
   entryId: string; photoRef: string | null; sources: string[]; updatedBy: string;
+  itemRefs: ItemRef[]; choices: ItemChoice[];
 }): MealRow {
   const confidence: Confidence =
     p.dishConfidence === 'low' ? 'low' :
@@ -268,9 +399,9 @@ function buildRow(p: {
     nutrients: scaleNutrients(p.result.nutrients, p.portion),
     nutrientSource: p.result.official ? 'grounding' : 'estimate',
     confidence,
-    entryId: p.entryId, itemRefs: [], status: 'estimated', assignedBy: 'auto',
+    entryId: p.entryId, itemRefs: p.itemRefs, status: 'estimated', assignedBy: 'auto',
     photoRefs: p.photoRef ? [p.photoRef] : [],
-    rev: 1, sources: p.sources, updatedBy: p.updatedBy, updatedAt: p.eatenAt,
+    rev: 1, sources: p.sources, updatedBy: p.updatedBy, updatedAt: p.eatenAt, choices: p.choices,
   };
 }
 

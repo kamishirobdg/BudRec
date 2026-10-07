@@ -16,6 +16,7 @@ import { getUniqueUsers } from '../services/SheetsService';
 import * as OcrWorker from '../services/OcrWorker';
 import * as ReceiptQueue from '../services/ReceiptQueueService';
 import MealEditModal, { MealTarget } from './MealEditModal';
+import InventoryView from './InventoryView';
 
 function pad(n: number): string {
   return String(n).padStart(2, '0');
@@ -47,6 +48,9 @@ export default function MealsScreen() {
   const [people, setPeople]     = useState<string[]>([]);
   const [target, setTarget]     = useState<MealTarget | null>(null);
   const [deferred, setDeferred] = useState(0);
+  const [view, setView]         = useState<'meals' | 'stock'>('meals');
+  // 「食べきりましたか？」の数（在庫タブの見出しに出す）
+  const [confirmCount, setConfirmCount] = useState(0);
 
   // 月を素早く切り替えたとき、前の月の遅れて返った結果で上書きしない
   const requestSeq = useRef(0);
@@ -101,8 +105,32 @@ export default function MealsScreen() {
       }));
   }, [rows, person]);
 
+  const reviewCount = new Set(rows.filter((r) => r.status === 'needs_review').map((r) => r.mealId)).size;
+
+  const segment = (
+    <View style={styles.segment}>
+      {(['meals', 'stock'] as const).map((v) => (
+        <TouchableOpacity key={v} style={[styles.segBtn, view === v && styles.segBtnActive]} onPress={() => setView(v)}>
+          <Text style={[styles.segText, view === v && styles.segTextActive]}>
+            {v === 'meals' ? `食事${reviewCount > 0 ? `（要確認 ${reviewCount}）` : ''}` : `在庫${confirmCount > 0 ? `（確認 ${confirmCount}）` : ''}`}
+          </Text>
+        </TouchableOpacity>
+      ))}
+    </View>
+  );
+
+  if (view === 'stock') {
+    return (
+      <View style={styles.container}>
+        {segment}
+        <InventoryView onConfirmCount={setConfirmCount} />
+      </View>
+    );
+  }
+
   return (
     <View style={styles.container}>
+      {segment}
       <View style={styles.toolbar}>
         <TouchableOpacity onPress={() => setMonth((m) => shiftMonth(m, -1))}>
           <Text style={styles.arrow}>‹</Text>
@@ -188,6 +216,14 @@ export default function MealsScreen() {
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#f2f4f7' },
+  segment:   { flexDirection: 'row', gap: 8, paddingHorizontal: 16, paddingTop: 10, paddingBottom: 6, backgroundColor: '#fff' },
+  segBtn: {
+    flex: 1, alignItems: 'center', paddingVertical: 8, borderRadius: 10,
+    borderWidth: 1, borderColor: '#d1d5db', backgroundColor: '#fff',
+  },
+  segBtnActive:  { backgroundColor: '#2e7d32', borderColor: '#2e7d32' },
+  segText:       { fontSize: 14, fontWeight: '600', color: '#374151' },
+  segTextActive: { color: '#fff' },
   toolbar: {
     flexDirection: 'row', alignItems: 'center', gap: 12,
     paddingHorizontal: 16, paddingVertical: 10, backgroundColor: '#fff',

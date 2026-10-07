@@ -1,6 +1,6 @@
 {
   "name": "kakeibo",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "main": "index.ts",
   "scripts": {
     "start": "expo start",
@@ -15,10 +15,12 @@
     "@react-navigation/native": "^7.2.2",
     "axios": "^1.14.0",
     "expo": "~54.0.33",
+    "expo-application": "~7.0.8",
     "expo-auth-session": "~7.0.10",
     "expo-background-task": "~1.0.10",
     "expo-camera": "~17.0.10",
     "expo-crypto": "~15.0.8",
+    "expo-device": "~8.0.10",
     "expo-document-picker": "~14.0.8",
     "expo-file-system": "~19.0.21",
     "expo-image-manipulator": "~14.0.8",

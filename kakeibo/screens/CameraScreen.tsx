@@ -71,8 +71,6 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
   const [reviewBusy, setReviewBusy]     = useState(false);
   // 食事の確認・手入力（料理の写真から）
   const [mealTarget, setMealTarget]     = useState<{ item: ReceiptQueue.ReceiptItem; target: MealTarget } | null>(null);
-  // 撮るものの種類。続けて撮りやすいよう、切り替えるまで保つ
-  const [shotKind, setShotKind]         = useState<ReceiptQueue.PhotoKind>('receipt');
 
   // 代理入力モード
   const [proxyMode, setProxyMode] = useState(false);
@@ -151,7 +149,7 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
 
   /** 撮影時点の代理相手で積む（後から代理入力を切り替えても変わらない） */
   const enqueue = (base64: string) => {
-    OcrWorker.enqueue(base64, proxyMode ? proxyUser : undefined, shotKind);
+    OcrWorker.enqueue(base64, proxyMode ? proxyUser : undefined);
   };
 
   const handleShoot = async () => {
@@ -364,19 +362,6 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
             </TouchableOpacity>
           </View>
         )}
-        <View style={styles.kindRow}>
-          {(['receipt', 'meal'] as const).map((k) => (
-            <TouchableOpacity
-              key={k}
-              style={[styles.kindChip, shotKind === k && styles.kindChipActive]}
-              onPress={() => setShotKind(k)}
-            >
-              <Text style={[styles.kindChipText, shotKind === k && styles.kindChipTextActive]}>
-                {k === 'receipt' ? 'レシート' : '食事'}
-              </Text>
-            </TouchableOpacity>
-          ))}
-        </View>
         <View style={styles.buttonRow}>
           <TouchableOpacity
             style={[styles.shootBtn, capturing && styles.btnDisabled]}
@@ -406,20 +391,19 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
         }}
         onManual={(item) => {
           setListOpen(false);
-          if (item.kind === 'meal') {
-            setMealTarget({ item, target: { mode: 'new', photoUri: item.uri, shotAt: item.shotAt ?? Date.now(), proxyUser: item.proxyUser } });
-          } else {
-            setManualTarget(item);
-          }
+          // 読み取れなかった写真は、レシートか料理かも分からないので選んでもらう
+          Alert.alert('何として記録しますか？', undefined, [
+            { text: 'キャンセル', style: 'cancel' },
+            { text: 'レシート', onPress: () => setManualTarget(item) },
+            {
+              text: '食事',
+              onPress: () => setMealTarget({
+                item, target: { mode: 'new', photoUri: item.uri, shotAt: item.shotAt ?? Date.now(), proxyUser: item.proxyUser },
+              }),
+            },
+          ]);
         }}
-        onReview={(item) => {
-          setListOpen(false);
-          if (item.kind === 'meal' && item.mealId && item.mealSheet) {
-            setMealTarget({ item, target: { mode: 'edit', sheetName: item.mealSheet, mealId: item.mealId } });
-          } else {
-            setReview(item);
-          }
-        }}
+        onReview={(item) => { setListOpen(false); setReview(item); }}
         onDiscard={handleDiscard}
         onDiscardAll={handleDiscardAll}
       />
@@ -818,18 +802,6 @@ const styles = StyleSheet.create({
     fontSize: 14,
   },
   btnDisabled: { opacity: 0.5 },
-  kindRow: { flexDirection: 'row', gap: 8, marginBottom: 12 },
-  kindChip: {
-    paddingHorizontal: 18,
-    paddingVertical: 6,
-    borderRadius: 16,
-    backgroundColor: 'rgba(0,0,0,0.55)',
-    borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.4)',
-  },
-  kindChipActive:     { backgroundColor: '#2e7d32', borderColor: '#2e7d32' },
-  kindChipText:       { color: '#fff', fontSize: 14, fontWeight: '600' },
-  kindChipTextActive: { color: '#fff' },
   center: {
     flex: 1,
     backgroundColor: '#fff',

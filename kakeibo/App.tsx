@@ -132,6 +132,8 @@ function AppContent() {
     syncPending();
     // 前回 OCR 待ちのまま終了された画像の続き（中止・失敗したものは対象外）
     OcrWorker.kick();
+    // 空き時間に食品データの栄養を調べる
+    OcrWorker.researchIdle();
     // 無料枠切れで推定待ちになった画像を、アプリを開いていなくても処理し直す
     registerBackgroundOcr();
     // 期限（保存から 7 日・共有から 14 日）を過ぎた共有写真を共有用シートから消す

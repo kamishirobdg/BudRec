@@ -13,6 +13,8 @@ import type { ReceiptItem } from '../providers/AIProvider';
 import { nowLabel } from './jsonFileStore';
 import { getCurrentUserRaw } from './UserService';
 import { getItem, setItem } from './Storage';
+import * as Application from 'expo-application';
+import * as Device from 'expo-device';
 
 // ─── スプレッドシート設定（.env の EXPO_PUBLIC_SPREADSHEET_ID に設定） ───────
 // Google Sheets の URL から取得: https://docs.google.com/spreadsheets/d/{ID}/edit
@@ -60,10 +62,19 @@ function itemsSheetName(monthSheet: string): string {
   return `_items_${monthSheet}`;
 }
 
-const ITEMS_HEADER_ROW: readonly string[] = [
+/**
+ * 購入品目の列（仕様書 §3.2）。在庫として使う列（remaining 以降）は InventoryService が更新する。
+ */
+export const ITEMS_HEADER_ROW: readonly string[] = [
   'item_id', 'entry_id', 'purchased_at', 'user', 'store', 'name_raw', 'name',
-  'quantity', 'unit', 'amount', 'food_kind', 'long_life', 'food_code', 'remaining',
+  'quantity', 'unit', 'amount', 'food_kind', 'storage', 'shelf_days', 'pieces',
+  'remaining', 'remaining_pieces', 'status', 'food_id', 'updated_at',
 ];
+export const ITEMS_RANGE = 'A:S';
+
+export function itemsSheetNameOf(monthSheet: string): string {
+  return itemsSheetName(monthSheet);
+}
 
 export function newEntryId(): string {
   return Crypto.randomUUID();
@@ -475,7 +486,7 @@ async function execWrite(op: WriteQueue.WriteOp): Promise<number | void> {
         await writeHeaderRow(client, op.sheetName, ITEMS_HEADER_ROW);
       }
       await client.post(
-        `/values/${encodeURIComponent(op.sheetName)}!A:N:append`,
+        `/values/${encodeURIComponent(op.sheetName)}!${ITEMS_RANGE}:append`,
         { values: op.rows },
         { params: { valueInputOption: 'RAW', insertDataOption: 'INSERT_ROWS' } },
       );
@@ -574,9 +585,22 @@ async function writeRowWithRev(
 const DEVICE_ID_KEY = 'device_id';
 let deviceIdCache: string | null = null;
 
-/** 端末ごとに一度だけ作る ID。同時編集の検出で「最後に書いたのが自分か」を見るのに使う */
+/**
+ * 端末の ID。同時編集の検出（最後に書いたのが自分か）と、再インストール後の名前の自動選択に使う。
+ * Android の ANDROID_ID はアプリの署名ごとに決まり、同じ署名なら再インストールしても変わらない
+ * （EAS ビルドは毎回同じ署名）。取れなければ端末に保存した乱数を使う（再インストールで変わる）。
+ */
 export async function getDeviceId(): Promise<string> {
   if (deviceIdCache) return deviceIdCache;
+  try {
+    const androidId = Application.getAndroidId();
+    if (androidId) {
+      deviceIdCache = androidId;
+      return androidId;
+    }
+  } catch {
+    // Android 以外・取れない場合は下の保存した ID を使う
+  }
   const saved = await getItem(DEVICE_ID_KEY);
   if (saved) {
     deviceIdCache = saved;
@@ -855,9 +879,14 @@ function buildItemsOp(expense: ExpenseRow, items: ReceiptItem[]): WriteQueue.Wri
     it.unit ?? '',
     it.price,
     it.kind ?? '',
-    it.longLife === undefined ? '' : it.longLife ? 'TRUE' : 'FALSE',
-    '',                       // food_code（段階 3 で成分表と対応付ける）
-    1,                        // remaining
+    it.storage ?? '',
+    it.shelfDays ?? '',
+    it.pieces ?? '',
+    1,                        // remaining（割合）
+    it.pieces ?? '',          // remaining_pieces
+    it.kind === 'non_food' ? '' : 'in_stock',
+    '',                       // food_id（食品データと対応付けたら入る）
+    nowLabel(),
   ]);
   return {
     kind: 'appendItems',
@@ -1405,65 +1434,84 @@ async function readUsersFromSheet(
 // 端末のユーザー名は端末ローカルにしか無いので、各端末がサインイン時に自分の名前を
 // ここへ登録する。代理入力の相手を「シートにその人の記録があるか」に頼らず選べる。
 
-const USERS_SHEET = '_users';
+const USERS_SHEET  = '_users';
+const USERS_HEADER = ['user', 'registered_at', 'device_id', 'device_name', 'last_seen'];
+
+export interface RegisteredUser {
+  name:       string;
+  deviceId:   string;
+  deviceName: string;
+  /** 最後にその端末でアプリを開いた日時（エポックミリ秒。古い行は 0） */
+  lastSeen:   number;
+  rowIndex:   number;
+}
+
+async function readUserRows(client: AxiosInstance): Promise<RegisteredUser[]> {
+  const existing = await listSheetNames(client, true);
+  if (!existing.includes(USERS_SHEET)) return [];
+  const res = await client.get(`/values/${encodeURIComponent(USERS_SHEET)}!A:E`, {
+    params: { valueRenderOption: 'UNFORMATTED_VALUE' },
+  });
+  const rows: any[][] = res.data.values ?? [];
+  return rows.slice(1).map((r, i) => ({
+    name:       String(r?.[0] ?? '').trim(),
+    deviceId:   String(r?.[2] ?? ''),
+    deviceName: String(r?.[3] ?? ''),
+    lastSeen:   Number(r?.[4]) || 0,
+    rowIndex:   i + 2,
+  }));
+}
 
 async function readRegisteredUsers(client: AxiosInstance): Promise<Set<string>> {
   const users = new Set<string>();
   try {
-    const existing = await listSheetNames(client, true);
-    if (!existing.includes(USERS_SHEET)) return users;
-    const res = await client.get(`/values/${encodeURIComponent(USERS_SHEET)}!A:A`);
-    const rows: string[][] = res.data.values ?? [];
-    for (let i = 1; i < rows.length; i++) {
-      const cell = rows[i]?.[0];
-      if (cell && cell.trim()) users.add(cell.trim());
-    }
+    for (const u of await readUserRows(client)) if (u.name) users.add(u.name);
   } catch {
     // 読めなくても代理入力の候補が減るだけ
   }
   return users;
 }
 
+/** 登録されている端末と名前の一覧（初回の名前選びで使う） */
+export async function listRegisteredUsers(): Promise<RegisteredUser[]> {
+  if (await Demo.isDemo()) return [];
+  const client = await createClient();
+  return (await readUserRows(client)).filter((u) => u.name);
+}
+
 /**
- * この端末のユーザー名を登録する。既にあれば何もしない。
- * @param previous 名前を変えた場合の旧名。その行を新しい名前に書き換える
+ * この端末のユーザー名を登録する（端末ごとに 1 行。名前を変えたらその行を書き換える）。
+ * アプリを開くたびに呼び、最終利用日時も更新する。
+ * @param _previous 互換のため残している（端末で行を引くので使わない）
  */
-export async function registerUser(name: string, previous?: string): Promise<void> {
+export async function registerUser(name: string, _previous?: string): Promise<void> {
   const trimmed = name.trim();
   if (!trimmed || (await Demo.isDemo())) return;
   const client = await createClient();
   if (await ensureSheet(client, USERS_SHEET)) {
-    await writeHeaderRow(client, USERS_SHEET, ['user', 'registered_at']);
+    await writeHeaderRow(client, USERS_SHEET, USERS_HEADER);
   }
-  const res = await client.get(`/values/${encodeURIComponent(USERS_SHEET)}!A:A`);
-  const rows: string[][] = res.data.values ?? [];
-  const names = rows.map((r) => (r?.[0] ?? '').trim());
-  const prevIndex = previous && previous.trim() !== trimmed ? names.indexOf(previous.trim()) : -1;
-  if (names.includes(trimmed)) {
-    // 既にある名前に変えた。旧名が代理入力の候補に残らないよう空にする
-    if (prevIndex > 0) {
-      await client.put(
-        `/values/${encodeURIComponent(USERS_SHEET)}!A${prevIndex + 1}:B${prevIndex + 1}`,
-        { values: [['', '']] },
-        { params: { valueInputOption: 'RAW' } },
-      );
-    }
-    return;
-  }
-
-  if (prevIndex > 0) {
+  const me = await getDeviceId();
+  const row = [trimmed, nowLabel(), me, deviceName(), Date.now()];
+  const mine = (await readUserRows(client)).find((u) => u.deviceId === me);
+  if (mine) {
     await client.put(
-      `/values/${encodeURIComponent(USERS_SHEET)}!A${prevIndex + 1}:B${prevIndex + 1}`,
-      { values: [[trimmed, nowLabel()]] },
+      `/values/${encodeURIComponent(USERS_SHEET)}!A${mine.rowIndex}:E${mine.rowIndex}`,
+      { values: [row] },
       { params: { valueInputOption: 'RAW' } },
     );
     return;
   }
   await client.post(
-    `/values/${encodeURIComponent(USERS_SHEET)}!A:B:append`,
-    { values: [[trimmed, nowLabel()]] },
+    `/values/${encodeURIComponent(USERS_SHEET)}!A:E:append`,
+    { values: [row] },
     { params: { valueInputOption: 'RAW', insertDataOption: 'INSERT_ROWS' } },
   );
+}
+
+/** 「Pixel 8」のような端末名（取れなければ空） */
+function deviceName(): string {
+  return Device.modelName ?? '';
 }
 
 /** シートに存在するユーザー名一覧を返す。代理入力の相手を選ぶのに使う */
