@@ -41,6 +41,7 @@ import * as LastBatch from '../services/LastBatchService';
 import * as Demo from '../services/DemoService';
 import { runGmailImport, getSkippedMessageSummaries, SkippedMessageSummary } from '../services/GmailService';
 import { useGmailProgress } from '../services/GmailProgressService';
+import FoodResearchCard from '../components/FoodResearchCard';
 
 interface Props {
   onSignedOut: () => void;
@@ -603,6 +604,9 @@ export default function SettingsScreen({ onSignedOut }: Props) {
                 </Text>
               )}
             </View>
+
+            {/* 食品データの一括調査（デモ中は実データを読むので出さない） */}
+            {!demo.enabled && <FoodResearchCard />}
 
             {/* 未送信の書き込み（溜まっているときだけ出す）。
                 中身は実データ（店名・金額）そのままなので、デモ中は見せない */}

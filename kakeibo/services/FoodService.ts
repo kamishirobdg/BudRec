@@ -130,6 +130,25 @@ export async function loadFoods(force = false): Promise<Map<string, Food>> {
   return foods;
 }
 
+/**
+ * 飲食店のメニューを引く。店名は「マクドナルド 船橋日大前店」のように店舗名付きなので、
+ * 食品データにあるチェーン名のうち店名に含まれる一番長いものを使う。見つからなければ店名そのままで引く。
+ * 品名はレシートの表記・写真から読んだ名前など、候補を順に試す。
+ */
+export function findMenu(foods: Map<string, Food>, store: string, names: string[]): Food | undefined {
+  const norm = (s: string) => s.replace(/\s+/g, '').toLowerCase();
+  const s = norm(store);
+  let chain = '';
+  for (const f of foods.values()) {
+    if (f.chain && f.chain.length > chain.length && s.includes(norm(f.chain))) chain = f.chain;
+  }
+  for (const name of names.filter(Boolean)) {
+    const hit = (chain && freshNutrition(foods.get(foodKey(name, chain)))) || freshNutrition(foods.get(foodKey(name, store)));
+    if (hit) return hit;
+  }
+  return undefined;
+}
+
 /** 調べ済みで新しい栄養があれば返す */
 export function freshNutrition(f: Food | undefined): Food | null {
   if (!f || f.status !== 'done' || Date.now() - f.fetchedAt > REFRESH_MS) return null;

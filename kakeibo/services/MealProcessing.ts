@@ -16,7 +16,7 @@ import {
   IdentifiedDish, InventoryLine, NutritionQuery, NutritionResult, ReceiptLine, UsedItem,
 } from '../providers/GeminiMeal';
 import { listInventory, remainLabel, consume, InventoryItem } from './InventoryService';
-import { Food, foodKey, freshNutrition, loadFoods, saveResearched } from './FoodService';
+import { Food, findMenu, foodKey, freshNutrition, loadFoods, saveResearched } from './FoodService';
 import { rowsFromReceipts } from './ReceiptProcessing';
 import * as CategoryService from './CategoryService';
 import {
@@ -296,7 +296,9 @@ export async function recordMeal(
       if (food && n) return { nutrients: n, official: food.source === 'grounding' };
     }
     if (d.kind !== 'home' && d.used.length === 0) {
-      const food = freshNutrition(foods.get(foodKey(nameOf(i), d.kind === 'eat_out' ? storeOf(i) : '')));
+      const food = d.kind === 'eat_out' && storeOf(i)
+        ? findMenu(foods, storeOf(i), [nameOf(i), d.name])
+        : freshNutrition(foods.get(foodKey(nameOf(i))));
       if (food && food.basis === 'package') return { nutrients: food.nutrients, official: food.source === 'grounding' };
     }
     return null;
