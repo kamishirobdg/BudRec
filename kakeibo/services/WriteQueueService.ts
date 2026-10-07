@@ -31,10 +31,20 @@ export type WriteOp =
   | { kind: 'appendItems';  sheetName: string; entryId: string; store: string; rows: (string | number)[][] }
   /** 汎用の追記（食事など）。シートが無ければ header を書いて作る */
   | { kind: 'appendRaw';    sheetName: string; header: string[]; range: string; label: string; rows: (string | number)[][] }
-  | { kind: 'updateRow';    sheetName: string; rowIndex: number; entry: ExpenseRow }
-  | { kind: 'updateFlags';  sheetName: string; rowIndex: number; patch: RowFlagsPatch }
-  | { kind: 'markDeleted';  sheetName: string; rowIndex: number }
-  | { kind: 'setRecurring'; sheetName: string; rowIndex: number; recurring: boolean };
+  | ({ kind: 'updateRow';    sheetName: string; rowIndex: number; entry: ExpenseRow } & RevGuard)
+  | ({ kind: 'updateFlags';  sheetName: string; rowIndex: number; patch: RowFlagsPatch } & RevGuard)
+  | ({ kind: 'markDeleted';  sheetName: string; rowIndex: number } & RevGuard)
+  | ({ kind: 'setRecurring'; sheetName: string; rowIndex: number; recurring: boolean } & RevGuard);
+
+/**
+ * 同時編集の検出。`baseRev` は画面に読み込んだときの行の rev。送る直前にシートの rev と
+ * 違えば送らずに「競合」にする。`force` は「自分の内容で上書きする」を選んだとき。
+ * baseRev が無い操作（この仕組みより前に積まれたもの）は確かめずに送る。
+ */
+interface RevGuard {
+  baseRev?: number;
+  force?:   boolean;
+}
 
 export interface QueuedWrite {
   id:        string;
@@ -134,6 +144,41 @@ export function markAttempt(id: string, error: string, permanent: boolean): void
   item.permanent = permanent;
   persist();
   publish();
+}
+
+/** 競合で止まった項目を「自分の内容で上書きする」として送り直せるようにする */
+export function forceRetry(id: string): void {
+  const item = load().find((q) => q.id === id);
+  if (!item) return;
+  if (item.op.kind === 'updateRow' || item.op.kind === 'updateFlags'
+      || item.op.kind === 'markDeleted' || item.op.kind === 'setRecurring') {
+    item.op = { ...item.op, force: true };
+  }
+  item.permanent = false;
+  persist();
+  publish();
+}
+
+/** 競合で止まった項目か（設定画面で「上書きして送る」を出す） */
+export function isConflict(item: QueuedWrite): boolean {
+  return item.permanent && item.lastError.startsWith(CONFLICT_PREFIX);
+}
+
+export const CONFLICT_PREFIX = '競合';
+
+/** 同じ行を対象にした後続の項目の baseRev を、送れた直後の rev に合わせる（自分との競合を避ける） */
+export function advanceBaseRev(sheetName: string, rowIndex: number, rev: number): void {
+  let changed = false;
+  for (const item of load()) {
+    const t = rowTargetOf(item.op);
+    if (!t || t.sheetName !== sheetName || t.rowIndex !== rowIndex) continue;
+    if (item.op.kind === 'updateRow' || item.op.kind === 'updateFlags'
+        || item.op.kind === 'markDeleted' || item.op.kind === 'setRecurring') {
+      item.op = { ...item.op, baseRev: rev };
+      changed = true;
+    }
+  }
+  if (changed) persist();
 }
 
 /** 全部捨てる（設定画面から明示的に選ばれたときだけ） */

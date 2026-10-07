@@ -9,7 +9,7 @@
  *   （Sheets API に条件付き書き込みが無いため。`_history` から戻せる）。
  */
 
-import { SheetsInternal, newEntryId } from './SheetsService';
+import { SheetsInternal, appendHistoryRow, newEntryId } from './SheetsService';
 import { nowLabel } from './jsonFileStore';
 import { Nutrients, sanitizeNutrients } from './Nutrients';
 import * as Demo from './DemoService';
@@ -62,8 +62,7 @@ export const MEALS_HEADER = [
 ];
 const MEALS_RANGE = 'A:U';
 
-const HISTORY_SHEET  = '_history';
-const HISTORY_HEADER = ['key', 'rev', 'saved_by', 'saved_at', 'sheet', 'rows_json'];
+const HISTORY_SHEET = '_history';
 
 const CORRECTIONS_SHEET  = '_meal_corrections';
 const CORRECTIONS_HEADER = ['corrected_at', 'meal_id', 'dish_id', 'field', 'before', 'after', 'context'];
@@ -204,7 +203,7 @@ export async function saveMeal(
 
   // 上書きする直前の内容を残す（戻せるように）
   if (current.length > 0) {
-    await appendHistory(`meal:${mealId}`, currentRev, savedBy, sheetName, current);
+    await appendHistory(`meal:${mealId}`, currentRev, sheetName, current);
   }
 
   const rev = currentRev + 1;
@@ -267,17 +266,9 @@ export interface HistoryEntry {
   rows:    MealRow[];
 }
 
-async function appendHistory(key: string, rev: number, savedBy: string, sheet: string, rows: MealRow[]): Promise<void> {
-  const client = await SheetsInternal.createClient();
-  if (await SheetsInternal.ensureSheet(client, HISTORY_SHEET)) {
-    await SheetsInternal.writeHeaderRow(client, HISTORY_SHEET, HISTORY_HEADER);
-  }
+async function appendHistory(key: string, rev: number, sheet: string, rows: MealRow[]): Promise<void> {
   const snapshot = rows.map(({ rowIndex: _r, sheetName: _s, ...rest }) => rest);
-  await client.post(
-    `/values/${encodeURIComponent(HISTORY_SHEET)}!A:F:append`,
-    { values: [[key, rev, savedBy, nowLabel(), sheet, JSON.stringify(snapshot)]] },
-    { params: { valueInputOption: 'RAW', insertDataOption: 'INSERT_ROWS' } },
-  );
+  await appendHistoryRow(key, rev, sheet, JSON.stringify(snapshot));
 }
 
 /** 食事の過去の内容（新しい順） */

@@ -33,6 +33,9 @@ import {
   updateRecurringFlag,
   applyRecurringEntries,
   flushWriteQueue,
+  ExpenseConflictError,
+  ExpenseHistoryEntry,
+  getExpenseHistory,
 } from '../services/SheetsService';
 import { QueuedWriteError, useWriteQueue } from '../services/WriteQueueService';
 import * as WriteQueue from '../services/WriteQueueService';
@@ -378,7 +381,7 @@ export default function SummaryScreen({ onSignedOut }: Props) {
       for (const row of removed) {
         if (!row.sheetName || row.rowIndex === undefined) continue;
         try {
-          await markRowDeleted(row.sheetName, row.rowIndex);
+          await markRowDeleted(row.sheetName, row.rowIndex, { baseRev: row.rev });
           changed++;
         } catch (e) {
           if (!(e instanceof QueuedWriteError)) throw e;
@@ -427,9 +430,11 @@ export default function SummaryScreen({ onSignedOut }: Props) {
       ),
     );
     try {
-      await updateRowFlags(row.sheetName, row.rowIndex, next);
+      const rev = await updateRowFlags(row.sheetName, row.rowIndex, next, { baseRev: row.rev });
+      if (typeof rev === 'number') applyRev(row, rev);
     } catch (e) {
       if (e instanceof AuthError) { onSignedOut(); return; }
+      if (handleConflict(e)) return;
       // 端末に退避できた変更は巻き戻さない（未送信バナーで気づける）
       if (e instanceof QueuedWriteError) return;
       Alert.alert('更新失敗', e instanceof Error ? e.message : String(e));
@@ -473,9 +478,11 @@ export default function SummaryScreen({ onSignedOut }: Props) {
       ),
     );
     try {
-      await updateRecurringFlag(row.sheetName, row.rowIndex, next);
+      const rev = await updateRecurringFlag(row.sheetName, row.rowIndex, next, { baseRev: row.rev });
+      if (typeof rev === 'number') applyRev(row, rev);
     } catch (e) {
       if (e instanceof AuthError) { onSignedOut(); return; }
+      if (handleConflict(e)) return;
       if (e instanceof QueuedWriteError) return;
       Alert.alert('更新失敗', e instanceof Error ? e.message : String(e));
       loadRows(currentRange);
@@ -935,12 +942,14 @@ export default function SummaryScreen({ onSignedOut }: Props) {
     );
   };
 
-  const handleSaveEdit = async (updated: ExpenseRow) => {
+  const handleSaveEdit = async (updated: ExpenseRow, force = false) => {
     if (!updated.sheetName || updated.rowIndex === undefined) return;
+    let rev: number | void = undefined;
     try {
-      await updateRow(updated.sheetName, updated.rowIndex, updated);
+      rev = await updateRow(updated.sheetName, updated.rowIndex, updated, { force });
     } catch (e) {
       if (e instanceof AuthError) { onSignedOut(); return; }
+      if (handleConflict(e, () => handleSaveEdit(updated, true))) return;
       // 端末に退避できたなら画面上は保存できたものとして扱う
       if (!(e instanceof QueuedWriteError)) {
         Alert.alert('保存失敗', e instanceof Error ? e.message : String(e));
@@ -950,9 +959,54 @@ export default function SummaryScreen({ onSignedOut }: Props) {
     setRows((prev) =>
       prev.map((r) =>
         r.sheetName === updated.sheetName && r.rowIndex === updated.rowIndex
-          ? updated
+          ? { ...updated, rev: typeof rev === 'number' ? rev : updated.rev }
           : r,
       ),
+    );
+    setEditTarget(null);
+  };
+
+  /** 書けた行の rev を手元にも反映する（次の操作が自分の書き込みと競合扱いにならないように） */
+  const applyRev = (row: ExpenseRow, rev: number) => {
+    setRows((prev) =>
+      prev.map((r) => (r.sheetName === row.sheetName && r.rowIndex === row.rowIndex ? { ...r, rev } : r)),
+    );
+  };
+
+  /**
+   * ほかの端末が先にこの行を変更していた場合。retry があれば「自分の内容で上書き」を選べる。
+   * 競合だったら true（呼び出し側はそれ以上何もしない）
+   */
+  const handleConflict = (e: unknown, retry?: () => void): boolean => {
+    if (!(e instanceof ExpenseConflictError)) return false;
+    const reload = () => { setEditTarget(null); loadRows(currentRange); };
+    Alert.alert(
+      'ほかの端末で先に変更されています',
+      retry ? '相手の変更を残すか、自分の内容で上書きするかを選んでください。' : '最新の内容を読み込みます。',
+      retry
+        ? [
+            { text: '相手の内容を残す', onPress: reload },
+            { text: '自分の内容で上書き', style: 'destructive', onPress: retry },
+          ]
+        : [{ text: 'OK', onPress: reload }],
+      { cancelable: false },
+    );
+    return true;
+  };
+
+  const deleteEntry = async (target: ExpenseRow, force = false) => {
+    try {
+      await markRowDeleted(target.sheetName!, target.rowIndex!, { baseRev: target.rev, force });
+    } catch (e) {
+      if (e instanceof AuthError) { onSignedOut(); return; }
+      if (handleConflict(e, () => deleteEntry(target, true))) return;
+      if (!(e instanceof QueuedWriteError)) {
+        Alert.alert('削除失敗', e instanceof Error ? e.message : String(e));
+        return;
+      }
+    }
+    setRows((prev) =>
+      prev.filter((r) => !(r.sheetName === target.sheetName && r.rowIndex === target.rowIndex)),
     );
     setEditTarget(null);
   };
@@ -967,24 +1021,7 @@ export default function SummaryScreen({ onSignedOut }: Props) {
         {
           text: '削除',
           style: 'destructive',
-          onPress: async () => {
-            try {
-              await markRowDeleted(target.sheetName!, target.rowIndex!);
-            } catch (e) {
-              if (e instanceof AuthError) { onSignedOut(); return; }
-              if (!(e instanceof QueuedWriteError)) {
-                Alert.alert('削除失敗', e instanceof Error ? e.message : String(e));
-                return;
-              }
-            }
-            setRows((prev) =>
-              prev.filter(
-                (r) =>
-                  !(r.sheetName === target.sheetName && r.rowIndex === target.rowIndex),
-              ),
-            );
-            setEditTarget(null);
-          },
+          onPress: () => { deleteEntry(target); },
         },
       ],
     );
@@ -1284,9 +1321,11 @@ function EditEntryModal({
   const [addCategoryOpen, setAddCategoryOpen]       = useState(false);
   const [newCategoryText, setNewCategoryText]       = useState('');
   const [savingCategory, setSavingCategory]         = useState(false);
+  const [history, setHistory]                       = useState<ExpenseHistoryEntry[] | null>(null);
 
   useEffect(() => {
     if (!target) return;
+    setHistory(null);
     setTimestamp(target.timestamp);
     setSource(target.source);
     setUser(target.user);
@@ -1361,6 +1400,36 @@ function EditEntryModal({
     } finally {
       setSavingCategory(false);
     }
+  };
+
+  const openHistory = async () => {
+    if (!target.sheetName || target.rowIndex === undefined) return;
+    try {
+      setHistory(await getExpenseHistory(target.sheetName, target.rowIndex));
+    } catch (e) {
+      Alert.alert('読み込み失敗', e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  /** 過去の内容で上書きする（戻す操作も 1 回の保存として扱い、今の内容は履歴に残る） */
+  const restore = (h: ExpenseHistoryEntry) => {
+    Alert.alert('この内容に戻しますか？', `${h.savedAt} 時点（${h.savedBy || '不明'}）`, [
+      { text: 'キャンセル', style: 'cancel' },
+      {
+        text: '戻す',
+        onPress: () => {
+          setHistory(null);
+          onSave({
+            ...h.row,
+            deleted:   false,
+            entryId:   target.entryId,
+            rev:       target.rev,
+            rowIndex:  target.rowIndex,
+            sheetName: target.sheetName,
+          });
+        },
+      },
+    ]);
   };
 
   return (
@@ -1448,6 +1517,10 @@ function EditEntryModal({
             </TouchableOpacity>
 
             <View style={{ height: 24 }} />
+            <TouchableOpacity style={styles.historyBtn} onPress={openHistory}>
+              <Text style={styles.historyBtnText}>以前の内容に戻す</Text>
+            </TouchableOpacity>
+
             <TouchableOpacity
               style={styles.deleteBtn}
               onPress={() => onDelete(target)}
@@ -1501,6 +1574,35 @@ function EditEntryModal({
                   </TouchableOpacity>
                 );
               }}
+            />
+          </Pressable>
+        </Pressable>
+      </Modal>
+
+      {/* 以前の内容 */}
+      <Modal
+        visible={history !== null}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setHistory(null)}
+      >
+        <Pressable style={styles.modalBackdrop} onPress={() => setHistory(null)}>
+          <Pressable style={styles.modalSheet} onPress={(e) => e.stopPropagation()}>
+            <Text style={styles.modalTitle}>以前の内容</Text>
+            {history && history.length === 0 && (
+              <Text style={styles.historyEmpty}>以前の内容はありません</Text>
+            )}
+            <FlatList
+              data={history ?? []}
+              keyExtractor={(h) => `${h.rev}-${h.savedAt}`}
+              renderItem={({ item: h }) => (
+                <TouchableOpacity style={styles.modalItem} onPress={() => restore(h)}>
+                  <Text style={styles.modalItemText}>{h.savedAt}（{h.savedBy || '不明'}）</Text>
+                  <Text style={styles.historySub}>
+                    {h.row.store || '(店名なし)'}  ¥{h.row.amount.toLocaleString()}  {h.row.category}
+                  </Text>
+                </TouchableOpacity>
+              )}
             />
           </Pressable>
         </Pressable>
@@ -1969,6 +2071,10 @@ const styles = StyleSheet.create({
 
   deleteBtn:     { borderWidth: 1, borderColor: '#dc2626', borderRadius: 12, paddingVertical: 12, alignItems: 'center', backgroundColor: '#fff' },
   deleteBtnText: { fontSize: 15, color: '#dc2626', fontWeight: '600' },
+  historyBtn:     { alignItems: 'center', paddingVertical: 12, marginBottom: 12 },
+  historyBtnText: { fontSize: 14, color: '#2563eb', fontWeight: '600' },
+  historyEmpty:   { paddingHorizontal: 16, paddingVertical: 12, color: '#888' },
+  historySub:     { fontSize: 12, color: '#666', marginTop: 2 },
 
   // ─── チェックボックス (編集モーダル内) ───────────────────────────────────
   checkbox:      { flexDirection: 'row', alignItems: 'center', gap: 8, paddingVertical: 4 },

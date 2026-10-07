@@ -217,6 +217,25 @@ export default function SettingsScreen({ onSignedOut }: Props) {
     );
   };
 
+  /** 競合で止まった変更を、相手の変更より優先して送る */
+  const handleForceOne = (item: WriteQueue.QueuedWrite) => {
+    Alert.alert(
+      '自分の内容で上書きしますか？',
+      `${WriteQueue.describeOp(item.op)}\nほかの端末での変更は、上書きされる前の内容として履歴に残ります。`,
+      [
+        { text: 'キャンセル', style: 'cancel' },
+        {
+          text: '上書きして送る',
+          style: 'destructive',
+          onPress: () => {
+            WriteQueue.forceRetry(item.id);
+            handleFlushQueue();
+          },
+        },
+      ],
+    );
+  };
+
   const handleDiscardAllQueued = () => {
     Alert.alert(
       'すべて破棄しますか？',
@@ -602,6 +621,14 @@ export default function SettingsScreen({ onSignedOut }: Props) {
                           {q.queuedAt} · {q.permanent ? '送信不可' : `${q.attempts} 回失敗`} · {q.lastError}
                         </Text>
                       </View>
+                      {WriteQueue.isConflict(q) && (
+                        <TouchableOpacity
+                          style={[styles.queueDiscardBtn, { marginRight: 6 }]}
+                          onPress={() => handleForceOne(q)}
+                        >
+                          <Text style={styles.queueDiscardBtnText}>上書き</Text>
+                        </TouchableOpacity>
+                      )}
                       <TouchableOpacity
                         style={styles.queueDiscardBtn}
                         onPress={() => handleDiscardOne(q)}

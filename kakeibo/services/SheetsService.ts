@@ -11,6 +11,7 @@ import * as WriteQueue from './WriteQueueService';
 import * as Crypto from 'expo-crypto';
 import type { ReceiptItem } from '../providers/AIProvider';
 import { nowLabel } from './jsonFileStore';
+import { getCurrentUserRaw } from './UserService';
 
 // ─── スプレッドシート設定（.env の EXPO_PUBLIC_SPREADSHEET_ID に設定） ───────
 // Google Sheets の URL から取得: https://docs.google.com/spreadsheets/d/{ID}/edit
@@ -35,6 +36,8 @@ export interface ExpenseRow {
   deleted?:      boolean; // 論理削除フラグ。true の行は getRows で除外される
   /** 行の ID（M 列）。品目・食事から参照する。追加時に振る。2026-10 より前の行は空 */
   entryId?:      string;
+  /** 同時編集の検出用（N 列）。書き換えるたびに 1 増える。2026-10 より前の行は 0 */
+  rev?:          number;
   /** 購入品目。追加時だけ使い、月次シートには書かず `_items_YYYY-MM` に書く */
   items?:        ReceiptItem[];
   rowIndex?:     number;  // シート上の行番号（1-based、ヘッダー=1）。getRows で付与
@@ -45,11 +48,11 @@ export interface ExpenseRow {
 const HEADER_ROW: readonly string[] = [
   'timestamp', 'source', 'user', 'store', 'category',
   'amount', 'memo', 'counted_amount', 'excluded', 'confirmed', 'recurring',
-  'deleted', 'entry_id',
+  'deleted', 'entry_id', 'rev',
 ];
 
-/** 月次シートの列範囲（A:M = timestamp 〜 entry_id） */
-const MONTH_RANGE = 'A:M';
+/** 月次シートの列範囲（A:N = timestamp 〜 rev） */
+const MONTH_RANGE = 'A:N';
 
 /** 購入品目のシート名（購入した月ごと） */
 function itemsSheetName(monthSheet: string): string {
@@ -312,6 +315,7 @@ async function copyRecurringRowsToNewMonth(
         'TRUE',         // recurring
         'FALSE',        // deleted
         newEntryId(),   // entry_id（コピー元とは別の行なので振り直す）
+        1,              // rev
       ]);
     if (shifted.length === 0) continue;
 
@@ -449,7 +453,7 @@ function toSheetRow(entry: ExpenseRow): (string | number)[] {
  * 1 操作をスプレッドシートへ送る。
  * 初回の書き込みと、キューからの再送の両方がここを通る。
  */
-async function execWrite(op: WriteQueue.WriteOp): Promise<void> {
+async function execWrite(op: WriteQueue.WriteOp): Promise<number | void> {
   const client = await createClient();
 
   switch (op.kind) {
@@ -458,7 +462,7 @@ async function execWrite(op: WriteQueue.WriteOp): Promise<void> {
       await ensureSheetExists(client, sheetName);
       await client.post(
         `/values/${encodeURIComponent(sheetName)}!${MONTH_RANGE}:append`,
-        { values: [[...toSheetRow(op.entry), op.entry.entryId ?? '']] },
+        { values: [[...toSheetRow(op.entry), op.entry.entryId ?? '', 1]] },
         { params: { valueInputOption: 'RAW', insertDataOption: 'INSERT_ROWS' } },
       );
       return;
@@ -486,40 +490,131 @@ async function execWrite(op: WriteQueue.WriteOp): Promise<void> {
       return;
     }
     case 'updateRow':
-      await client.put(
-        `/values/${encodeURIComponent(op.sheetName)}!A${op.rowIndex}:L${op.rowIndex}`,
-        { values: [toSheetRow(op.entry)] },
-        { params: { valueInputOption: 'RAW' } },
-      );
-      return;
     case 'updateFlags':
-      await client.put(
-        `/values/${encodeURIComponent(op.sheetName)}!H${op.rowIndex}:J${op.rowIndex}`,
-        {
-          values: [[
-            op.patch.countedAmount,
-            op.patch.excluded  ? 'TRUE' : 'FALSE',
-            op.patch.confirmed ? 'TRUE' : 'FALSE',
-          ]],
-        },
-        { params: { valueInputOption: 'RAW' } },
-      );
-      return;
     case 'markDeleted':
-      await client.put(
-        `/values/${encodeURIComponent(op.sheetName)}!L${op.rowIndex}`,
-        { values: [['TRUE']] },
-        { params: { valueInputOption: 'RAW' } },
-      );
-      return;
     case 'setRecurring':
-      await client.put(
-        `/values/${encodeURIComponent(op.sheetName)}!K${op.rowIndex}`,
-        { values: [[op.recurring ? 'TRUE' : 'FALSE']] },
-        { params: { valueInputOption: 'RAW' } },
-      );
-      return;
+      return writeRowWithRev(client, op);
   }
+}
+
+/**
+ * 既存の行を書き換える。同時編集の検出のため、書く前に行を読み、N 列の rev が
+ * 画面に読み込んだときの値（op.baseRev）と同じか確かめる。違えば ExpenseConflictError。
+ *
+ * 書くのは「その操作の列から N 列まで」の連続した範囲を 1 回の PUT で
+ * （PUT は通信断でも再送してよい扱いなので、POST の batchUpdate にしない）。
+ * 間に挟まる列は、いま読んだ値をそのまま書き戻す。
+ *
+ * 編集と削除は、上書きする直前の内容を `_history` に残す（以前の内容に戻せるように）。
+ */
+async function writeRowWithRev(
+  client: AxiosInstance,
+  op: Extract<WriteQueue.WriteOp, { rowIndex: number }>,
+): Promise<number> {
+  const r = op.rowIndex;
+  const res = await client.get(`/values/${encodeURIComponent(op.sheetName)}!A${r}:N${r}`);
+  const cells: string[] = res.data.values?.[0] ?? [];
+  const currentRev = Number(cells[13]) || 0;
+  if (op.baseRev !== undefined && !op.force && currentRev !== op.baseRev) {
+    throw new ExpenseConflictError(currentRev, cells.length > 0 ? parseRow(cells, r, op.sheetName) : null);
+  }
+  const rev = currentRev + 1;
+  const cell = (i: number) => cells[i] ?? '';
+
+  let range: string;
+  let values: (string | number)[];
+  switch (op.kind) {
+    case 'updateRow':
+      range  = `A${r}:N${r}`;
+      values = [...toSheetRow(op.entry), cell(12), rev];
+      break;
+    case 'updateFlags':
+      range  = `H${r}:N${r}`;
+      values = [
+        op.patch.countedAmount,
+        op.patch.excluded  ? 'TRUE' : 'FALSE',
+        op.patch.confirmed ? 'TRUE' : 'FALSE',
+        cell(10), cell(11), cell(12), rev,
+      ];
+      break;
+    case 'setRecurring':
+      range  = `K${r}:N${r}`;
+      values = [op.recurring ? 'TRUE' : 'FALSE', cell(11), cell(12), rev];
+      break;
+    case 'markDeleted':
+      range  = `L${r}:N${r}`;
+      values = ['TRUE', cell(12), rev];
+      break;
+  }
+
+  if ((op.kind === 'updateRow' || op.kind === 'markDeleted') && cells.length > 0) {
+    await appendHistoryRow(`entry:${op.sheetName}:${r}`, currentRev, op.sheetName, JSON.stringify(cells));
+  }
+  await client.put(
+    `/values/${encodeURIComponent(op.sheetName)}!${range}`,
+    { values: [values] },
+    { params: { valueInputOption: 'RAW' } },
+  );
+  return rev;
+}
+
+/** ほかの端末が先にこの行を変更していた */
+export class ExpenseConflictError extends Error {
+  constructor(public readonly currentRev: number, public readonly current: ExpenseRow | null) {
+    super('ほかの端末で先に変更されています');
+    this.name = 'ExpenseConflictError';
+  }
+}
+
+// ─── 履歴（上書きの直前の内容） ───────────────────────────────────────────────
+
+const HISTORY_SHEET  = '_history';
+const HISTORY_HEADER = ['key', 'rev', 'saved_by', 'saved_at', 'sheet', 'rows_json'];
+
+/** 上書きの直前の内容を残す。失敗しても投げない（書き込み自体は続ける） */
+export async function appendHistoryRow(key: string, rev: number, sheet: string, json: string): Promise<void> {
+  try {
+    const client = await createClient();
+    if (await ensureSheet(client, HISTORY_SHEET)) {
+      await writeHeaderRow(client, HISTORY_SHEET, HISTORY_HEADER);
+    }
+    const savedBy = await getCurrentUserRaw();
+    await client.post(
+      `/values/${encodeURIComponent(HISTORY_SHEET)}!A:F:append`,
+      { values: [[key, rev, savedBy, nowLabel(), sheet, json]] },
+      { params: { valueInputOption: 'RAW', insertDataOption: 'INSERT_ROWS' } },
+    );
+  } catch (e) {
+    console.warn('[Sheets] 履歴を残せなかった:', describeError(e));
+  }
+}
+
+export interface ExpenseHistoryEntry {
+  rev:     number;
+  savedBy: string;
+  savedAt: string;
+  row:     ExpenseRow;
+}
+
+/** 支出行の過去の内容（新しい順） */
+export async function getExpenseHistory(sheetName: string, rowIndex: number): Promise<ExpenseHistoryEntry[]> {
+  const client = await createClient();
+  const names = await listSheetNames(client, true);
+  if (!names.includes(HISTORY_SHEET)) return [];
+  const res = await client.get(`/values/${encodeURIComponent(HISTORY_SHEET)}!A:F`);
+  const values: string[][] = res.data.values ?? [];
+  const key = `entry:${sheetName}:${rowIndex}`;
+  const out: ExpenseHistoryEntry[] = [];
+  for (const c of values.slice(1)) {
+    if (c[0] !== key) continue;
+    try {
+      const cells = JSON.parse(c[5] ?? '[]') as string[];
+      out.push({ rev: Number(c[1]) || 0, savedBy: c[2] ?? '', savedAt: c[3] ?? '', row: parseRow(cells, rowIndex, sheetName) });
+    } catch {
+      // 壊れた行は飛ばす
+    }
+  }
+  return out.sort((a, b) => b.rev - a.rev);
 }
 
 /** 後で送り直せば成功しうる失敗か（＝キューに積む価値があるか） */
@@ -551,9 +646,10 @@ function describeError(e: unknown): string {
  * ただし AuthError だけは元のまま投げてサインアウト処理をさせる。
  * キューには積んであるので、再ログイン後に自動で送られる。
  */
-async function writeOrQueue(op: WriteQueue.WriteOp): Promise<void> {
+async function writeOrQueue(op: WriteQueue.WriteOp): Promise<number | void> {
+  let rev: number | void;
   try {
-    await execWrite(op);
+    rev = await execWrite(op);
   } catch (e) {
     if (!isQueueable(e)) throw e;
     const reason = describeError(e);
@@ -564,6 +660,9 @@ async function writeOrQueue(op: WriteQueue.WriteOp): Promise<void> {
   // 今の書き込みは、同じ行に溜まっている未送信項目より新しい。
   // そのまま流すと古い値で上書きされるので、重なる列を潰しておく
   WriteQueue.reconcileAfterDirectWrite(op);
+  // 残った同じ行の未送信項目は、今書いた rev を基準にする（自分の書き込みと競合扱いにしない）
+  if (typeof rev === 'number' && 'rowIndex' in op) WriteQueue.advanceBaseRev(op.sheetName, op.rowIndex, rev);
+  return rev;
 }
 
 export interface FlushResult {
@@ -589,10 +688,19 @@ export async function flushWriteQueue(): Promise<FlushResult> {
     for (const item of WriteQueue.list()) {
       if (item.permanent) continue; // 送り直しても直らないと分かっているものは飛ばす
       try {
-        await execWrite(item.op);
+        const rev = await execWrite(item.op);
         WriteQueue.remove(item.id);
+        if (typeof rev === 'number' && 'rowIndex' in item.op) {
+          WriteQueue.advanceBaseRev(item.op.sheetName, item.op.rowIndex, rev);
+        }
         sent++;
       } catch (e) {
+        // ほかの端末が先に変更していた。勝手に上書きせず、設定画面で選んでもらう。
+        // ほかの行の項目は順番に影響しないので先へ進む
+        if (e instanceof ExpenseConflictError) {
+          WriteQueue.markAttempt(item.id, `${WriteQueue.CONFLICT_PREFIX}: ほかの端末で先に変更されています`, true);
+          continue;
+        }
         WriteQueue.markAttempt(item.id, describeError(e), !isQueueable(e));
         // AuthError は他の一時的な失敗と違い「送り直せば直る」ものではないので、
         // ここで握りつぶさず呼び出し元へ伝えてサインアウト処理をさせる
@@ -730,36 +838,37 @@ export async function getRowsRaw(yearMonth?: string): Promise<ExpenseRow[]> {
 
   return values
     .slice(1)
-    .map((row, i) => {
-      const amount = Number(row[5] ?? 0);
-      const countedRaw = row[7];
-      const counted = countedRaw === undefined || countedRaw === ''
-        ? amount
-        : Number(countedRaw);
-      const excludedRaw   = (row[8]  ?? '').toString().trim().toUpperCase();
-      const confirmedRaw  = (row[9]  ?? '').toString().trim().toUpperCase();
-      const recurringRaw  = (row[10] ?? '').toString().trim().toUpperCase();
-      const deletedRaw    = (row[11] ?? '').toString().trim().toUpperCase();
-      return {
-        timestamp:     normalizeTimestamp(row[0] ?? ''),
-        source:        row[1] ?? '',
-        user:          row[2] ?? '',
-        store:         row[3] ?? '',
-        category:      row[4] ?? '',
-        amount,
-        memo:          row[6] ?? '',
-        countedAmount: Number.isFinite(counted) ? counted : amount,
-        excluded:      excludedRaw  === 'TRUE',
-        confirmed:     confirmedRaw === 'TRUE',
-        recurring:     recurringRaw === 'TRUE',
-        deleted:       deletedRaw   === 'TRUE',
-        entryId:       row[12] ? String(row[12]) : undefined,
-        rowIndex:      i + 2, // ヘッダーが行1なので +2
-        sheetName,
-      };
-    })
+    .map((row, i) => parseRow(row, i + 2, sheetName)) // ヘッダーが行1なので +2
     // 論理削除された行はアプリからは完全に見せない（復活不可）
     .filter((r) => !r.deleted);
+}
+
+/** 月次シートの 1 行（A:N）を ExpenseRow にする */
+function parseRow(row: string[], rowIndex: number, sheetName: string): ExpenseRow {
+  const amount = Number(row[5] ?? 0);
+  const countedRaw = row[7];
+  const counted = countedRaw === undefined || countedRaw === ''
+    ? amount
+    : Number(countedRaw);
+  const flag = (i: number) => (row[i] ?? '').toString().trim().toUpperCase() === 'TRUE';
+  return {
+    timestamp:     normalizeTimestamp(row[0] ?? ''),
+    source:        row[1] ?? '',
+    user:          row[2] ?? '',
+    store:         row[3] ?? '',
+    category:      row[4] ?? '',
+    amount,
+    memo:          row[6] ?? '',
+    countedAmount: Number.isFinite(counted) ? counted : amount,
+    excluded:      flag(8),
+    confirmed:     flag(9),
+    recurring:     flag(10),
+    deleted:       flag(11),
+    entryId:       row[12] ? String(row[12]) : undefined,
+    rev:           Number(row[13]) || 0,
+    rowIndex,
+    sheetName,
+  };
 }
 
 /** 月次シートの一覧を新しい順に返す（'YYYY-MM' のみ、設定系シートは除外） */
@@ -808,12 +917,23 @@ export async function updateRowFlags(
   yearMonth: string,
   rowIndex: number,
   patch: { countedAmount: number; excluded: boolean; confirmed: boolean },
-): Promise<void> {
+  guard: RevOptions = {},
+): Promise<number | void> {
   if (await Demo.isDemo()) {
     Demo.demoPatch(yearMonth, rowIndex, patch);
     return;
   }
-  await writeOrQueue({ kind: 'updateFlags', sheetName: yearMonth, rowIndex, patch });
+  return writeOrQueue({ kind: 'updateFlags', sheetName: yearMonth, rowIndex, patch, ...guard });
+}
+
+/**
+ * 同時編集の検出。`baseRev` は画面に読み込んだときの行の rev（ExpenseRow.rev）。
+ * シートの rev と違えば ExpenseConflictError を投げる。`force` で確かめずに上書きする。
+ * 成功したら新しい rev を返す（未送信に回った場合は QueuedWriteError）。
+ */
+export interface RevOptions {
+  baseRev?: number;
+  force?:   boolean;
 }
 
 /**
@@ -824,7 +944,8 @@ export async function updateRow(
   yearMonth: string,
   rowIndex: number,
   entry: ExpenseRow,
-): Promise<void> {
+  opts: { force?: boolean } = {},
+): Promise<number | void> {
   if (await Demo.isDemo()) {
     Demo.demoPatch(yearMonth, rowIndex, {
       timestamp: entry.timestamp,
@@ -839,7 +960,8 @@ export async function updateRow(
     });
     return;
   }
-  await writeOrQueue({ kind: 'updateRow', sheetName: yearMonth, rowIndex, entry });
+  const { items: _items, ...rest } = entry;
+  return writeOrQueue({ kind: 'updateRow', sheetName: yearMonth, rowIndex, entry: rest, baseRev: entry.rev, force: opts.force });
 }
 
 /**
@@ -850,12 +972,13 @@ export async function updateRow(
 export async function markRowDeleted(
   yearMonth: string,
   rowIndex: number,
-): Promise<void> {
+  guard: RevOptions = {},
+): Promise<number | void> {
   if (await Demo.isDemo()) {
     Demo.demoPatch(yearMonth, rowIndex, { deleted: true });
     return;
   }
-  await writeOrQueue({ kind: 'markDeleted', sheetName: yearMonth, rowIndex });
+  return writeOrQueue({ kind: 'markDeleted', sheetName: yearMonth, rowIndex, ...guard });
 }
 
 /** 指定行の recurring フラグ（K列）のみ更新する */
@@ -863,12 +986,13 @@ export async function updateRecurringFlag(
   yearMonth: string,
   rowIndex: number,
   recurring: boolean,
-): Promise<void> {
+  guard: RevOptions = {},
+): Promise<number | void> {
   if (await Demo.isDemo()) {
     Demo.demoPatch(yearMonth, rowIndex, { recurring });
     return;
   }
-  await writeOrQueue({ kind: 'setRecurring', sheetName: yearMonth, rowIndex, recurring });
+  return writeOrQueue({ kind: 'setRecurring', sheetName: yearMonth, rowIndex, recurring, ...guard });
 }
 
 // ─── カテゴリ管理 ─────────────────────────────────────────────────────────────
