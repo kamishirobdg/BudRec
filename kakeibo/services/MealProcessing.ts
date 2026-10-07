@@ -16,14 +16,14 @@ import {
   IdentifiedDish, InventoryLine, NutritionQuery, NutritionResult, ReceiptLine, UsedItem,
 } from '../providers/GeminiMeal';
 import { listInventory, remainLabel, consume, InventoryItem } from './InventoryService';
-import { foodKey, freshNutrition, loadFoods, saveResearched } from './FoodService';
+import { Food, foodKey, freshNutrition, loadFoods, saveResearched } from './FoodService';
 import { rowsFromReceipts } from './ReceiptProcessing';
 import * as CategoryService from './CategoryService';
 import {
   MealRow, Confidence, ItemChoice, ItemRef, appendMeal, getMeals, mealRev, mealsSheetName, newMealId,
   recentCorrections, saveMeal, MealConflictError,
 } from './MealService';
-import { scaleNutrients } from './Nutrients';
+import { Nutrients, scaleNutrients } from './Nutrients';
 import * as Demo from './DemoService';
 import { ensureMealShared } from './SharedPhotos';
 
@@ -243,10 +243,23 @@ export interface MealResult {
   authFailed:  boolean;
 }
 
-/** 使った在庫の量を「1 パック（入り数ぶん）のうちの割合」にする */
-function packageFraction(ref: InventoryRef, used: UsedItem): number {
-  if (ref.pieces && used.pieces) return used.pieces / ref.pieces;
-  return (used.ratio ?? 0) * ref.remaining;
+/**
+ * 使った在庫の量を「1 パック（入り数ぶん）のうちの割合」にする。
+ * 解釈できない（入り数の無い品目に個数が返った・量が無い）ときは null（栄養は検索に回す）。
+ */
+function packageFraction(ref: InventoryRef, used: UsedItem): number | null {
+  if (used.pieces && ref.pieces) return used.pieces / ref.pieces;
+  if (used.ratio && used.ratio > 0) return used.ratio * ref.remaining;
+  return null;
+}
+
+/** 食品データの栄養（単位つき）から、食べた分の栄養を出す。出せなければ null */
+function nutrientsFromFood(food: Food, ref: InventoryRef, used: UsedItem): Nutrients | null {
+  // 複数入りの商品の公式表示は 1 個あたりが普通なので、個数を直接掛ける
+  if (food.basis === 'piece') return used.pieces ? scaleNutrients(food.nutrients, used.pieces) : null;
+  if (food.basis !== 'package') return null;
+  const f = packageFraction(ref, used);
+  return f === null ? null : scaleNutrients(food.nutrients, f);
 }
 
 /**
@@ -258,13 +271,17 @@ export async function recordMeal(
   shotAt: number,
   photoRef: string | null,
   receipt: ReceiptCandidate | null,
-  signal: AbortSignal,
+  signal?: AbortSignal,
 ): Promise<MealResult> {
   const { dishes, inventory, mealId, photographer, partner } = a;
   const linked = receipt ?? (dishes.some((d) => d.kind !== 'home' && d.used.length === 0) ? await findReceiptNear(shotAt) : null);
-  const matches = linked
-    ? await matchReceiptItems(linked.store, dishes.map((d) => d.name), linked.lines, signal)
-    : dishes.map(() => null);
+  // 自炊の料理はレシートの品目と突き合わせない（「親子丼」が「鶏もも肉」にならないように）
+  const targets = dishes.map((_, i) => i).filter((i) => dishes[i].kind !== 'home' && dishes[i].used.length === 0);
+  const matches: (number | null)[] = dishes.map(() => null);
+  if (linked && targets.length > 0) {
+    const m = await matchReceiptItems(linked.store, targets.map((i) => dishes[i].name), linked.lines, signal);
+    targets.forEach((i, k) => { matches[i] = m[k]; });
+  }
   const nameOf = (i: number) => (matches[i] !== null && linked ? linked.lines[matches[i]!].name : dishes[i].name);
   const storeOf = (i: number) => (dishes[i].kind !== 'home' && linked && matches[i] !== null ? linked.store : '');
 
@@ -275,9 +292,8 @@ export async function recordMeal(
     if (d.kind === 'packaged' && d.used.length === 1 && d.choices.length === 0) {
       const ref = inventory[d.used[0].index];
       const food = ref && freshNutrition(foods.get(foodKey(ref.name)));
-      if (food && food.basis === 'package') {
-        return { nutrients: scaleNutrients(food.nutrients, packageFraction(ref, d.used[0])), official: food.source === 'grounding' };
-      }
+      const n = food ? nutrientsFromFood(food, ref, d.used[0]) : null;
+      if (food && n) return { nutrients: n, official: food.source === 'grounding' };
     }
     if (d.kind !== 'home' && d.used.length === 0) {
       const food = freshNutrition(foods.get(foodKey(nameOf(i), d.kind === 'eat_out' ? storeOf(i) : '')));
@@ -291,8 +307,16 @@ export async function recordMeal(
     const queries: NutritionQuery[] = todo.map((i) => {
       const d = dishes[i];
       const used = d.used
-        .map((u) => inventory[u.index] && `${inventory[u.index].name} ${u.pieces ? `${u.pieces}個` : `約${Math.round(packageFraction(inventory[u.index], u) * 100)}%`}`)
-        .filter(Boolean);
+        .filter((u) => inventory[u.index])
+        .map((u) => {
+          const f = packageFraction(inventory[u.index], u);
+          const amount = u.pieces ? `${u.pieces}個` : f !== null ? `1 パックの約${Math.round(f * 100)}%` : '量は不明';
+          return `${inventory[u.index].name} ${amount}`;
+        });
+      // 家にある商品を食べた: その量で。家で作った料理: 使った食材を添える
+      if (d.kind === 'packaged' && used.length === 1) {
+        return { store: '', name: nameOf(i), kind: d.kind, amount: used[0] };
+      }
       return {
         store: storeOf(i),
         name:  used.length > 0 ? `${nameOf(i)}（使った食材: ${used.join('、')}）` : nameOf(i),
@@ -353,12 +377,10 @@ export async function recordMeal(
     else if (!(e instanceof Error && e.name === 'QueuedWriteError')) throw e;
   }
 
-  // 在庫の残りを減らす。どれか見分けられなかった品は、選んでもらってから減らす
-  await consume(dishes
-    .filter((d) => d.choices.length === 0)
-    .flatMap((d) => d.used
-      .filter((u) => inventory[u.index])
-      .map((u) => ({ itemId: inventory[u.index].itemId, pieces: u.pieces, ratio: u.ratio }))));
+  // 在庫の残りを減らす。見分けられなかった候補の品だけは、選んでもらってから減らす
+  await consume(dishes.flatMap((d) => d.used
+    .filter((u) => inventory[u.index] && !d.choices.includes(u.index))
+    .map((u) => ({ itemId: inventory[u.index].itemId, pieces: u.pieces, ratio: u.ratio }))));
 
   return {
     mealId,

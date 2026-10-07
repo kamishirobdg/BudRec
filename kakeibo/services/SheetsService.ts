@@ -537,7 +537,7 @@ async function writeRowWithRev(
   const cells: string[] = res.data.values?.[0] ?? [];
   const currentRev = Number(cells[13]) || 0;
   const lastWriter = cells[14] ?? '';
-  if (op.baseRev !== undefined && !op.force && currentRev !== op.baseRev && lastWriter !== me) {
+  if (op.baseRev !== undefined && !op.force && currentRev !== op.baseRev && !(await isMyWriterId(lastWriter))) {
     throw new ExpenseConflictError(currentRev, cells.length > 0 ? parseRow(cells, r, op.sheetName) : null);
   }
   const rev = currentRev + 1;
@@ -581,6 +581,16 @@ async function writeRowWithRev(
 }
 
 // ─── この端末の識別子（O 列 writer） ─────────────────────────────────────────
+
+/**
+ * O 列の writer がこの端末か。端末 ID を ANDROID_ID に切り替える前に保存していた乱数の ID も
+ * 自分として扱う（切り替え直後に、自分の書き込みを相手の変更と取り違えないように）。
+ */
+async function isMyWriterId(id: string): Promise<boolean> {
+  if (!id) return false;
+  if (id === (await getDeviceId())) return true;
+  return id === (await getItem(DEVICE_ID_KEY));
+}
 
 const DEVICE_ID_KEY = 'device_id';
 let deviceIdCache: string | null = null;
@@ -1479,12 +1489,24 @@ export async function listRegisteredUsers(): Promise<RegisteredUser[]> {
   return (await readUserRows(client)).filter((u) => u.name);
 }
 
+let registerInflight: Promise<void> | null = null;
+
 /**
  * この端末のユーザー名を登録する（端末ごとに 1 行。名前を変えたらその行を書き換える）。
  * アプリを開くたびに呼び、最終利用日時も更新する。
- * @param _previous 互換のため残している（端末で行を引くので使わない）
+ * 同時に呼ばれたら（初回の名前入力と起動時の登録など）順に実行する。並べて走らせると、
+ * どちらも自分の行を見つけられずに 2 行追加してしまう。
+ * @param previous 名前を変えた場合の旧名。端末 ID の無い旧形式の行に残っていれば空にする
  */
-export async function registerUser(name: string, _previous?: string): Promise<void> {
+export async function registerUser(name: string, previous?: string): Promise<void> {
+  const prior = registerInflight;
+  const p = (prior ? prior.catch(() => {}) : Promise.resolve()).then(() => registerUserOnce(name, previous));
+  registerInflight = p;
+  p.finally(() => { if (registerInflight === p) registerInflight = null; }).catch(() => {});
+  return p;
+}
+
+async function registerUserOnce(name: string, previous?: string): Promise<void> {
   const trimmed = name.trim();
   if (!trimmed || (await Demo.isDemo())) return;
   const client = await createClient();
@@ -1493,7 +1515,17 @@ export async function registerUser(name: string, _previous?: string): Promise<vo
   }
   const me = await getDeviceId();
   const row = [trimmed, nowLabel(), me, deviceName(), Date.now()];
-  const mine = (await readUserRows(client)).find((u) => u.deviceId === me);
+  const rows = await readUserRows(client);
+  // 端末 ID の無い旧形式の行に旧名が残っていれば空にする（代理入力の候補に残らないように）
+  const legacy = previous ? rows.filter((u) => !u.deviceId && u.name === previous.trim() && u.name !== trimmed) : [];
+  for (const u of legacy) {
+    await client.put(
+      `/values/${encodeURIComponent(USERS_SHEET)}!A${u.rowIndex}:E${u.rowIndex}`,
+      { values: [['', '', '', '', '']] },
+      { params: { valueInputOption: 'RAW' } },
+    );
+  }
+  const mine = rows.find((u) => u.deviceId === me);
   if (mine) {
     await client.put(
       `/values/${encodeURIComponent(USERS_SHEET)}!A${mine.rowIndex}:E${mine.rowIndex}`,

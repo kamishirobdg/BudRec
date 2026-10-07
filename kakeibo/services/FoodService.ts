@@ -13,6 +13,7 @@ import { nowLabel } from './jsonFileStore';
 import { getItem, setItem } from './Storage';
 import { Nutrients, sanitizeNutrients } from './Nutrients';
 import { researchFoods, FoodQuery, FoodNutrition } from '../providers/GeminiMeal';
+import { QuotaExceededError } from '../providers/AIProvider';
 import type { ReceiptItem } from '../providers/AIProvider';
 import * as Demo from './DemoService';
 
@@ -44,7 +45,7 @@ export interface Food {
   pieces:        number | null;
   content:       string;
   nutrients:     Nutrients;
-  basis:         'package' | 'per100g';
+  basis:         'piece' | 'package' | 'per100g';
   source:        'grounding' | 'estimate' | '';
   sources:       string[];
   fetchedAt:     number;
@@ -75,7 +76,7 @@ function fromCells(c: any[], rowIndex: number): Food {
     foodId: String(c[0] ?? ''), key: String(c[1] ?? ''), name: String(c[2] ?? ''), chain: String(c[3] ?? ''),
     kind: String(c[4] ?? ''), storage: String(c[5] ?? ''), shelfDays: num(c[6]), pieces: num(c[7]),
     content: String(c[8] ?? ''), nutrients: sanitizeNutrients(parseJsonCell(c[9], {})),
-    basis: c[10] === 'per100g' ? 'per100g' : 'package',
+    basis: c[10] === 'per100g' ? 'per100g' : c[10] === 'piece' ? 'piece' : 'package',
     source: c[11] === 'grounding' || c[11] === 'estimate' ? c[11] : '',
     sources: parseJsonCell<string[]>(c[12], []), fetchedAt: Number(c[13]) || 0,
     purchaseCount: Number(c[14]) || 0, lastPrice: num(c[15]), prices: parseJsonCell<number[]>(c[16], []),
@@ -109,7 +110,20 @@ export async function loadFoods(force = false): Promise<Map<string, Food>> {
     ((res.data.values ?? []) as any[][]).forEach((c, i) => {
       if (i === 0 || !c[1]) return;
       const f = fromCells(c, i + 1);
-      foods.set(f.key, f);
+      const prev = foods.get(f.key);
+      if (!prev) {
+        foods.set(f.key, f);
+        return;
+      }
+      // 二人の端末が同じ品目を同時に足すと同じ鍵の行が 2 行できる。最初の行に寄せ、
+      // 栄養は調べ済みの方を、購入回数は多い方を使う
+      const nutrition = prev.status === 'done' ? prev : f.status === 'done' ? f : prev;
+      foods.set(f.key, {
+        ...prev,
+        nutrients: nutrition.nutrients, basis: nutrition.basis, source: nutrition.source,
+        sources: nutrition.sources, fetchedAt: nutrition.fetchedAt, status: nutrition.status,
+        purchaseCount: Math.max(prev.purchaseCount, f.purchaseCount),
+      });
     });
   }
   cache = { foods, at: Date.now() };
@@ -131,14 +145,30 @@ async function ensureSheet(): Promise<void> {
   }
 }
 
-async function writeFoods(updates: Food[], appends: Food[]): Promise<void> {
+/**
+ * 書き換えるのは役割ごとの列だけにする。購入の記録（E〜I・O〜Q）と栄養の調査（J〜N・R）が同時に走っても、
+ * 相手が書いた列を古い値で上書きしない。
+ */
+type FoodColumns = 'purchase' | 'nutrition';
+
+function rangesFor(f: Food, cols: FoodColumns): { range: string; values: (string | number)[][] }[] {
+  const c = toCells(f);
+  const r = f.rowIndex;
+  const at = (from: string, to: string, a: number, b: number) =>
+    ({ range: `'${SHEET}'!${from}${r}:${to}${r}`, values: [c.slice(a, b + 1)] });
+  return cols === 'purchase'
+    ? [at('E', 'I', 4, 8), at('O', 'Q', 14, 16), at('S', 'S', 18, 18)]
+    : [at('J', 'N', 9, 13), at('R', 'S', 17, 18)];
+}
+
+async function writeFoods(updates: Food[], appends: Food[], cols: FoodColumns): Promise<void> {
   if (updates.length === 0 && appends.length === 0) return;
   await ensureSheet();
   const client = await SheetsInternal.createClient();
   if (updates.length > 0) {
     await client.post('/values:batchUpdate', {
       valueInputOption: 'RAW',
-      data: updates.map((f) => ({ range: `'${SHEET}'!A${f.rowIndex}:S${f.rowIndex}`, values: [toCells(f)] })),
+      data: updates.flatMap((f) => rangesFor(f, cols)),
     });
   }
   if (appends.length > 0) {
@@ -189,7 +219,7 @@ export async function recordPurchases(items: ReceiptItem[]): Promise<void> {
       if (next.rowIndex > 0) updates.set(key, next);
       else appends.set(key, next);
     }
-    await writeFoods([...updates.values()], [...appends.values()]);
+    await writeFoods([...updates.values()], [...appends.values()], 'purchase');
   } catch (e) {
     console.warn('[Food] 購入の記録に失敗:', e instanceof Error ? e.message : e);
   }
@@ -213,11 +243,12 @@ export async function saveResearched(entries: { query: FoodQuery; result: FoodNu
       source: got ? (result.official ? 'grounding' : 'estimate') : base.source,
       sources: got ? sources : base.sources,
       fetchedAt: Date.now(),
-      status: got ? 'done' : 'failed',
+      // 調べ直して見つからなくても、前に調べた値は使い続ける
+      status: got || base.status === 'done' ? 'done' : 'failed',
     };
     (next.rowIndex > 0 ? updates : appends).push(next);
   }
-  await writeFoods(updates, appends);
+  await writeFoods(updates, appends, 'nutrition');
 }
 
 /** 調べ直す（在庫・食事の画面の「調べ直す」）。調べた結果を返す */
@@ -259,8 +290,17 @@ export async function researchSomePending(signal?: AbortSignal): Promise<boolean
   const queries: FoodQuery[] = due.map((f) => ({
     name: f.name, chain: f.chain, kind: (f.kind as FoodQuery['kind']) || 'packaged', content: f.content,
   }));
-  const { results, sources } = await researchFoods(queries, signal);
-  await saveResearched(queries.map((query, i) => ({ query, result: results[i], sources })));
+  // 呼ぶ前に数える。失敗（読み取りの失敗・保存の失敗）を数えないと、同じ品目を何度も調べて無料枠を使い続ける
   await setItem(RESEARCH_COUNTER_KEY, JSON.stringify({ date: counter.date, count: counter.count + due.length }));
+  try {
+    const { results, sources } = await researchFoods(queries, signal);
+    await saveResearched(queries.map((query, i) => ({ query, result: results[i], sources })));
+  } catch (e) {
+    // 無料枠切れなら今日はもう調べない
+    if (e instanceof QuotaExceededError) {
+      await setItem(RESEARCH_COUNTER_KEY, JSON.stringify({ date: counter.date, count: DAILY_RESEARCH_LIMIT }));
+    }
+    throw e;
+  }
   return true;
 }

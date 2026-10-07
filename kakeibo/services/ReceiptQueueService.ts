@@ -106,11 +106,15 @@ export function readReceipt(uri: string): string {
   return file.base64Sync();
 }
 
-/** 状態を書き換える。`rows` / `error` / `notBefore` / `mealId` は渡さなければ消える */
+/**
+ * 状態を書き換える。`rows` / `error` / `notBefore` は渡さなければ消える。
+ * **`analysis` は渡さなければ引き継ぐ**（中止・推定待ち・失敗にしても、書き始めた振り分けの結果を
+ * 失うと、再開時に Gemini を呼び直して ID を振り直し、二重に登録してしまうため）。消すときは null を渡す。
+ */
 export function setStatus(
   uri: string,
   status: ReceiptStatus,
-  extra: { error?: string; rows?: ExpenseRow[]; notBefore?: number; analysis?: StoredAnalysis } = {},
+  extra: { error?: string; rows?: ExpenseRow[]; notBefore?: number; analysis?: StoredAnalysis | null } = {},
 ): void {
   // 破棄済みの画像に状態だけ残さない
   if (!new File(uri).exists) return;
@@ -124,6 +128,7 @@ export function setStatus(
     shotAt:    prev?.shotAt,
     proxyUser: prev?.proxyUser,
     ...extra,
+    analysis:  extra.analysis === null ? undefined : extra.analysis ?? prev?.analysis,
   };
   writeMeta([...list.filter((m) => m.name !== name), next]);
 }

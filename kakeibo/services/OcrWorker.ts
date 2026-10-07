@@ -232,12 +232,14 @@ async function processOne(item: ReceiptQueue.ReceiptItem): Promise<Outcome> {
           // ID を振った結果を残してから書き始める（途中で終了されても二重に登録しないため）
           ReceiptQueue.setStatus(item.uri, 'queued', { analysis });
         }
-        return await writeAnalysis(item, analysis, abort.signal);
+        // 書き始めたら中止を効かせない（途中で止めると、書けたものと書けていないものが混ざる）
+        return await writeAnalysis(item, analysis);
       } catch (e) {
         if (e instanceof AuthError) return 'auth-failed';
         if (e instanceof CancelledError || abort.signal.aborted) return cancelled();
         if (e instanceof QuotaExceededError) return deferAll(e.retryAt);
         if (attempt >= 1) {
+          // 振り分けの結果は残す（レシートが書けていれば、手入力・再開で二重に登録しないため）
           ReceiptQueue.setStatus(item.uri, 'failed', { error: e instanceof Error ? e.message : String(e) });
           return 'done';
         }
@@ -260,7 +262,7 @@ async function processOne(item: ReceiptQueue.ReceiptItem): Promise<Outcome> {
  * - 料理・食品 → 食事として記録（同じ写真のレシートがあればそれにひも付ける）
  * - 写真: 食事の写真としてコピーを残し、レシートとして登録したものはレシートの写真として移す
  */
-async function writeAnalysis(item: ReceiptQueue.ReceiptItem, a: StoredAnalysis, signal: AbortSignal): Promise<Outcome> {
+async function writeAnalysis(item: ReceiptQueue.ReceiptItem, a: StoredAnalysis): Promise<Outcome> {
   const shotAt = item.shotAt ?? Date.now();
   const messages: string[] = [];
 
@@ -277,9 +279,11 @@ async function writeAnalysis(item: ReceiptQueue.ReceiptItem, a: StoredAnalysis, 
   }
 
   let meal: MealResult | null = null;
+  // 食事の写真は記録より先にコピーしておく（記録の後で終了されると、再開時に記録済みとして飛ばされ写真が残らない）。
+  // 同じ名前のファイルがあれば何もしないので、何度呼んでもよい
+  if (a.dishes.length > 0) archiveMealPhoto(item.uri, true);
   if (a.dishes.length > 0 && !(await mealExists(mealsSheetName(epochToTimestamp(shotAt)), a.mealId))) {
-    meal = await recordMeal(a, shotAt, mealPhotoRef(item.uri), saved[0] ? receiptCandidateOf(saved[0]) : null, signal);
-    archiveMealPhoto(item.uri, true);
+    meal = await recordMeal(a, shotAt, mealPhotoRef(item.uri), saved[0] ? receiptCandidateOf(saved[0]) : null);
     const dishes = [...new Set(meal.rows.map((x) => x.dish))];
     messages.push([
       meal.needsReview ? '食事を記録しました（要確認）' : '食事を記録しました',
@@ -298,7 +302,8 @@ async function writeAnalysis(item: ReceiptQueue.ReceiptItem, a: StoredAnalysis, 
   }
 
   if (messages.length > 0) emit({ type: 'saved', message: messages.join('\n') });
-  if (saved.length > 0) await linkSavedReceipts(saved);
+  // この写真の食事に付けたレシートを、ほかの食事にまで付けない
+  if (saved.length > 0 && a.dishes.length === 0) await linkSavedReceipts(saved);
   // 未送信に積んだうえで再サインインが要る状態になった。記録は後で届くので、ここで止める
   if (meal?.authFailed) return 'auth-failed';
   if (meal?.sharedMeal) await ensureMealShared(meal.rows, meal.rows[0]?.updatedBy ?? '');

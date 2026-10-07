@@ -79,8 +79,24 @@ function parseItem(c: any[], rowIndex: number, sheetName: string): InventoryItem
  * 在庫の一覧。日持ちを過ぎたもの・食べきったもの・削除したレシートの品目は除く。
  * @param includeConfirm 「食べきりましたか？」の確認待ちも含める
  */
+/**
+ * 在庫の読み出しは 6 か月 × 2 シートを読むので、続けて撮ったときに Sheets の読み取り上限（毎分 60）に
+ * 当たらないよう短い間だけ使い回す。在庫を書き換えたら捨てる。
+ */
+const CACHE_MS = 30_000;
+let cache: { items: InventoryItem[]; at: number } | null = null;
+
 export async function listInventory(includeConfirm = true): Promise<InventoryItem[]> {
   if (await Demo.isDemo()) return [];
+  if (!cache || Date.now() - cache.at > CACHE_MS) cache = { items: await readInventory(), at: Date.now() };
+  // 呼び出し側が書き換えても使い回す元が変わらないよう写しを返す
+  return cache.items
+    .filter((i) => includeConfirm || i.status !== 'confirm')
+    .map((i) => ({ ...i }));
+}
+
+async function readInventory(): Promise<InventoryItem[]> {
+  const includeConfirm = true;
   const client = await SheetsInternal.createClient();
   const names = await SheetsInternal.listSheetNames(client, true);
   const now = Date.now();
@@ -101,7 +117,8 @@ export async function listInventory(includeConfirm = true): Promise<InventoryIte
       const item = parseItem(c, i + 1, sheet);
       if (!item || item.status === 'used_up' || item.expiresMs < now) return;
       if (item.status === 'confirm' && !includeConfirm) return;
-      if (item.remaining <= 0 && (item.remainingPieces ?? 0) <= 0) return;
+      // 残りが 0 でも「食べきりましたか？」の確認待ちは出す（「まだある」で戻せるように）
+      if (item.status === 'in_stock' && item.remaining <= 0 && (item.remainingPieces ?? 0) <= 0) return;
       out.push(item);
     });
     // 削除した支出行の品目は在庫にしない
@@ -119,6 +136,7 @@ export function remainLabel(i: InventoryItem): string {
 }
 
 async function writeState(item: InventoryItem, remaining: number, remainingPieces: number | null, status: ItemStatus): Promise<void> {
+  cache = null;
   const client = await SheetsInternal.createClient();
   // O:Q（remaining / remaining_pieces / status）と S（updated_at）
   await client.post('/values:batchUpdate', {
@@ -147,6 +165,8 @@ export async function consume(list: Consumption[]): Promise<void> {
     for (const c of list) {
       const item = items.find((i) => i.itemId === c.itemId);
       if (!item) continue;
+      // 入り数の無い品目に個数で返ってきたなど、量を解釈できないものは減らさない
+      if (item.remainingPieces === null && !c.ratio) continue;
       let remaining = item.remaining;
       let remainingPieces = item.remainingPieces;
       if (remainingPieces !== null && item.pieces) {
@@ -157,7 +177,12 @@ export async function consume(list: Consumption[]): Promise<void> {
         remaining = Math.max(0, remaining - remaining * (c.ratio ?? 0));
       }
       const nearlyEmpty = remainingPieces !== null ? remainingPieces <= 0 : remaining <= NEARLY_EMPTY;
-      await writeState(item, round(remaining), remainingPieces, nearlyEmpty ? 'confirm' : item.status);
+      const status: ItemStatus = nearlyEmpty ? 'confirm' : item.status;
+      await writeState(item, round(remaining), remainingPieces, status);
+      // 同じ品目を 1 回で何度か減らす（卵を 2 品に使ったなど）ときに、減らした後の値から続ける
+      item.remaining = round(remaining);
+      item.remainingPieces = remainingPieces;
+      item.status = status;
     }
   } catch (e) {
     console.warn('[Inventory] 残りを減らせなかった:', e instanceof Error ? e.message : e);

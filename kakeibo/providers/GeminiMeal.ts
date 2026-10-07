@@ -202,8 +202,11 @@ export interface FoodQuery {
 
 export interface FoodNutrition {
   nutrients: Nutrients;
-  /** 値の単位。package = 1 個・1 パック・一人前あたり / per100g = 100g あたり（量り売りの食材） */
-  basis:     'package' | 'per100g';
+  /**
+   * 値の単位。piece = 複数入りの商品の 1 個（1 本）あたり / package = 1 パック・1 個売りの商品・一人前あたり /
+   * per100g = 100g あたり（量り売りの食材）。食べた量を掛けるのはアプリ側で行う
+   */
+  basis:     'piece' | 'package' | 'per100g';
   official:  boolean;
 }
 
@@ -220,7 +223,9 @@ export async function researchFoods(
     .map((q, i) => `${i}: ${q.chain ? `「${q.chain}」の` : ''}「${q.name}」${q.content ? `（${q.content}）` : ''}`)
     .join('\n');
   const prompt = `次の食品の栄養成分を調べ、JSON のみを返してください（説明文は不要）。
-- 市販の商品・飲食店のメニューは、Google 検索で**メーカー・店の公式の栄養成分表示**を探して使い、basis を package（1 個・1 パック・一人前あたり）にする。公式の値が見つからなければ一般的な値で推定し、official を false にする
+- 市販の商品・飲食店のメニューは、Google 検索で**メーカー・店の公式の栄養成分表示**を探して使う。公式の値が見つからなければ一般的な値で推定し、official を false にする
+  - 複数入りの商品（6 本入りのアイスなど）は 1 個（1 本）あたりの値にして basis を piece にする
+  - 1 個売りの商品・1 パックで食べる商品・飲食店のメニューは、その 1 つ（一人前）あたりで basis を package にする
 - 肉・魚・野菜など量り売りの食材は、100g あたりの一般的な値（日本食品標準成分表に相当する値）にして basis を per100g、official を false にする
 
 ${list}
@@ -237,7 +242,7 @@ ${NUTRIENT_LIST}`;
     const hit = arr.find((r) => Number(r?.index) === i) ?? arr[i];
     return {
       nutrients: sanitizeNutrients(hit?.nutrients),
-      basis:     hit?.basis === 'per100g' ? 'per100g' : 'package',
+      basis:     hit?.basis === 'per100g' ? 'per100g' : hit?.basis === 'piece' ? 'piece' : 'package',
       official:  hit?.official === true,
     };
   });
@@ -290,6 +295,8 @@ export interface NutritionQuery {
   store: string;
   name:  string;
   kind:  DishKind;
+  /** 食べた量（「1 個」「1 パックの約 30%」など）。省略時は商品 1 個・一人前 */
+  amount?: string;
 }
 
 export interface NutritionResult {
@@ -314,7 +321,7 @@ export async function lookupNutrition(
   const grounded = queries.some((q) => q.kind !== 'home');
 
   const list = queries
-    .map((q, i) => `${i}: ${q.store ? `店「${q.store}」の` : ''}「${q.name}」（${q.kind === 'packaged' ? '商品 1 個' : '一人前'}）`)
+    .map((q, i) => `${i}: ${q.store ? `店「${q.store}」の` : ''}「${q.name}」（${q.amount ?? (q.kind === 'packaged' ? '商品 1 個' : '一人前')}）`)
     .join('\n');
   const prompt = `次の食事の栄養成分を求め、JSON のみを返してください（説明文は不要）。
 ${grounded ? 'チェーン店のメニューや市販の商品は、Google 検索で**店・メーカーの公式の栄養成分表示**を探して、その値を使ってください。公式の値が見つからなければ一般的な値で推定し、official を false にしてください。' : '家で作った料理なので、写真と料理名から一般的な分量・値で推定し、official は false にしてください。'}

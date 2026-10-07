@@ -391,10 +391,12 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
         }}
         onManual={(item) => {
           setListOpen(false);
-          // 読み取れなかった写真は、レシートか料理かも分からないので選んでもらう
+          // 読み取れなかった写真は、レシートか料理かも分からないので選んでもらう。
+          // レシートを読み取って書き始めていた写真は、レシートとして入れると二重に登録しうるので出さない
+          const receiptStarted = (item.analysis?.receiptRows.length ?? 0) > 0;
           Alert.alert('何として記録しますか？', undefined, [
             { text: 'キャンセル', style: 'cancel' },
-            { text: 'レシート', onPress: () => setManualTarget(item) },
+            ...(receiptStarted ? [] : [{ text: 'レシート', onPress: () => setManualTarget(item) }]),
             {
               text: '食事',
               onPress: () => setMealTarget({

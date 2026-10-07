@@ -234,12 +234,20 @@ export default function MealEditModal({ target, onClose, onSaved }: Props) {
       }));
     });
 
-  /** 候補から選んだら、その在庫を使ったことにする（量は推定のまま） */
+  /** 使った在庫のうち、見分けられなかった候補にあたるもの（量は推定のまま） */
+  const pendingRef = (d: DishDraft) =>
+    d.itemRefs.find((r) => d.choices.some((c) => c.itemId === r.itemId));
+
+  /**
+   * 候補から選んだら、候補にあたる在庫だけを選んだものに差し替える（ほかの食材はそのまま）。
+   * 「どれでもない」なら候補にあたる在庫を外す。
+   */
   const resolveChoice = (d: DishDraft): { itemRefs: MealRow['itemRefs']; choices: ItemChoice[] } => {
     if (!d.chosen) return { itemRefs: d.itemRefs, choices: d.choices };
-    if (d.chosen === 'none') return { itemRefs: [], choices: [] };
-    const amount = d.itemRefs[0] ?? { itemId: d.chosen };
-    return { itemRefs: [{ ...amount, itemId: d.chosen }], choices: [] };
+    const pending = pendingRef(d);
+    const others = d.itemRefs.filter((r) => r !== pending);
+    if (d.chosen === 'none') return { itemRefs: others, choices: [] };
+    return { itemRefs: [...others, { ...(pending ?? {}), itemId: d.chosen }], choices: [] };
   };
 
   /** 栄養を調べ直す（リニューアルなどで明らかに違うとき） */
@@ -338,10 +346,18 @@ export default function MealEditModal({ target, onClose, onSaved }: Props) {
       const saved = await persist(buildRows(list, photoRef), baseRev);
       if (!saved) return;
       if (target.mode === 'new') archiveMealPhoto(target.photoUri);
+      // 保存できた内容を手元にも反映する（この後の処理が失敗して保存し直したとき、自分の保存と競合したり、
+      // 在庫を二重に減らしたりしないように）
+      setLoaded(saved);
+      setDrafts(toDrafts(saved));
+      setBaseRev(mealRev(saved));
       // 候補から選んだ在庫の残りを、ここで初めて減らす
       await consume(list
         .filter((d) => d.chosen && d.chosen !== 'none')
-        .map((d) => ({ itemId: d.chosen!, pieces: d.itemRefs[0]?.usedPieces, ratio: d.itemRefs[0]?.usedRatio })));
+        .map((d) => {
+          const ref = pendingRef(d);
+          return { itemId: d.chosen!, pieces: ref?.usedPieces, ratio: ref?.usedRatio };
+        }));
       await logCorrections(corrections(list));
       // 共有してから確定日時を書く（この保存で新しく共有した写真にも 7 日の期限を付ける）
       await ensureMealShared(saved, me);
@@ -476,7 +492,7 @@ export default function MealEditModal({ target, onClose, onSaved }: Props) {
                               small
                               label={`${c.name}（${c.store} ${c.bought}）`}
                               active={d.chosen === c.itemId}
-                              onPress={() => update(d.dishId, { chosen: c.itemId, dish: c.name })}
+                              onPress={() => update(d.dishId, { chosen: c.itemId })}
                             />
                           ))}
                           <Chip
