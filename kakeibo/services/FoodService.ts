@@ -102,16 +102,20 @@ let cache: { foods: Map<string, Food>; at: number } | null = null;
 const CACHE_MS = 60_000;
 
 let inflight: Promise<Map<string, Food>> | null = null;
+/** 書き込むたびに進める。書き込みより前に始まった読み込みの結果をキャッシュに残さないため */
+let generation = 0;
 
 export async function loadFoods(force = false): Promise<Map<string, Food>> {
   if (!force && cache && Date.now() - cache.at < CACHE_MS) return cache.foods;
   // 画像の表示などで同時に何か所からも呼ばれるので、読み込み中なら同じ結果を待つ
   if (!force && inflight) return inflight;
-  inflight = readFoods().finally(() => { inflight = null; });
-  return inflight;
+  const task = readFoods().finally(() => { if (inflight === task) inflight = null; });
+  inflight = task;
+  return task;
 }
 
 async function readFoods(): Promise<Map<string, Food>> {
+  const gen = generation;
   const client = await SheetsInternal.createClient();
   const names = await SheetsInternal.listSheetNames(client, true);
   const foods = new Map<string, Food>();
@@ -139,25 +143,27 @@ async function readFoods(): Promise<Map<string, Food>> {
       });
     });
   }
-  cache = { foods, at: Date.now() };
+  if (gen === generation) cache = { foods, at: Date.now() };
   return foods;
 }
 
 /**
  * 飲食店のメニューを引く。店名は「マクドナルド 船橋日大前店」のように店舗名付きなので、
- * 食品データにあるチェーン名のうち店名に含まれる一番長いものを使う。見つからなければ店名そのままで引く。
+ * 食品データにあるチェーン名のうち店名に含まれるものを長い順に試す（自動の調査は店名そのものを
+ * チェーン名として保存するので、「マクドナルド 船橋日大前店」と「マクドナルド」の両方がありうる）。
  * 品名はレシートの表記・写真から読んだ名前など、候補を順に試す。
  */
 export function findMenu(foods: Map<string, Food>, store: string, names: string[]): Food | undefined {
   const norm = (s: string) => s.replace(/\s+/g, '').toLowerCase();
   const s = norm(store);
-  let chain = '';
-  for (const f of foods.values()) {
-    if (f.chain && f.chain.length > chain.length && s.includes(norm(f.chain))) chain = f.chain;
-  }
+  const chains = new Set<string>([store]);
+  for (const f of foods.values()) if (f.chain && s.includes(norm(f.chain))) chains.add(f.chain);
+  const ordered = [...chains].sort((a, b) => b.length - a.length);
   for (const name of names.filter(Boolean)) {
-    const hit = (chain && freshNutrition(foods.get(foodKey(name, chain)))) || freshNutrition(foods.get(foodKey(name, store)));
-    if (hit) return hit;
+    for (const chain of ordered) {
+      const hit = freshNutrition(foods.get(foodKey(name, chain)));
+      if (hit) return hit;
+    }
   }
   return undefined;
 }
@@ -193,24 +199,41 @@ function rangesFor(f: Food, cols: FoodColumns): { range: string; values: (string
   return [at('T', 'T', 19, 19)];
 }
 
+/** 書き込みの途中で失敗した。`updated` は書けた（書き換えが済んだ）かどうか */
+class PartialWriteError extends Error {
+  constructor(readonly original: unknown, readonly updated: boolean) {
+    super(original instanceof Error ? original.message : String(original));
+  }
+}
+
 async function writeFoods(updates: Food[], appends: Food[], cols: FoodColumns): Promise<void> {
   if (updates.length === 0 && appends.length === 0) return;
-  await ensureSheet();
-  const client = await SheetsInternal.createClient();
-  if (updates.length > 0) {
-    await client.post('/values:batchUpdate', {
-      valueInputOption: 'RAW',
-      data: updates.flatMap((f) => rangesFor(f, cols)),
-    });
-  }
-  if (appends.length > 0) {
-    await client.post(
-      `/values/${encodeURIComponent(SHEET)}!${RANGE}:append`,
-      { values: appends.map(toCells) },
-      { params: { valueInputOption: 'RAW', insertDataOption: 'INSERT_ROWS' } },
-    );
-  }
+  generation++;
   cache = null;
+  try {
+    await ensureSheet();
+    const client = await SheetsInternal.createClient();
+    if (updates.length > 0) {
+      await client.post('/values:batchUpdate', {
+        valueInputOption: 'RAW',
+        data: updates.flatMap((f) => rangesFor(f, cols)),
+      });
+    }
+    if (appends.length > 0) {
+      try {
+        await client.post(
+          `/values/${encodeURIComponent(SHEET)}!${RANGE}:append`,
+          { values: appends.map(toCells) },
+          { params: { valueInputOption: 'RAW', insertDataOption: 'INSERT_ROWS' } },
+        );
+      } catch (e) {
+        throw new PartialWriteError(e, updates.length > 0);
+      }
+    }
+  } finally {
+    generation++;
+    cache = null;
+  }
 }
 
 function newFood(key: string, name: string, chain: string): Food {
@@ -245,9 +268,16 @@ export async function recordPurchases(items: ReceiptItem[]): Promise<void> {
   try {
     await writePurchases(food);
   } catch (e) {
+    const rest = e instanceof PurchaseWriteError ? e.remaining : food;
+    const cause = e instanceof PurchaseWriteError ? e.original : e;
+    // 送り直しても通らない失敗（400 など）は残さない（同期のたびに同じ失敗を繰り返すだけ）
+    if (rest.length === 0 || !SheetsInternal.isQueueable(cause)) {
+      console.warn('[Food] 購入の記録に失敗:', e instanceof Error ? e.message : e);
+      return;
+    }
     console.warn('[Food] 購入の記録に失敗。後で記録する:', e instanceof Error ? e.message : e);
     const pending = readJsonArray<PendingPurchase>(PENDING_FILE);
-    writeJson(PENDING_FILE, [...pending, { id: newEntryId(), items: food }].slice(-PENDING_MAX));
+    writeJson(PENDING_FILE, [...pending, { id: newEntryId(), items: rest }].slice(-PENDING_MAX));
   }
 }
 
@@ -260,12 +290,26 @@ export function flushPendingPurchases(): Promise<void> {
       if (await Demo.isDemo()) return;
       const pending = readJsonArray<PendingPurchase>(PENDING_FILE);
       if (pending.length === 0) return;
-      await writePurchases(pending.flatMap((p) => p.items));
       // 記録している間に増えた分は残す
       const done = new Set(pending.map((p) => p.id));
-      const rest = readJsonArray<PendingPurchase>(PENDING_FILE).filter((p) => !done.has(p.id));
-      if (rest.length > 0) writeJson(PENDING_FILE, rest);
-      else removeFile(PENDING_FILE);
+      const replace = (extra: PendingPurchase[]) => {
+        const rest = [...readJsonArray<PendingPurchase>(PENDING_FILE).filter((p) => !done.has(p.id)), ...extra];
+        if (rest.length > 0) writeJson(PENDING_FILE, rest);
+        else removeFile(PENDING_FILE);
+      };
+      try {
+        await writePurchases(pending.flatMap((p) => p.items));
+        replace([]);
+      } catch (e) {
+        // 送り直しても通らない失敗なら捨てる。既存の品目の書き換えだけ済んだ場合は、
+        // 新しい品目だけ残す（済んだ分を二重に数えない）
+        if (e instanceof PurchaseWriteError && !SheetsInternal.isQueueable(e.original)) {
+          replace([]);
+        } else if (e instanceof PurchaseWriteError && e.remaining.length < pending.flatMap((p) => p.items).length) {
+          replace(e.remaining.length > 0 ? [{ id: newEntryId(), items: e.remaining }] : []);
+        }
+        throw e;
+      }
     } catch (e) {
       console.warn('[Food] 未記録の購入を記録できなかった:', e instanceof Error ? e.message : e);
     } finally {
@@ -275,8 +319,32 @@ export function flushPendingPurchases(): Promise<void> {
   return flushing;
 }
 
-async function writePurchases(food: ReceiptItem[]): Promise<void> {
-  const foods = await loadFoods(true);
+/** 購入の記録に失敗した。`remaining` はまだ記録できていない品目 */
+class PurchaseWriteError extends Error {
+  constructor(readonly original: unknown, readonly remaining: ReceiptItem[]) {
+    super(original instanceof Error ? original.message : String(original));
+  }
+}
+
+/**
+ * 読んで足して書くので、この端末の中では 1 つずつ順に行う（起動直後の未記録分の記録と、
+ * OCR・Gmail 取り込みの記録が重なると、片方の +1 が消えたり同じ品目の行が 2 行できたりする）
+ */
+let purchaseChain: Promise<unknown> = Promise.resolve();
+
+function writePurchases(food: ReceiptItem[]): Promise<void> {
+  const run = purchaseChain.then(() => writePurchasesNow(food));
+  purchaseChain = run.catch(() => undefined);
+  return run;
+}
+
+async function writePurchasesNow(food: ReceiptItem[]): Promise<void> {
+  let foods: Map<string, Food>;
+  try {
+    foods = await loadFoods(true);
+  } catch (e) {
+    throw new PurchaseWriteError(e, food);
+  }
   const updates = new Map<string, Food>();
   const appends = new Map<string, Food>();
   for (const it of food) {
@@ -297,7 +365,14 @@ async function writePurchases(food: ReceiptItem[]): Promise<void> {
     if (next.rowIndex > 0) updates.set(key, next);
     else appends.set(key, next);
   }
-  await writeFoods([...updates.values()], [...appends.values()], 'purchase');
+  try {
+    await writeFoods([...updates.values()], [...appends.values()], 'purchase');
+  } catch (e) {
+    if (e instanceof PartialWriteError && e.updated) {
+      throw new PurchaseWriteError(e.original, food.filter((it) => appends.has(foodKey(it.normalized ?? it.name))));
+    }
+    throw new PurchaseWriteError(e instanceof PartialWriteError ? e.original : e, food);
+  }
 }
 
 /** 調べた栄養を保存する（無ければ作る） */

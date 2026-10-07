@@ -16,10 +16,21 @@ import { readJsonArray, removeFile, writeJson } from './jsonFileStore';
 const PER_REQUEST = 50;
 const REFRESH_MS = 180 * 24 * 60 * 60 * 1000;
 /**
- * 前回の文面に載せた品名。取り込んだときに、答えに無かったものを「見つからなかった」にする。
+ * 前回の文面に載せた品名。取り込んだときに、答えに無かったものをしばらく載せないようにする。
  * SecureStore は大きな値を保存できないことがあるのでファイルに置く
  */
 const LAST_REQUEST_FILE = 'food-research-request.json';
+/**
+ * 文面に載せたのに答えに無かった品目（AI が分からなかった・答えが途中で切れた）。30 日は載せない。
+ * 食品データを failed にはしない（途中で切れた答えで、空き時間の調査からも永久に外れてしまうため）
+ */
+const SKIPPED_FILE = 'food-research-skipped.json';
+const SKIP_MS = 30 * 24 * 60 * 60 * 1000;
+
+interface Skipped {
+  key: string;
+  at:  number;
+}
 
 /** レシートの品目のうち、食品ではないもの（メモ欄には区別が無いので名前で外す） */
 const NON_FOOD = /レジ袋|ポリ袋|袋$|値引|割引|送料|手数料|^部門|^小計|^合計|ポイント/;
@@ -46,7 +57,7 @@ async function collectCandidates(): Promise<Candidate[]> {
   const months = names.filter((n) => /^\d{4}-\d{2}$/.test(n));
   const items = names.filter((n) => /^_items_\d{4}-\d{2}$/.test(n));
   const ranges = [
-    ...months.map((s) => `'${s}'!D2:G`),
+    ...months.map((s) => `'${s}'!D2:M`),
     ...items.map((s) => `'${s}'!${ITEMS_RANGE}`),
   ];
   if (ranges.length === 0) return [];
@@ -69,9 +80,11 @@ async function collectCandidates(): Promise<Candidate[]> {
   valueRanges.forEach((vr, i) => {
     const rows = vr.values ?? [];
     if (i < months.length) {
-      // D 店名 / E カテゴリ / F 金額 / G メモ。食費・外食など「食」の付くカテゴリだけ（日用品の品目を外す）
+      // D 店名 / E カテゴリ / F 金額 / G メモ / L 削除 / M entry_id。食費・外食など「食」の付くカテゴリだけ
+      // （日用品の品目を外す）。entry_id のある行は品目が `_items` にあるのでそちらで数える（二重に数えない）
       for (const r of rows) {
         if (!String(r[1] ?? '').includes('食')) continue;
+        if (String(r[8]).toUpperCase() === 'TRUE' || String(r[9] ?? '') !== '') continue;
         for (const part of String(r[3] ?? '').split(/[,、，]\s*/)) {
           const m = part.trim().match(/^(.*?)[:：]\s*-?\d+\s*$/);
           if (m) add(m[1], String(r[0] ?? ''), '');
@@ -93,11 +106,14 @@ async function collectCandidates(): Promise<Candidate[]> {
 
 /**
  * 調査用の文面を作る。まだ調べていない品目を購入回数の多い順に 50 件まで載せる。
- * 載せた品目は覚えておき、取り込みのときに答えに無かったものを「見つからなかった」にする（次から載せない）。
+ * 載せた品目は覚えておき、取り込みのときに答えに無かったものは 30 日載せない。
  */
 export async function buildResearchRequest(): Promise<{ text: string; count: number; remaining: number }> {
   const [candidates, foods] = await Promise.all([collectCandidates(), loadFoods(true)]);
-  const due = candidates.filter((c) => isDue(foods.get(foodKey(c.name))));
+  // 外食のメニューは `チェーン名|品名` の鍵で入るので、チェーン名を問わず品名で「調べ済み」を判断する
+  const settled = new Set([...foods.values()].filter((f) => !isDue(f)).map((f) => foodKey(f.name)));
+  const skipped = new Set(readSkipped().map((s) => s.key));
+  const due = candidates.filter((c) => !settled.has(foodKey(c.name)) && !skipped.has(foodKey(c.name)));
   const batch = due.slice(0, PER_REQUEST);
   writeJson(LAST_REQUEST_FILE, batch.map((c) => c.name));
   if (batch.length === 0) return { text: '', count: 0, remaining: 0 };
@@ -111,7 +127,7 @@ export async function buildResearchRequest(): Promise<{ text: string; count: num
 【返し方】
 - 表だけを返す（説明文は不要）。コードブロック（\`\`\`）の中に、タブ区切りで、1 行目に次の見出しを書く:
 ${TABLE_COLUMNS.join('\t')}
-- name: 下の一覧の品名をそのまま書く（直さない。［］の店名は書かない）
+- name: 下の一覧の品名をそのまま書く（直さない。（）の内容量と［］の店名は書かない）
 - chain: 飲食店のメニューならチェーン名（店舗名は除く。例: マクドナルド）。コンビニ・スーパーで買った商品・食材は空
 - basis: piece（複数入り商品の 1 個あたり）/ package（1 個売り・1 パック・飲食店の一人前あたり）/ per100g（肉・魚・野菜など量り売りの食材の 100g あたり）
 - official: メーカー・店の公式の栄養成分表示から取った値なら TRUE、推定した値なら FALSE
@@ -134,6 +150,7 @@ export interface ParsedFood {
 /** 表を読む。タブ区切りのほか、AI アプリが Markdown の表で返した場合（| 区切り）も受け付ける */
 export function parseResearchTable(text: string): { rows: ParsedFood[]; skipped: number } {
   const lines = text.split(/\r?\n/).map((l) => l.trim()).filter((l) => l && !l.startsWith('```'));
+  // タブが空白に変わった表は読まない（空欄の列が詰まって、値が別の栄養素の列にずれるため）
   const split = (l: string) =>
     l.includes('\t') ? l.split('\t').map((s) => s.trim())
       : l.startsWith('|') ? l.replace(/^\||\|$/g, '').split('|').map((s) => s.trim())
@@ -179,8 +196,12 @@ export function parseResearchTable(text: string): { rows: ParsedFood[]; skipped:
   return { rows, skipped };
 }
 
+function readSkipped(): Skipped[] {
+  return readJsonArray<Skipped>(SKIPPED_FILE).filter((s) => Date.now() - Number(s.at) < SKIP_MS);
+}
+
 /**
- * AI の答えを `_foods` に取り込む。前回の文面に載せたのに答えに無かった品目は「見つからなかった」にする。
+ * AI の答えを `_foods` に取り込む。前回の文面に載せたのに答えに無かった品目は 30 日載せない。
  * 表が見つからなければ例外を投げる。
  */
 export async function importResearchTable(text: string): Promise<{ imported: number; skipped: number }> {
@@ -188,21 +209,26 @@ export async function importResearchTable(text: string): Promise<{ imported: num
   if (rows.length === 0 && skipped === 0) throw new Error('表が見つかりませんでした。答えをまるごと貼り付けてください');
 
   const asked = readJsonArray<string>(LAST_REQUEST_FILE).map(String);
+  const askedKeys = new Set(asked.map((n) => foodKey(n)));
+  // AI が「牛乳（1000ml）」のように内容量を付けて返したら、載せた品名に戻す
+  for (const r of rows) {
+    if (askedKeys.has(foodKey(r.query.name))) continue;
+    const bare = r.query.name.replace(/\s*[（(［\[][^）)］\]]*[）)］\]]\s*$/, '');
+    if (bare && askedKeys.has(foodKey(bare))) r.query = { ...r.query, name: bare };
+  }
   const answered = new Set(rows.map((r) => foodKey(r.query.name)));
   // 前回の文面への答えでない表（別に用意した表など）なら、載せた品目に印を付けない
   const isAnswer = asked.some((name) => answered.has(foodKey(name)));
-  const missing: ParsedFood[] = (isAnswer ? asked : [])
-    .filter((name) => !answered.has(foodKey(name)))
-    .map((name) => ({
-      query: { name, chain: '', kind: 'packaged', content: '' },
-      result: { nutrients: sanitizeNutrients({}), basis: 'package', official: false },
-      sources: [],
-    }));
 
   // 同じ品目が 2 回出てきたら後の行を使う
   const unique = new Map<string, ParsedFood>();
   for (const r of rows) unique.set(foodKey(r.query.name, r.query.chain), r);
-  await saveResearched([...unique.values(), ...missing]);
-  if (isAnswer) removeFile(LAST_REQUEST_FILE);
+  await saveResearched([...unique.values()]);
+
+  if (isAnswer) {
+    const missing = asked.filter((name) => !answered.has(foodKey(name)));
+    writeJson(SKIPPED_FILE, [...readSkipped(), ...missing.map((name) => ({ key: foodKey(name), at: Date.now() }))]);
+    removeFile(LAST_REQUEST_FILE);
+  }
   return { imported: unique.size, skipped };
 }

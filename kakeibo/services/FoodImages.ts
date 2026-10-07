@@ -15,8 +15,8 @@ import * as Demo from './DemoService';
 const FOOD_DIR = ['photos', 'foods'] as const;
 /** 1 回に探す品目数（空き時間に少しずつ） */
 const PER_RUN = 5;
-/** 1 品で読むページ数の上限 */
-const PAGES_PER_FOOD = 3;
+/** 1 品で読むページ数の上限（grounding の参照は 5 品ぶんまとめてなので、どの品のページも見られるだけ読む） */
+const PAGES_PER_FOOD = 8;
 /** 品名とページの題名がこれ以上似ていれば、その品のページとみなす（文字の 2-gram の Dice 係数） */
 const MIN_SIMILARITY = 0.3;
 
@@ -82,10 +82,13 @@ async function readPage(url: string): Promise<PageInfo | null> {
  * 画像をまだ探していない品目を少しずつ探す（空き時間に呼ぶ）。探したら true。
  * 外食のメニューは在庫に出ないので対象外。
  */
+/** この起動中にページを読めなかった品目（同じ品目ばかり試して先に進めなくならないように） */
+const unreachable = new Set<string>();
+
 export async function fillSomeImages(): Promise<boolean> {
   if (await Demo.isDemo()) return false;
   const foods = [...(await loadFoods(true)).values()]
-    .filter((f) => f.status === 'done' && !f.chain && !f.imageUrl && f.sources.length > 0)
+    .filter((f) => f.status === 'done' && !f.chain && !f.imageUrl && f.sources.length > 0 && !unreachable.has(f.foodId))
     .sort((a, b) => b.purchaseCount - a.purchaseCount)
     .slice(0, PER_RUN);
   if (foods.length === 0) return false;
@@ -100,11 +103,18 @@ export async function fillSomeImages(): Promise<boolean> {
   const results: { food: Food; imageUrl: string }[] = [];
   for (const food of foods) {
     let best: { score: number; image: string } = { score: 0, image: '' };
+    let read = 0;
     for (const url of food.sources.slice(0, PAGES_PER_FOOD)) {
       const info = await page(url);
+      if (info) read++;
       if (!info?.image) continue;
       const score = similarity(food.name, info.title);
       if (score > best.score) best = { score, image: info.image };
+    }
+    // どのページも読めなかった（通信の失敗・403 など）ときは、見つからなかったと決めずに次の機会に回す
+    if (read === 0) {
+      unreachable.add(food.foodId);
+      continue;
     }
     const imageUrl = best.score >= MIN_SIMILARITY ? best.image : '-';
     results.push({ food, imageUrl });
@@ -132,7 +142,20 @@ export function downloadFoodImage(food: Food): Promise<string | null> {
     try {
       const file = imageFile(food);
       if (file.exists) return file.uri;
-      return (await File.downloadFileAsync(food.imageUrl, file)).uri;
+      // 書きかけのファイルが残ると次から取り直さないので、一時ファイルに落としてから移す
+      const tmp = new File(Paths.cache, `food-${food.foodId}.tmp`);
+      if (tmp.exists) tmp.delete();
+      let moved = false;
+      try {
+        await File.downloadFileAsync(food.imageUrl, tmp);
+        if (!tmp.exists || tmp.size === 0 || (tmp.type && !tmp.type.startsWith('image/'))) return null;
+        // move すると tmp 自体が移した先を指すようになるので、後で消さない
+        tmp.move(file);
+        moved = true;
+        return file.uri;
+      } finally {
+        if (!moved && tmp.exists) tmp.delete();
+      }
     } catch (e) {
       console.warn('[FoodImages] 画像を保存できなかった:', e instanceof Error ? e.message : e);
       return null;
