@@ -251,8 +251,8 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
         : 'スプレッドシートに書き込み中...',
     );
     try {
-      const msg = await saveReceiptRows(rows);
-      ReceiptQueue.deleteReceipt(uri);
+      const { message: msg, entryIds } = await saveReceiptRows(rows);
+      ReceiptQueue.completeReceipt(uri, entryIds);
       refresh();
       onSuccess(msg);
       return true;
@@ -592,9 +592,6 @@ function ManualEntryModal({
 
             <View style={{ height: 8 }} />
             <Button title="保存" onPress={handleSave} />
-            <Text style={styles.manualNote}>
-              ※ 保存後にレシート画像は削除されます
-            </Text>
           </ScrollView>
         </KeyboardAvoidingView>
       </SafeAreaView>
@@ -846,7 +843,6 @@ const styles = StyleSheet.create({
   fill: { flex: 1 },
   manualScroll: { padding: 16 },
   manualImageBox: { paddingHorizontal: 16, paddingTop: 12 },
-  manualNote: { fontSize: 11, color: '#888', marginTop: 12, textAlign: 'center' },
 
   fieldBox:   { marginBottom: 12 },
   fieldLabel: { fontSize: 12, color: '#666', marginBottom: 4 },

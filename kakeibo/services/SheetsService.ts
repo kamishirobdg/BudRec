@@ -8,6 +8,8 @@ import {
 import { attachRetryInterceptor } from './httpRetry';
 import * as Demo from './DemoService';
 import * as WriteQueue from './WriteQueueService';
+import * as Crypto from 'expo-crypto';
+import type { ReceiptItem } from '../providers/AIProvider';
 
 // ─── スプレッドシート設定（.env の EXPO_PUBLIC_SPREADSHEET_ID に設定） ───────
 // Google Sheets の URL から取得: https://docs.google.com/spreadsheets/d/{ID}/edit
@@ -30,6 +32,10 @@ export interface ExpenseRow {
   confirmed:     boolean; // 重複警告を確認済みとしてマーク
   recurring:     boolean; // true なら翌月新規シート作成時に自動コピー（固定費）
   deleted?:      boolean; // 論理削除フラグ。true の行は getRows で除外される
+  /** 行の ID（M 列）。品目・食事から参照する。追加時に振る。2026-10 より前の行は空 */
+  entryId?:      string;
+  /** 購入品目。追加時だけ使い、月次シートには書かず `_items_YYYY-MM` に書く */
+  items?:        ReceiptItem[];
   rowIndex?:     number;  // シート上の行番号（1-based、ヘッダー=1）。getRows で付与
   sheetName?:    string;  // 取得元シート名（YYYY-MM）。getRows で付与
 }
@@ -38,11 +44,25 @@ export interface ExpenseRow {
 const HEADER_ROW: readonly string[] = [
   'timestamp', 'source', 'user', 'store', 'category',
   'amount', 'memo', 'counted_amount', 'excluded', 'confirmed', 'recurring',
-  'deleted',
+  'deleted', 'entry_id',
 ];
 
-/** 月次シートの列範囲（A:L = timestamp 〜 deleted） */
-const MONTH_RANGE = 'A:L';
+/** 月次シートの列範囲（A:M = timestamp 〜 entry_id） */
+const MONTH_RANGE = 'A:M';
+
+/** 購入品目のシート名（購入した月ごと） */
+function itemsSheetName(monthSheet: string): string {
+  return `_items_${monthSheet}`;
+}
+
+const ITEMS_HEADER_ROW: readonly string[] = [
+  'item_id', 'entry_id', 'purchased_at', 'user', 'store', 'name_raw', 'name',
+  'quantity', 'unit', 'amount', 'food_kind', 'long_life', 'food_code', 'remaining',
+];
+
+export function newEntryId(): string {
+  return Crypto.randomUUID();
+}
 
 /** 設定シート名（先頭の _ で月別シートと区別） */
 const SETTINGS_SHEET           = '_settings';
@@ -290,6 +310,7 @@ async function copyRecurringRowsToNewMonth(
         'FALSE',        // confirmed
         'TRUE',         // recurring
         'FALSE',        // deleted
+        newEntryId(),   // entry_id（コピー元とは別の行なので振り直す）
       ]);
     if (shifted.length === 0) continue;
 
@@ -346,7 +367,11 @@ async function fetchSheetId(client: AxiosInstance, sheetName: string): Promise<n
  * ヘッダーがまだ無いのでその追記は 1 行目に入り、後から確定するヘッダー PUT に消される。
  * 月初に二人がほぼ同時に最初の支出を登録した場合に起こりうる（2026-08-12 修正）。
  */
-async function writeHeaderRow(client: AxiosInstance, sheetName: string): Promise<void> {
+async function writeHeaderRow(
+  client: AxiosInstance,
+  sheetName: string,
+  header: readonly string[] = HEADER_ROW,
+): Promise<void> {
   const res = await client.get(`/values/${encodeURIComponent(sheetName)}!A1:L1`);
   const firstRow: string[] = res.data.values?.[0] ?? [];
 
@@ -354,14 +379,14 @@ async function writeHeaderRow(client: AxiosInstance, sheetName: string): Promise
     // 通常はこちら。まだ誰も書いていない
     await client.put(
       `/values/${encodeURIComponent(sheetName)}!A1`,
-      { values: [HEADER_ROW] },
+      { values: [header] },
       { params: { valueInputOption: 'RAW' } },
     );
     return;
   }
 
   // 誰かがヘッダーを書き終えていたなら何もしない
-  if (firstRow[0] === HEADER_ROW[0]) return;
+  if (firstRow[0] === header[0]) return;
 
   // 明細行が入ってしまっている。上書きすると消えるので、上に 1 行差し込んでから書く
   const sheetId = await fetchSheetId(client, sheetName);
@@ -379,7 +404,7 @@ async function writeHeaderRow(client: AxiosInstance, sheetName: string): Promise
   });
   await client.put(
     `/values/${encodeURIComponent(sheetName)}!A1`,
-    { values: [HEADER_ROW] },
+    { values: [header] },
     { params: { valueInputOption: 'RAW' } },
   );
 }
@@ -398,7 +423,10 @@ async function ensureSheetExists(client: AxiosInstance, sheetName: string): Prom
 
 // ─── 書き込みの実行と退避 ─────────────────────────────────────────────────────
 
-/** ExpenseRow をシートの 1 行（A:L）に変換する */
+/**
+ * ExpenseRow をシートの 1 行（A:L）に変換する。M 列の entry_id は含めない
+ * （編集で書き戻すときに ID を消さないよう、追加時だけ別に足す）
+ */
 function toSheetRow(entry: ExpenseRow): (string | number)[] {
   return [
     entry.timestamp,
@@ -429,7 +457,18 @@ async function execWrite(op: WriteQueue.WriteOp): Promise<void> {
       await ensureSheetExists(client, sheetName);
       await client.post(
         `/values/${encodeURIComponent(sheetName)}!${MONTH_RANGE}:append`,
-        { values: [toSheetRow(op.entry)] },
+        { values: [[...toSheetRow(op.entry), op.entry.entryId ?? '']] },
+        { params: { valueInputOption: 'RAW', insertDataOption: 'INSERT_ROWS' } },
+      );
+      return;
+    }
+    case 'appendItems': {
+      if (await ensureSheet(client, op.sheetName)) {
+        await writeHeaderRow(client, op.sheetName, ITEMS_HEADER_ROW);
+      }
+      await client.post(
+        `/values/${encodeURIComponent(op.sheetName)}!A:N:append`,
+        { values: op.rows },
         { params: { valueInputOption: 'RAW', insertDataOption: 'INSERT_ROWS' } },
       );
       return;
@@ -567,13 +606,66 @@ export async function flushWriteQueue(): Promise<FlushResult> {
  * シート名は timestamp の年月から自動生成され、未作成なら自動で作る。
  * 通信できなかった場合は端末に退避して QueuedWriteError を投げる。
  */
-export async function appendRow(entry: ExpenseRow): Promise<void> {
-  // デモモード中はシートに書かず、メモリ上のオーバーレイにだけ積む
+export async function appendRow(entry: ExpenseRow): Promise<string> {
+  const { items, ...rest } = entry;
+  const expense: ExpenseRow = { ...rest, entryId: entry.entryId || newEntryId() };
+  const entryId = expense.entryId!;
+
+  // デモモード中はシートに書かず、メモリ上のオーバーレイにだけ積む（品目も書かない）
   if (await Demo.isDemo()) {
-    Demo.demoAppend(entry, sheetNameFromTimestamp(entry.timestamp));
-    return;
+    Demo.demoAppend(expense, sheetNameFromTimestamp(expense.timestamp));
+    return entryId;
   }
-  await writeOrQueue({ kind: 'append', entry });
+
+  const itemsOp = buildItemsOp(expense, items ?? []);
+  try {
+    await writeOrQueue({ kind: 'append', entry: expense });
+  } catch (e) {
+    // 支出行が未送信に回ったなら、品目もその後ろに積む（送る順番を保つ）
+    if (itemsOp && (e instanceof WriteQueue.QueuedWriteError || e instanceof AuthError)) {
+      WriteQueue.enqueue(itemsOp, describeError(e));
+    }
+    throw e;
+  }
+
+  // 支出行は書けている。品目の失敗で呼び出し元に失敗を返すと、レシートを読み直して
+  // 支出行を二重に作られるので、ここで止めて投げない（一時的な失敗は未送信に積まれる）
+  if (itemsOp) {
+    try {
+      await writeOrQueue(itemsOp);
+    } catch (e) {
+      console.warn('[Sheets] 品目を書き込めなかった:', describeError(e));
+    }
+  }
+  return entryId;
+}
+
+/** 品目の追記操作を作る。食品以外も含めて全部残す（家計簿側の検索・集計にも使う） */
+function buildItemsOp(expense: ExpenseRow, items: ReceiptItem[]): WriteQueue.WriteOp | null {
+  if (items.length === 0) return null;
+  const rows = items.map((it) => [
+    newEntryId(),             // item_id
+    expense.entryId ?? '',
+    expense.timestamp,        // purchased_at
+    expense.user,
+    expense.store,
+    it.name,                  // name_raw
+    it.normalized ?? it.name, // name
+    it.quantity ?? '',
+    it.unit ?? '',
+    it.price,
+    it.kind ?? '',
+    it.longLife === undefined ? '' : it.longLife ? 'TRUE' : 'FALSE',
+    '',                       // food_code（段階 3 で成分表と対応付ける）
+    1,                        // remaining
+  ]);
+  return {
+    kind: 'appendItems',
+    sheetName: itemsSheetName(sheetNameFromTimestamp(expense.timestamp)),
+    entryId: expense.entryId ?? '',
+    store: expense.store,
+    rows,
+  };
 }
 
 /**
@@ -633,6 +725,7 @@ export async function getRowsRaw(yearMonth?: string): Promise<ExpenseRow[]> {
         confirmed:     confirmedRaw === 'TRUE',
         recurring:     recurringRaw === 'TRUE',
         deleted:       deletedRaw   === 'TRUE',
+        entryId:       row[12] ? String(row[12]) : undefined,
         rowIndex:      i + 2, // ヘッダーが行1なので +2
         sheetName,
       };
@@ -1159,6 +1252,7 @@ export async function applyRecurringEntries(): Promise<number> {
           excluded:   false,
           confirmed:  false,
           deleted:    false,
+          entryId:    undefined, // コピー元とは別の行なので振り直す
           rowIndex:   undefined,
           sheetName:  undefined,
         });

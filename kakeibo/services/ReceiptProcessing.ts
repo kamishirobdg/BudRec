@@ -3,7 +3,7 @@
  * 撮影画面と裏で回る OCR（`OcrWorker`）の両方から使う。
  */
 
-import { appendRow, ExpenseRow } from './SheetsService';
+import { appendRow, ExpenseRow, newEntryId } from './SheetsService';
 import { QueuedWriteError } from './WriteQueueService';
 import { AuthError } from './AuthService';
 import { getCurrentUser } from './UserService';
@@ -32,16 +32,23 @@ export async function extractRows(
   return valid.map((data) => toExpenseRow(data, user, source));
 }
 
+export interface SaveResult {
+  message:  string;
+  /** 書き込めた（未送信に回ったものを含む）行の ID。写真のひも付けに使う */
+  entryIds: string[];
+}
+
 /**
  * 行をスプレッドシートに書き込む。1 件でも入れば成功として扱い、結果メッセージを返す。
  * 全滅したときだけ例外を投げる。
  */
-export async function saveReceiptRows(rows: ExpenseRow[]): Promise<string> {
+export async function saveReceiptRows(rows: ExpenseRow[]): Promise<SaveResult> {
   const saved: ExpenseRow[] = [];
   let queued = 0;
   let failed = 0;
 
-  for (const row of rows) {
+  // ID を先に振っておく（未送信に回った行も、写真や品目と同じ ID で後から届く）
+  for (const row of rows.map((r) => ({ ...r, entryId: r.entryId || newEntryId() }))) {
     try {
       await appendRow(row);
       saved.push(row);
@@ -65,8 +72,11 @@ export async function saveReceiptRows(rows: ExpenseRow[]): Promise<string> {
   // デモ中は appendRow がメモリ上のオーバーレイに積むだけで実データは書かれないが、
   // saved にはマスク前の実データ（店名・金額）が入っているため、
   // ここに保存すると端末ファイルに実データが残ってしまう。デモ中は保存しない
-  if (!(await Demo.isDemo())) LastBatch.saveLastBatch(saved);
-  return buildSaveMessage(saved, queued, failed);
+  if (!(await Demo.isDemo())) LastBatch.saveLastBatch(saved.map(({ items: _items, ...r }) => r));
+  return {
+    message:  buildSaveMessage(saved, queued, failed),
+    entryIds: saved.map((r) => r.entryId!),
+  };
 }
 
 /** OCR 結果 1 件を書き込み用の行に変換する */
@@ -83,6 +93,7 @@ function toExpenseRow(data: ReceiptData, user: string, source: string): ExpenseR
     excluded:      false,
     confirmed:     false,
     recurring:     false,
+    items:         data.items,
   };
 }
 

@@ -154,8 +154,8 @@ async function processOne(item: ReceiptQueue.ReceiptItem): Promise<'done' | 'can
           ReceiptQueue.setStatus(item.uri, 'review', { rows });
           return 'done';
         }
-        const message = await saveReceiptRows(rows);
-        ReceiptQueue.deleteReceipt(item.uri);
+        const { message, entryIds } = await saveReceiptRows(rows);
+        ReceiptQueue.completeReceipt(item.uri, entryIds);
         emit({ type: 'saved', message });
         return 'done';
       } catch (e) {

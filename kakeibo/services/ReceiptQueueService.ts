@@ -14,6 +14,7 @@
 import { Directory, File, Paths } from 'expo-file-system';
 import type { ExpenseRow } from './SheetsService';
 import { readJsonArray, writeJson } from './jsonFileStore';
+import { archiveReceiptPhoto } from './PhotoStore';
 
 const DIR_NAME  = 'pending-receipts';
 const META_FILE = 'receipt-meta.json';
@@ -120,6 +121,15 @@ export function deleteReceipt(uri: string): void {
   }
   const name = nameOf(uri);
   writeMeta(readMeta().filter((m) => m.name !== name));
+}
+
+/**
+ * 登録できた画像を片付ける。写真は消さずに端末内の保存先へ移し、登録した行とひも付ける。
+ */
+export function completeReceipt(uri: string, entryIds: string[]): void {
+  archiveReceiptPhoto(uri, entryIds);
+  // 移せなかった場合も含め、OCR 待ちのフォルダと状態からは外す
+  deleteReceipt(uri);
 }
 
 /** ディレクトリ内の全ファイルを削除 */

@@ -3,9 +3,20 @@
  * Gemini / Claude / OpenAI などを差し替え可能にする。
  */
 
+/** 品目の種類。食事の記録で候補に使うのは ingredient / packaged だけ */
+export type ItemKind = 'ingredient' | 'packaged' | 'non_food';
+
 export interface ReceiptItem {
-  name:  string;
-  price: number;
+  /** レシート・メールの表記そのまま（半角カナ・略称を含む） */
+  name:      string;
+  price:     number;
+  /** 正規化した品名（半角カナの展開・略称の解決） */
+  normalized?: string;
+  quantity?: number;
+  unit?:     string;
+  kind?:     ItemKind;
+  /** 米・調味料・冷凍食品など日持ちするもの */
+  longLife?: boolean;
 }
 
 /**
@@ -73,14 +84,23 @@ export function buildReceiptPrompt(categories: string[]): string {
   - どこにも日付が無ければ空文字
 - time: レシートに印字された**購入時刻**を HH:MM 形式（24時間表記）で。無ければ空文字。推測しない。
 - category: 以下のリストから最も適切な1つを選ぶ。該当が無ければ「その他」。
-- items: 購入品の配列（任意、{name, price} の形式）
+- items: 購入品の配列（任意）。${ITEM_FIELDS_GUIDE}
 
 カテゴリ候補:
 ${list}
 
 出力例（レシート 2 枚が写っている画像）:
-{"receipts":[{"store":"セブンイレブン","amount":1280,"date":"2026-04-07","time":"18:42","category":"食費","items":[{"name":"おにぎり","price":150}]},{"store":"マツモトキヨシ","amount":3480,"date":"2026-04-07","time":"19:05","category":"日用品","items":[]}]}`;
+{"receipts":[{"store":"セブンイレブン","amount":1280,"date":"2026-04-07","time":"18:42","category":"食費","items":[{"name":"ﾂﾅﾏﾖｵﾆｷﾞﾘ","price":150,"normalized":"ツナマヨおにぎり","quantity":1,"unit":"個","kind":"packaged","longLife":false}]},{"store":"マツモトキヨシ","amount":3480,"date":"2026-04-07","time":"19:05","category":"日用品","items":[]}]}`;
 }
+
+/** 品目の各項目の説明（レシート・メール共通） */
+const ITEM_FIELDS_GUIDE = `各品目の項目:
+  - name: レシート・メールの表記そのまま（半角カナや略称も直さない）
+  - price: その品目の金額（数値）
+  - normalized: 一般的な品名に直したもの（例: ｺｸｻﾝﾌﾞﾀｺﾏ → 国産豚こま切れ肉）。直せなければ name と同じ
+  - quantity / unit: 内容量か個数（例: 300 / g、2 / 個、1 / パック）。表記に無ければ省略する。推測しない
+  - kind: ingredient（調理に使う食材・調味料）/ packaged（弁当・パン・菓子・飲料などそのまま食べる食品）/ non_food（食品以外）
+  - longLife: 米・乾物・調味料・冷凍食品・缶詰など日持ちするものは true`;
 
 /** メール本文用プロンプト（取引でない場合は amount=0 を返させる） */
 export function buildEmailPrompt(categories: string[]): string {
@@ -112,7 +132,7 @@ export function buildEmailPrompt(categories: string[]): string {
 - amount: 金額（数値、円記号やカンマ無し、税込）。取引でなければ 0。
 - date: 取引日（YYYY-MM-DD 形式）。不明なら空文字。
 - category: 以下のリストから最も適切な1つを選ぶ。該当が無ければ「その他」。
-- items: 購入品の配列（{name, price}）。複数ある場合はすべて列挙。
+- items: 購入品の配列。複数ある場合はすべて列挙。${ITEM_FIELDS_GUIDE}
 
 カテゴリ候補:
 ${list}
@@ -139,10 +159,16 @@ const RECEIPT_PROPERTIES = {
     items: {
       type: 'OBJECT',
       properties: {
-        name:  { type: 'STRING' },
-        price: { type: 'NUMBER' },
+        name:       { type: 'STRING' },
+        price:      { type: 'NUMBER' },
+        normalized: { type: 'STRING' },
+        quantity:   { type: 'NUMBER' },
+        unit:       { type: 'STRING' },
+        kind:       { type: 'STRING', enum: ['ingredient', 'packaged', 'non_food'] },
+        longLife:   { type: 'BOOLEAN' },
       },
       required: ['name', 'price'],
+      propertyOrdering: ['name', 'price', 'normalized', 'quantity', 'unit', 'kind', 'longLife'],
     },
   },
 } as const;
@@ -278,8 +304,30 @@ function toReceiptData(parsed: any, raw: string, fallbackCategory: string, categ
     category,
     date,
     time:     parsed?.time ? String(parsed.time) : undefined,
-    items:    Array.isArray(parsed?.items) ? parsed.items : undefined,
+    items:    Array.isArray(parsed?.items) ? parsed.items.map(toReceiptItem).filter(Boolean) as ReceiptItem[] : undefined,
     raw,
+  };
+}
+
+const ITEM_KINDS: readonly string[] = ['ingredient', 'packaged', 'non_food'];
+
+/** モデルが返した品目を整える。品名の無いものは捨てる */
+function toReceiptItem(raw: any): ReceiptItem | null {
+  const name = String(raw?.name ?? '').trim();
+  if (!name) return null;
+  const price    = Number(raw?.price);
+  const quantity = Number(raw?.quantity);
+  const kind     = String(raw?.kind ?? '');
+  const normalized = String(raw?.normalized ?? '').trim();
+  const unit       = String(raw?.unit ?? '').trim();
+  return {
+    name,
+    price:      Number.isFinite(price) ? price : 0,
+    normalized: normalized || undefined,
+    quantity:   Number.isFinite(quantity) && quantity > 0 ? quantity : undefined,
+    unit:       unit || undefined,
+    kind:       ITEM_KINDS.includes(kind) ? (kind as ItemKind) : undefined,
+    longLife:   typeof raw?.longLife === 'boolean' ? raw.longLife : undefined,
   };
 }
 
