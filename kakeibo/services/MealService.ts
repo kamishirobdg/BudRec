@@ -17,7 +17,8 @@ import * as WriteQueue from './WriteQueueService';
 
 export type MealKind       = 'eat_out' | 'packaged' | 'home';
 export type MealStatus     = 'estimated' | 'needs_review' | 'edited';
-export type NutrientSource = 'grounding' | 'food_table' | 'estimate';
+/** grounding = 公式の表示 / manual = 手で直した / estimate = 推定 */
+export type NutrientSource = 'grounding' | 'food_table' | 'estimate' | 'manual';
 export type Confidence     = 'high' | 'medium' | 'low';
 
 export interface ItemRef {

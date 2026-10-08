@@ -26,7 +26,10 @@ import { getUniqueUsers } from '../services/SheetsService';
 import { epochToTimestamp } from '../services/MealProcessing';
 import { archiveMealPhoto, mealPhotoRef } from '../services/PhotoStore';
 import { ensureMealShared, markSettled } from '../services/SharedPhotos';
-import { researchNow } from '../services/FoodService';
+import { researchNow, saveResearched } from '../services/FoodService';
+import { NutritionLabel, readNutritionLabel } from '../services/LabelReader';
+import NutrientEditModal from '../components/NutrientEditModal';
+import * as ImagePicker from 'expo-image-picker';
 import { consume } from '../services/InventoryService';
 import FoodThumb from '../components/FoodThumb';
 
@@ -70,6 +73,8 @@ interface DishDraft {
   chosen:         string | null;
   /** 「栄養を調べ直す」で栄養を差し替えた */
   refreshed:      boolean;
+  /** 栄養を手で直した・包装の表示から入れた（名前を変えても調べ直して上書きしない） */
+  manualNutrition: boolean;
 }
 
 const RATIOS = [0.5, 0.6, 0.7, 0.4, 0.3];
@@ -104,6 +109,7 @@ function toDrafts(rows: MealRow[]): DishDraft[] {
       choices: first.choices ?? [],
       chosen: null,
       refreshed: false,
+      manualNutrition: first.nutrientSource === 'manual',
     };
   });
 }
@@ -125,6 +131,9 @@ export default function MealEditModal({ target, onClose, onSaved }: Props) {
   const [history, setHistory] = useState<HistoryEntry[] | null>(null);
   // 「相手と共有」を触ったときの値（null = 触っていない。二人で食べた食事なら共有）
   const [sharedFlag, setSharedFlag] = useState<boolean | null>(null);
+  // 栄養を直す画面（label があれば包装の表示から）
+  const [nutEdit, setNutEdit] = useState<{ dishId: string; label: NutritionLabel | null } | null>(null);
+  const [readingLabel, setReadingLabel] = useState<string | null>(null);
 
   const isNewMeal = target?.mode === 'new';
   const sheetName = target?.mode === 'edit' ? target.sheetName : null;
@@ -199,14 +208,14 @@ export default function MealEditModal({ target, onClose, onSaved }: Props) {
       dishId: newMealId(), dish: name, originalDish: '', kind: prev[0]?.kind ?? 'home', store: prev[0]?.store ?? '',
       eaters: [{ user: me, portion: 1 }], originalEaters: [], whole: sanitizeNutrients({}),
       nutrientSource: 'estimate', confidence: 'low', entryId: prev[0]?.entryId ?? '', itemRefs: [], sources: [],
-      assignedBy: 'manual', isNew: true, choices: [], chosen: null, refreshed: false,
+      assignedBy: 'manual', isNew: true, choices: [], chosen: null, refreshed: false, manualNutrition: false,
     }]);
     setNewDish('');
   };
 
   /** 名前を変えた・足した品の栄養を引き直す。取れなければ不明（null）のまま保存する */
   const refreshNutrition = async (list: DishDraft[]): Promise<DishDraft[]> => {
-    const targets = list.filter((d) => d.isNew || d.dish.trim() !== d.originalDish);
+    const targets = list.filter((d) => !d.manualNutrition && (d.isNew || d.dish.trim() !== d.originalDish));
     if (targets.length === 0) return list;
     try {
       const { results, sources } = await lookupNutrition(
@@ -263,6 +272,44 @@ export default function MealEditModal({ target, onClose, onSaved }: Props) {
     return { itemRefs: [...others, { ...(pending ?? {}), itemId: d.chosen }], choices: [] };
   };
 
+  /** 包装の栄養成分表示を撮って読む。読めたら食べた量を入れる画面を出す */
+  const shootLabel = async (d: DishDraft) => {
+    try {
+      const perm = await ImagePicker.requestCameraPermissionsAsync();
+      if (!perm.granted) return;
+      const res = await ImagePicker.launchCameraAsync({ base64: true, quality: 0.85, mediaTypes: ['images'] });
+      const base64 = res.canceled ? null : res.assets[0]?.base64;
+      if (!base64) return;
+      setReadingLabel(d.dishId);
+      const label = await readNutritionLabel(base64);
+      setNutEdit({ dishId: d.dishId, label });
+    } catch (e) {
+      Alert.alert('読み取れませんでした', e instanceof Error ? e.message : String(e));
+    } finally {
+      setReadingLabel(null);
+    }
+  };
+
+  /** 栄養を直した値にする。包装の表示から入れたときは、食品データにも入れる（次からはその値を使う） */
+  const applyNutrients = (dishId: string, nutrients: Nutrients, label: NutritionLabel | null) => {
+    const d = drafts.find((x) => x.dishId === dishId);
+    update(dishId, {
+      whole: nutrients,
+      nutrientSource: label ? 'grounding' : 'manual',
+      confidence: 'high',
+      refreshed: true,
+      manualNutrition: true,
+    });
+    setNutEdit(null);
+    if (label && d) {
+      saveResearched([{
+        query: { name: d.dish.trim(), chain: '', kind: 'packaged', content: label.content },
+        result: { nutrients: label.nutrients, basis: label.basis, official: true },
+        sources: [],
+      }]).catch((e) => console.warn('[Meal] 食品データに入れられなかった:', e instanceof Error ? e.message : e));
+    }
+  };
+
   /** 栄養を調べ直す（リニューアルなどで明らかに違うとき） */
   const reresearch = async (d: DishDraft) => {
     try {
@@ -279,6 +326,7 @@ export default function MealEditModal({ target, onClose, onSaved }: Props) {
         confidence: food.source === 'grounding' ? 'high' : 'low',
         sources: food.sources,
         refreshed: true,
+        manualNutrition: false,
       });
     } catch (e) {
       Alert.alert('調べられませんでした', e instanceof Error ? e.message : String(e));
@@ -542,11 +590,19 @@ export default function MealEditModal({ target, onClose, onSaved }: Props) {
                         </View>
                       </View>
                     )}
-                    {!d.isNew && (
-                      <TouchableOpacity onPress={() => reresearch(d)}>
-                        <Text style={styles.reresearch}>栄養を調べ直す</Text>
+                    <View style={styles.nutActions}>
+                      {!d.isNew && (
+                        <TouchableOpacity onPress={() => reresearch(d)}>
+                          <Text style={styles.reresearch}>栄養を調べ直す</Text>
+                        </TouchableOpacity>
+                      )}
+                      <TouchableOpacity onPress={() => setNutEdit({ dishId: d.dishId, label: null })}>
+                        <Text style={styles.reresearch}>栄養を直す</Text>
                       </TouchableOpacity>
-                    )}
+                      <TouchableOpacity onPress={() => shootLabel(d)} disabled={readingLabel !== null}>
+                        <Text style={styles.reresearch}>{readingLabel === d.dishId ? '読み取り中...' : '表示を撮る'}</Text>
+                      </TouchableOpacity>
+                    </View>
                     {d.isNew ? (
                       <View style={styles.chips}>
                         {(['eat_out', 'packaged', 'home'] as const).map((k) => (
@@ -562,7 +618,7 @@ export default function MealEditModal({ target, onClose, onSaved }: Props) {
                     ) : (
                       <Text style={styles.sub}>
                         {kcal(d.whole)}（1品）
-                        {d.nutrientSource === 'grounding' ? '・公式' : '・推定'}
+                        {d.nutrientSource === 'grounding' ? '・公式' : d.nutrientSource === 'manual' ? '・手入力' : '・推定'}
                       </Text>
                     )}
 
@@ -669,6 +725,16 @@ export default function MealEditModal({ target, onClose, onSaved }: Props) {
             </View>
           </View>
         </Modal>
+
+        {/* 栄養を直す（包装の表示を読んだときは、食べた量を入れる） */}
+        <NutrientEditModal
+          visible={nutEdit !== null}
+          title={drafts.find((d) => d.dishId === nutEdit?.dishId)?.dish ?? ''}
+          initial={drafts.find((d) => d.dishId === nutEdit?.dishId)?.whole ?? sanitizeNutrients({})}
+          label={nutEdit?.label ?? null}
+          onClose={() => setNutEdit(null)}
+          onSave={(n) => nutEdit && applyNutrients(nutEdit.dishId, n, nutEdit.label)}
+        />
       </SafeAreaView>
     </Modal>
   );
@@ -721,6 +787,7 @@ const styles = StyleSheet.create({
   shareLabel:     { fontSize: 14, color: '#1f2937' },
   choiceItem:     { flexDirection: 'row', alignItems: 'center', gap: 4 },
   reresearch:     { fontSize: 12, color: '#2563eb', fontWeight: '600' },
+  nutActions:     { flexDirection: 'row', gap: 16, flexWrap: 'wrap' },
   addRow:    { flexDirection: 'row', gap: 8 },
   addInput: {
     flex: 1, backgroundColor: '#fff', borderRadius: 12, paddingHorizontal: 14, paddingVertical: 10,

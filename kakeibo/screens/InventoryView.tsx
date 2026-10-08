@@ -12,7 +12,9 @@ import {
 import {
   InventoryItem, keepInStock, listInventory, markUsedUp, remainLabel,
 } from '../services/InventoryService';
-import { findFood, loadFoods, researchNow } from '../services/FoodService';
+import { findFood, loadFoods, researchNow, saveResearched } from '../services/FoodService';
+import { readNutritionLabel } from '../services/LabelReader';
+import * as ImagePicker from 'expo-image-picker';
 import FoodThumb from '../components/FoodThumb';
 
 const STORAGE_LABEL: Record<string, string> = { chilled: '冷蔵', frozen: '冷凍', ambient: '常温', '': 'その他' };
@@ -75,6 +77,28 @@ export default function InventoryView({ onConfirmCount }: { onConfirmCount?: (n:
     Alert.alert(food && Object.values(food.nutrients).some((v) => v !== null) ? '栄養を更新しました' : '見つかりませんでした');
   });
 
+  /** 包装の栄養成分表示を撮って、食品データにその値を入れる（次からの食事はこの値で計算する） */
+  const shootLabel = (item: InventoryItem) => run(item, async () => {
+    const perm = await ImagePicker.requestCameraPermissionsAsync();
+    if (!perm.granted) return;
+    const res = await ImagePicker.launchCameraAsync({ base64: true, quality: 0.85, mediaTypes: ['images'] });
+    const base64 = res.canceled ? null : res.assets[0]?.base64;
+    if (!base64) return;
+    const label = await readNutritionLabel(base64);
+    // 店のオリジナル商品はチェーン名と組の鍵で入っているので、同じ鍵に入れる
+    const known = findFood(await loadFoods(), item.name, item.store);
+    await saveResearched([{
+      query: {
+        name: item.name, chain: known?.chain ?? '', kind: item.kind === 'ingredient' ? 'ingredient' : 'packaged',
+        content: label.content || item.quantity,
+      },
+      result: { nutrients: label.nutrients, basis: label.basis, official: true },
+      sources: [],
+    }]);
+    const kcal = label.nutrients['ENERC_KCAL'];
+    Alert.alert('取り込みました', `${label.unitLabel}${kcal !== null ? ` ${Math.round(kcal)} kcal` : ''}`);
+  });
+
   return (
     <SectionList
       sections={sections}
@@ -110,6 +134,7 @@ export default function InventoryView({ onConfirmCount }: { onConfirmCount?: (n:
                 <>
                   <Btn label="食べきった" onPress={() => run(item, () => markUsedUp(item))} />
                   <Btn label="栄養を調べ直す" onPress={() => reresearch(item)} />
+                  <Btn label="表示を撮る" onPress={() => shootLabel(item)} />
                 </>
               )}
             </View>
@@ -138,7 +163,7 @@ const styles = StyleSheet.create({
   name:    { flex: 1, fontSize: 15, fontWeight: '600', color: '#111' },
   remain:  { fontSize: 13, color: '#2e7d32', fontWeight: '700' },
   sub:     { fontSize: 12, color: '#6b7280' },
-  actions: { flexDirection: 'row', gap: 8, marginTop: 6 },
+  actions: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 6 },
   btn: {
     borderWidth: 1, borderColor: '#d1d5db', borderRadius: 8,
     paddingHorizontal: 12, paddingVertical: 6, backgroundColor: '#fff',

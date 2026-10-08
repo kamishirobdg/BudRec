@@ -320,6 +320,13 @@ export async function recordMeal(
         }
         return { nutrients: food.nutrients, official: food.source === 'grounding' };
       }
+      // 包装の表示から入れた「1 個あたり」「100g あたり」の値（1 つ分 = 1 個。100g あたりは見積もった量を掛ける）
+      if (food && d.kind === 'packaged' && food.basis === 'piece') {
+        return { nutrients: food.nutrients, official: food.source === 'grounding' };
+      }
+      if (food && d.kind === 'packaged' && food.basis === 'per100g' && d.grams) {
+        return { nutrients: scaleNutrients(food.nutrients, d.grams / 100), official: food.source === 'grounding' };
+      }
     }
     return null;
   });
