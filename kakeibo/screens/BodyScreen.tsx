@@ -9,7 +9,10 @@ import {
 } from '../services/ActivityService';
 import { getMeals, MealRow } from '../services/MealService';
 import { DEFAULT_PREFS, NutritionPrefs, loadPrefs } from '../services/NutritionPrefsService';
-import { ageOf, dayOf, shiftDay, today } from '../services/NutritionJudge';
+import { ageOf, dayOf, shiftDay, toDay } from '../services/NutritionJudge';
+
+/** からだの記録はカレンダーの日付（0 時区切り）。食事の「朝 4 時区切り」とは違う */
+const today = () => toDay(new Date());
 import { getCurrentUser } from '../services/UserService';
 import { cachedLoad } from '../services/LocalCache';
 

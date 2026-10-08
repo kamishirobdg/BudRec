@@ -99,7 +99,7 @@ export default function NutritionPrefsModal({ user, prefs, onClose, onSaved, aut
                       onChangeText={setBirthDate}
                       keyboardType="numbers-and-punctuation"
                       placeholder="1990/4/15"
-                      maxLength={10}
+                      maxLength={11}
                     />
                   </View>
                   <View style={styles.profileRow}>

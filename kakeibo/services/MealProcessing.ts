@@ -306,7 +306,20 @@ export async function recordMeal(
       const food = d.kind === 'eat_out' && storeOf(i)
         ? (menuIndex ? findMenu(menuIndex, storeOf(i), [nameOf(i), d.name]) : undefined)
         : freshNutrition(findFood(foods, nameOf(i), linked?.store ?? ''));
-      if (food && food.basis === 'package') return { nutrients: food.nutrients, official: food.source === 'grounding' };
+      if (food && food.basis === 'package') {
+        // 包装の表示のエネルギーが読めたら、それに合わせる
+        const kcal = food.nutrients['ENERC_KCAL'];
+        if (d.kind === 'packaged' && d.labelKcal && kcal && kcal > 0) {
+          return { nutrients: scaleNutrients(food.nutrients, d.labelKcal / kcal), official: true };
+        }
+        // 写真から量を見積もった商品は、食品データの内容量（g）が分かれば量の割合を掛ける。分からなければ調べ直す
+        // （食品データの値が袋全体のものだと、1 枚食べただけで袋全部の量になってしまう）
+        if (d.kind === 'packaged' && d.grams) {
+          const g = Number(food.content.match(/^(\d+(?:\.\d+)?)\s*g$/i)?.[1]);
+          return g > 0 ? { nutrients: scaleNutrients(food.nutrients, d.grams / g), official: food.source === 'grounding' } : null;
+        }
+        return { nutrients: food.nutrients, official: food.source === 'grounding' };
+      }
     }
     return null;
   });

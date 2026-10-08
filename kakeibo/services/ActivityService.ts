@@ -84,7 +84,9 @@ async function safe<T>(fn: () => Promise<T>): Promise<T | null> {
 }
 
 /** ヘルスコネクトから、その日の記録を読む */
-async function readDay(user: string, day: string, sleeps: { end: number; minutes: number }[], weights: { at: number; kg: number }[]): Promise<DayActivity> {
+async function readDay(
+  user: string, day: string, sleeps: { end: number; minutes: number; origin: string }[], weights: { at: number; kg: number }[],
+): Promise<DayActivity> {
   const start = localMidnight(day);
   const end = localMidnight(shiftDay(day, 1));
   const timeRangeFilter = { operator: 'between' as const, startTime: start.toISOString(), endTime: end.toISOString() };
@@ -96,7 +98,12 @@ async function readDay(user: string, day: string, sleeps: { end: number; minutes
   // 睡眠: 前日 18 時〜当日 18 時に終わったもの（その日の朝に起きた分）
   const sleepFrom = start.getTime() - 6 * 3600_000;
   const sleepTo = start.getTime() + 18 * 3600_000;
-  const sleepMin = sleeps.filter((s) => s.end >= sleepFrom && s.end < sleepTo).reduce((a, s) => a + s.minutes, 0);
+  // 睡眠を書くアプリが 2 つ以上あると同じ夜が二重に入るので、アプリごとに足して一番長いものを使う（足し合わせない）
+  const byOrigin = new Map<string, number>();
+  for (const s of sleeps) {
+    if (s.end >= sleepFrom && s.end < sleepTo) byOrigin.set(s.origin, (byOrigin.get(s.origin) ?? 0) + s.minutes);
+  }
+  const sleepMin = Math.max(0, ...byOrigin.values());
   // 体重: その日の最後に量った値
   const weight = weights.filter((w) => w.at >= start.getTime() && w.at < end.getTime()).sort((a, b) => b.at - a.at)[0];
   const stepCount = steps?.COUNT_TOTAL ?? 0;
@@ -126,11 +133,11 @@ export async function readRecentDays(user: string, days = SYNC_DAYS, now: Date =
   const sleeps = (sleepRes?.records ?? []).map((r) => {
     const s = Date.parse(r.startTime);
     const e = Date.parse(r.endTime);
-    // 寝ていなかった段階（起きている・ベッドの外）を除く
+    // 寝ていなかった段階（起きている 1・ベッドの外 3・ベッドで起きている 7）を除く
     const awake = (r.stages ?? [])
-      .filter((st) => st.stage === 1 || st.stage === 3)
+      .filter((st) => st.stage === 1 || st.stage === 3 || (st.stage as number) === 7)
       .reduce((a, st) => a + (Date.parse(st.endTime) - Date.parse(st.startTime)), 0);
-    return { end: e, minutes: Math.max(0, (e - s - awake) / 60_000) };
+    return { end: e, minutes: Math.max(0, (e - s - awake) / 60_000), origin: r.metadata?.dataOrigin ?? '' };
   });
   const weights = (weightRes?.records ?? []).map((r) => ({ at: Date.parse(r.time), kg: r.weight.inKilograms }));
   const out: DayActivity[] = [];
