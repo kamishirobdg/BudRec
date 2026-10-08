@@ -48,7 +48,7 @@ export interface ExpenseRow {
 }
 
 /** ヘッダー行（新規シート作成時に書き込む） */
-const HEADER_ROW: readonly string[] = [
+export const HEADER_ROW: readonly string[] = [
   'timestamp', 'source', 'user', 'store', 'category',
   'amount', 'memo', 'counted_amount', 'excluded', 'confirmed', 'recurring',
   'deleted', 'entry_id', 'rev', 'writer',
@@ -1243,6 +1243,18 @@ async function readConfig(client: AxiosInstance): Promise<Map<string, string>> {
   return map;
 }
 
+/** _config の値を読む（無ければ ''）。チェーン店の候補探しの条件など、二人で共有する設定に使う */
+export async function getConfigValue(key: string): Promise<string> {
+  const client = await createClient();
+  return (await readConfig(client)).get(key) ?? '';
+}
+
+/** _config に値を書く */
+export async function setConfigValue(key: string, value: string): Promise<void> {
+  const client = await createClient();
+  await upsertConfigValue(client, key, value);
+}
+
 /** 一部計上のデフォルト金額を取得（未設定なら 1000） */
 export async function getDefaultPartialAmount(): Promise<number> {
   const client = await createClient();
@@ -1476,7 +1488,7 @@ async function readUsersFromSheet(
 // ここへ登録する。代理入力の相手を「シートにその人の記録があるか」に頼らず選べる。
 
 const USERS_SHEET  = '_users';
-const USERS_HEADER = ['user', 'registered_at', 'device_id', 'device_name', 'last_seen'];
+export const USERS_HEADER = ['user', 'registered_at', 'device_id', 'device_name', 'last_seen'];
 
 export interface RegisteredUser {
   name:       string;

@@ -44,6 +44,7 @@ import { useGmailProgress } from '../services/GmailProgressService';
 import FoodResearchCard from '../components/FoodResearchCard';
 import PhotoRetentionCard from '../components/PhotoRetentionCard';
 import TabLayoutCard from '../components/TabLayoutCard';
+import ChainsCard from '../components/ChainsCard';
 
 interface Props {
   onSignedOut: () => void;
@@ -609,6 +610,8 @@ export default function SettingsScreen({ onSignedOut }: Props) {
 
             {/* 食品データの一括調査（デモ中は実データを読むので出さない） */}
             {!demo.enabled && <FoodResearchCard />}
+
+            {!demo.enabled && <ChainsCard />}
 
             <TabLayoutCard />
 

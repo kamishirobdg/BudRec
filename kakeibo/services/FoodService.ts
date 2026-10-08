@@ -1,15 +1,20 @@
 /**
- * 食品データ（`_foods`）。品目・メニューごとに栄養（と、使い道が決まるまで記録するだけの価格）を持ち、
- * 同じ食品が何度出てきても検索は最初の 1 回で済ませる。仕様は docs/meal-nutrition-spec.md §3.7。
+ * 食品データ（`_foods`）と外食のメニュー（`_menus`）。品目・メニューごとに栄養（と、使い道が決まるまで
+ * 記録するだけの価格）を持ち、同じ食品が何度出てきても検索は最初の 1 回で済ませる。
+ * 仕様は docs/meal-nutrition-spec.md §3.7。
  *
- * - レシート・メールの品目を登録したら、購入回数と価格を記録する（栄養はまだ無い = pending）
+ * - レシート・メールの品目を登録したら、購入回数と価格を記録する（栄養はまだ無い = pending）。
+ *   店のオリジナル商品（PB・店内調理）は「スーパー・コンビニのチェーン名|品名」の鍵にする
  * - 栄養が要るときはまずここを引く。無ければ grounding で調べて足す
  * - 空き時間（OCR の待ちが無いとき）に、pending を購入回数の多い順に少しずつ調べる（1 日の上限あり）
  * - 調べてから 180 日経ったら調べ直す。在庫・食事の画面の「調べ直す」でいつでも調べ直せる
+ * - 外食のメニュー（eat_out）は `_menus` に分ける。行数が多い（チェーン店の全メニュー）ので、レシートの
+ *   登録のたびには読まず、外食の栄養を引くときだけ読む。端末に 1 日保存して使い回す
  */
 
 import { SheetsInternal, newEntryId } from './SheetsService';
 import { nowLabel, readJsonArray, removeFile, writeJson } from './jsonFileStore';
+import { chainAliases, disabledChains, normalizeStore, retailChainOf } from './ChainService';
 import { getItem, setItem } from './Storage';
 import { Nutrients, sanitizeNutrients } from './Nutrients';
 import { researchFoods, FoodQuery, FoodNutrition } from '../providers/GeminiMeal';
@@ -18,7 +23,8 @@ import type { ReceiptItem } from '../providers/AIProvider';
 import * as Demo from './DemoService';
 
 const SHEET = '_foods';
-const HEADER = [
+export const MENU_SHEET = '_menus';
+export const FOOD_HEADER = [
   'food_id', 'key', 'name', 'chain', 'kind', 'storage', 'shelf_days', 'pieces', 'content',
   'nutrients', 'basis', 'source', 'sources', 'fetched_at', 'purchase_count', 'last_price', 'prices',
   'status', 'updated_at', 'image_url',
@@ -116,11 +122,18 @@ export async function loadFoods(force = false): Promise<Map<string, Food>> {
 
 async function readFoods(): Promise<Map<string, Food>> {
   const gen = generation;
+  const foods = await readTable(SHEET);
+  if (gen === generation) cache = { foods, at: Date.now() };
+  return foods;
+}
+
+/** 食品データのシート（`_foods` / `_menus`）を読む。同じ鍵の行が 2 行あれば 1 つにまとめる */
+async function readTable(sheet: string): Promise<Map<string, Food>> {
   const client = await SheetsInternal.createClient();
   const names = await SheetsInternal.listSheetNames(client, true);
   const foods = new Map<string, Food>();
-  if (names.includes(SHEET)) {
-    const res = await client.get(`/values/${encodeURIComponent(SHEET)}!${RANGE}`, {
+  if (names.includes(sheet)) {
+    const res = await client.get(`/values/${encodeURIComponent(sheet)}!${RANGE}`, {
       params: { valueRenderOption: 'UNFORMATTED_VALUE' },
     });
     ((res.data.values ?? []) as any[][]).forEach((c, i) => {
@@ -143,80 +156,102 @@ async function readFoods(): Promise<Map<string, Food>> {
       });
     });
   }
-  if (gen === generation) cache = { foods, at: Date.now() };
   return foods;
 }
 
-/**
- * チェーン名の別名（レシート・メールの店名が英字や略称のとき）。キーは食品データの chain 列の名前。
- * 短すぎて別の店名にも含まれうる略称（「マック」→ マックスバリュ など）は入れない。
- */
-const CHAIN_ALIASES: Record<string, string[]> = {
-  'マクドナルド':               ["McDonald's", 'McDonalds'],
-  'モスバーガー':               ['MOS BURGER', 'MOSBURGER'],
-  'バーガーキング':             ['BURGER KING'],
-  'ドトール':                   ['DOUTOR'],
-  'すき家':                     ['SUKIYA'],
-  'ガスト':                     ['GUSTO'],
-  'はま寿司':                   ['HAMA-SUSHI', 'HAMASUSHI', 'はまずし'],
-  'ピザハット':                 ['PIZZA HUT', 'PIZZAHUT'],
-  'コメダ珈琲店':               ['コメダ', 'KOMEDA'],
-  'ケンタッキーフライドチキン': ['KFC', 'ケンタッキー', 'KENTUCKY'],
-  'ミスタードーナツ':           ['ミスド', 'MISTER DONUT', 'MISTERDONUT'],
-  'サンマルクカフェ':           ['サンマルク', 'ST.MARC', 'SAINT MARC'],
-  'ドミノ・ピザ':               ["Domino's", 'DOMINOS'],
-  '吉野家':                     ['YOSHINOYA'],
-  'なか卯':                     ['NAKAU'],
-  'やよい軒':                   ['YAYOIKEN'],
-  '松のや':                     ['松乃家', 'MATSUNOYA'],
-  'CoCo壱番屋':                 ['ココイチ', 'ココ壱', 'COCOICHI'],
-  'リンガーハット':             ['RINGER HUT', 'RINGERHUT'],
-  '天丼てんや':                 ['てんや', 'TENYA'],
-  '富士そば':                   ['FUJISOBA'],
-  'スシロー':                   ['SUSHIRO'],
-  'しゃぶ葉':                   ['SHABUYO'],
-  '洋麺屋五右衛門':             ['五右衛門', 'GOEMON'],
-  'びっくりドンキー':           ['BIKKURI DONKEY'],
-  'ペッパーランチ':             ['PEPPER LUNCH'],
-  '回転寿司みさき':             ['みさき'],
-  '壱角家':                     ['IKKAKUYA'],
-  '銚子丸':                     ['CHOSHIMARU'],
-  'カレーショップC&C':          ['C&C'],
-  'ヴィ・ド・フランス':         ['VIE DE FRANCE'],
-};
+// ─── 外食のメニュー（`_menus`） ───────────────────────────────────────────────
 
-function chainNames(chain: string): string[] {
-  return [chain, ...(CHAIN_ALIASES[chain] ?? [])];
+const MENU_CACHE_FILE = 'menus-cache.json';
+const MENU_CACHE_MS = 24 * 60 * 60 * 1000;
+let menuCache: { foods: Map<string, Food>; at: number } | null = null;
+let menuInflight: Promise<Map<string, Food>> | null = null;
+
+/** メニューを全部読む（OFF にしたチェーンも含む）。端末に 1 日保存して使い回す */
+async function loadAllMenus(force = false): Promise<Map<string, Food>> {
+  if (!force && menuCache && Date.now() - menuCache.at < MENU_CACHE_MS) return menuCache.foods;
+  if (!force) {
+    const saved = readJsonArray<{ at: number; foods: Food[] }>(MENU_CACHE_FILE)[0];
+    if (saved && Date.now() - saved.at < MENU_CACHE_MS && Array.isArray(saved.foods)) {
+      menuCache = { foods: new Map(saved.foods.map((f) => [f.key, f])), at: saved.at };
+      return menuCache.foods;
+    }
+    if (menuInflight) return menuInflight;
+  }
+  const task = (async () => {
+    const foods = await readTable(MENU_SHEET);
+    menuCache = { foods, at: Date.now() };
+    // 配列 1 つに包んで置く（jsonFileStore は配列として読む）
+    writeJson(MENU_CACHE_FILE, [{ at: menuCache.at, foods: [...foods.values()] }]);
+    return foods;
+  })().finally(() => { if (menuInflight === task) menuInflight = null; });
+  menuInflight = task;
+  return task;
 }
 
-/** 店名の照合用に揃える（全角英数を半角に、空白・中黒・アポストロフィ・ハイフンを消し、小文字に） */
-function normalizeStore(s: string): string {
-  return s
-    .replace(/[Ａ-Ｚａ-ｚ０-９＆．]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xfee0))
-    .replace(/[\s　・'’\-‐－]/g, '')
-    .toLowerCase();
+/** 端末に保存したメニューを捨てる（取り込み・ON/OFF・書き込みの後） */
+export function invalidateMenus(): void {
+  menuCache = null;
+  removeFile(MENU_CACHE_FILE);
+}
+
+export interface MenuIndex {
+  menus:   Map<string, Food>;
+  aliases: Map<string, string[]>;
+}
+
+/** 外食の栄養を引くための索引（OFF にしたチェーンのメニューは除く） */
+export async function loadMenuIndex(force = false): Promise<MenuIndex> {
+  const [all, disabled, aliases] = await Promise.all([loadAllMenus(force), disabledChains(), chainAliases()]);
+  const menus = disabled.size === 0 ? all : new Map([...all].filter(([, f]) => !disabled.has(f.chain)));
+  return { menus, aliases };
+}
+
+/** 外食のメニューに入っているチェーン名と件数（設定画面のチェーン店の一覧に使う） */
+export async function menuChainCounts(): Promise<Map<string, number>> {
+  const counts = new Map<string, number>();
+  for (const f of (await loadAllMenus()).values()) {
+    if (f.chain) counts.set(f.chain, (counts.get(f.chain) ?? 0) + 1);
+  }
+  return counts;
 }
 
 /**
  * 飲食店のメニューを引く。店名は「マクドナルド 船橋日大前店」のように店舗名付きなので、
- * 食品データにあるチェーン名のうち店名に含まれるもの（別名を含む）を長い順に試す（自動の調査は店名そのものを
+ * メニューにあるチェーン名のうち店名に含まれるもの（別名を含む）を長い順に試す（自動の調査は店名そのものを
  * チェーン名として保存するので、「マクドナルド 船橋日大前店」と「マクドナルド」の両方がありうる）。
  * 品名はレシートの表記・写真から読んだ名前など、候補を順に試す。
  */
-export function findMenu(foods: Map<string, Food>, store: string, names: string[]): Food | undefined {
+export function findMenu(index: MenuIndex, store: string, names: string[]): Food | undefined {
   const s = normalizeStore(store);
   const chains = new Set<string>([store]);
-  for (const f of foods.values()) {
-    if (f.chain && !chains.has(f.chain) && chainNames(f.chain).some((n) => s.includes(normalizeStore(n)))) chains.add(f.chain);
+  for (const f of index.menus.values()) {
+    if (!f.chain || chains.has(f.chain)) continue;
+    const all = [f.chain, ...(index.aliases.get(f.chain) ?? [])];
+    if (all.some((n) => s.includes(normalizeStore(n)))) chains.add(f.chain);
   }
   const ordered = [...chains].sort((a, b) => b.length - a.length);
   for (const name of names.filter(Boolean)) {
     for (const chain of ordered) {
-      const hit = freshNutrition(foods.get(foodKey(name, chain)));
+      const hit = freshNutrition(index.menus.get(foodKey(name, chain)));
       if (hit) return hit;
     }
   }
   return undefined;
+}
+
+/**
+ * 買った品目の食品データを引く。店のオリジナル商品は「スーパー・コンビニのチェーン名|品名」の鍵で
+ * 入っているので先にそちらを見て、無ければ品名だけの鍵を見る。
+ */
+export function findFood(foods: Map<string, Food>, name: string, store = ''): Food | undefined {
+  const chain = store ? retailChainOf(store) : '';
+  return (chain ? foods.get(foodKey(name, chain)) : undefined) ?? foods.get(foodKey(name));
+}
+
+/** 品目の鍵（店のオリジナル商品ならチェーン名と組にする） */
+export function purchaseKey(name: string, store: string, ownBrand: boolean | undefined): { key: string; chain: string } {
+  const chain = ownBrand && store ? retailChainOf(store) : '';
+  return { key: foodKey(name, chain), chain };
 }
 
 /** 調べ済みで新しい栄養があれば返す */
@@ -227,10 +262,10 @@ export function freshNutrition(f: Food | undefined): Food | null {
 
 // ─── 書き込み ─────────────────────────────────────────────────────────────────
 
-async function ensureSheet(): Promise<void> {
+async function ensureSheet(sheet: string): Promise<void> {
   const client = await SheetsInternal.createClient();
-  if (await SheetsInternal.ensureSheet(client, SHEET)) {
-    await SheetsInternal.writeHeaderRow(client, SHEET, HEADER);
+  if (await SheetsInternal.ensureSheet(client, sheet)) {
+    await SheetsInternal.writeHeaderRow(client, sheet, FOOD_HEADER);
   }
 }
 
@@ -240,11 +275,11 @@ async function ensureSheet(): Promise<void> {
  */
 type FoodColumns = 'purchase' | 'nutrition' | 'image';
 
-function rangesFor(f: Food, cols: FoodColumns): { range: string; values: (string | number)[][] }[] {
+function rangesFor(f: Food, cols: FoodColumns, sheet: string): { range: string; values: (string | number)[][] }[] {
   const c = toCells(f);
   const r = f.rowIndex;
   const at = (from: string, to: string, a: number, b: number) =>
-    ({ range: `'${SHEET}'!${from}${r}:${to}${r}`, values: [c.slice(a, b + 1)] });
+    ({ range: `'${sheet}'!${from}${r}:${to}${r}`, values: [c.slice(a, b + 1)] });
   if (cols === 'purchase') return [at('E', 'I', 4, 8), at('O', 'Q', 14, 16), at('S', 'S', 18, 18)];
   if (cols === 'nutrition') return [at('J', 'N', 9, 13), at('R', 'S', 17, 18)];
   return [at('T', 'T', 19, 19)];
@@ -257,23 +292,23 @@ class PartialWriteError extends Error {
   }
 }
 
-async function writeFoods(updates: Food[], appends: Food[], cols: FoodColumns): Promise<void> {
+async function writeFoods(updates: Food[], appends: Food[], cols: FoodColumns, sheet = SHEET): Promise<void> {
   if (updates.length === 0 && appends.length === 0) return;
   generation++;
   cache = null;
   try {
-    await ensureSheet();
+    await ensureSheet(sheet);
     const client = await SheetsInternal.createClient();
     if (updates.length > 0) {
       await client.post('/values:batchUpdate', {
         valueInputOption: 'RAW',
-        data: updates.flatMap((f) => rangesFor(f, cols)),
+        data: updates.flatMap((f) => rangesFor(f, cols, sheet)),
       });
     }
     if (appends.length > 0) {
       try {
         await client.post(
-          `/values/${encodeURIComponent(SHEET)}!${RANGE}:append`,
+          `/values/${encodeURIComponent(sheet)}!${RANGE}:append`,
           { values: appends.map(toCells) },
           { params: { valueInputOption: 'RAW', insertDataOption: 'INSERT_ROWS' } },
         );
@@ -284,6 +319,7 @@ async function writeFoods(updates: Food[], appends: Food[], cols: FoodColumns): 
   } finally {
     generation++;
     cache = null;
+    if (sheet === MENU_SHEET) invalidateMenus();
   }
 }
 
@@ -303,18 +339,21 @@ const PENDING_FILE = 'pending-purchases.json';
 /** 溜めすぎない（ずっと送れないときに端末のファイルが膨らみ続けないように） */
 const PENDING_MAX = 200;
 
+/** 買った品目と、買った店（店のオリジナル商品の鍵に使う） */
+type Purchase = ReceiptItem & { store?: string };
+
 interface PendingPurchase {
   id:    string;
-  items: ReceiptItem[];
+  items: Purchase[];
 }
 
 /**
  * レシート・メールの品目を登録したときに呼ぶ。購入回数と価格を記録する（栄養は後で調べる）。
  * 失敗しても投げない（登録は済んでいる）。記録できなかった分は端末に残して後で記録する。
  */
-export async function recordPurchases(items: ReceiptItem[]): Promise<void> {
+export async function recordPurchases(items: ReceiptItem[], store = ''): Promise<void> {
   if (await Demo.isDemo()) return;
-  const food = items.filter((it) => it.kind && it.kind !== 'non_food');
+  const food: Purchase[] = items.filter((it) => it.kind && it.kind !== 'non_food').map((it) => ({ ...it, store }));
   if (food.length === 0) return;
   try {
     await writePurchases(food);
@@ -374,7 +413,7 @@ export function flushPendingPurchases(): Promise<void> {
 
 /** 購入の記録に失敗した。`remaining` はまだ記録できていない品目 */
 class PurchaseWriteError extends Error {
-  constructor(readonly original: unknown, readonly remaining: ReceiptItem[]) {
+  constructor(readonly original: unknown, readonly remaining: Purchase[]) {
     super(original instanceof Error ? original.message : String(original));
   }
 }
@@ -385,13 +424,13 @@ class PurchaseWriteError extends Error {
  */
 let purchaseChain: Promise<unknown> = Promise.resolve();
 
-function writePurchases(food: ReceiptItem[]): Promise<void> {
+function writePurchases(food: Purchase[]): Promise<void> {
   const run = purchaseChain.then(() => writePurchasesNow(food));
   purchaseChain = run.catch(() => undefined);
   return run;
 }
 
-async function writePurchasesNow(food: ReceiptItem[]): Promise<void> {
+async function writePurchasesNow(food: Purchase[]): Promise<void> {
   let foods: Map<string, Food>;
   try {
     foods = await loadFoods(true);
@@ -402,8 +441,8 @@ async function writePurchasesNow(food: ReceiptItem[]): Promise<void> {
   const appends = new Map<string, Food>();
   for (const it of food) {
     const name = it.normalized ?? it.name;
-    const key = foodKey(name);
-    const base = updates.get(key) ?? appends.get(key) ?? foods.get(key) ?? newFood(key, name, '');
+    const { key, chain } = purchaseKey(name, it.store ?? '', it.ownBrand);
+    const base = updates.get(key) ?? appends.get(key) ?? foods.get(key) ?? newFood(key, name, chain);
     const next: Food = {
       ...base,
       kind: it.kind ?? base.kind,
@@ -422,7 +461,8 @@ async function writePurchasesNow(food: ReceiptItem[]): Promise<void> {
     await writeFoods([...updates.values()], [...appends.values()], 'purchase');
   } catch (e) {
     if (e instanceof PartialWriteError && e.updated) {
-      throw new PurchaseWriteError(e.original, food.filter((it) => appends.has(foodKey(it.normalized ?? it.name))));
+      throw new PurchaseWriteError(e.original, food.filter((it) =>
+        appends.has(purchaseKey(it.normalized ?? it.name, it.store ?? '', it.ownBrand).key)));
     }
     throw new PurchaseWriteError(e instanceof PartialWriteError ? e.original : e, food);
   }
@@ -430,8 +470,19 @@ async function writePurchasesNow(food: ReceiptItem[]): Promise<void> {
 
 /** 調べた栄養を保存する（無ければ作る） */
 export async function saveResearched(entries: { query: FoodQuery; result: FoodNutrition; sources: string[] }[]): Promise<void> {
-  if (entries.length === 0) return;
-  const foods = await loadFoods(true);
+  // 外食のメニューは `_menus`、それ以外は `_foods` に入れる
+  const menus = entries.filter((e) => e.query.kind === 'eat_out');
+  const others = entries.filter((e) => e.query.kind !== 'eat_out');
+  if (others.length > 0) await saveResearchedTo(others, await loadFoods(true), SHEET);
+  // メニューは行数が多いので読み直さない（ほかの端末が同じメニューを足していたら同じ鍵の行が増えるが、読むときにまとめる）
+  if (menus.length > 0) await saveResearchedTo(menus, await loadAllMenus(), MENU_SHEET);
+}
+
+async function saveResearchedTo(
+  entries: { query: FoodQuery; result: FoodNutrition; sources: string[] }[],
+  foods: Map<string, Food>,
+  sheet: string,
+): Promise<void> {
   const updates: Food[] = [];
   const appends: Food[] = [];
   for (const { query, result, sources } of entries) {
@@ -451,7 +502,7 @@ export async function saveResearched(entries: { query: FoodQuery; result: FoodNu
     };
     (next.rowIndex > 0 ? updates : appends).push(next);
   }
-  await writeFoods(updates, appends, 'nutrition');
+  await writeFoods(updates, appends, 'nutrition', sheet);
 }
 
 /** パッケージ画像の URL を書く（見つからなかったときは '-'） */
@@ -464,7 +515,8 @@ export async function saveImageUrls(list: { food: Food; imageUrl: string }[]): P
 export async function researchNow(query: FoodQuery): Promise<Food | null> {
   const { results, sources } = await researchFoods([query]);
   await saveResearched([{ query, result: results[0], sources }]);
-  return (await loadFoods(true)).get(foodKey(query.name, query.chain)) ?? null;
+  const table = query.kind === 'eat_out' ? await loadAllMenus() : await loadFoods(true);
+  return table.get(foodKey(query.name, query.chain)) ?? null;
 }
 
 // ─── 空き時間の調査 ───────────────────────────────────────────────────────────

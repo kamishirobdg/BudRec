@@ -80,7 +80,7 @@ async function readPage(url: string): Promise<PageInfo | null> {
 
 /**
  * 画像をまだ探していない品目を少しずつ探す（空き時間に呼ぶ）。探したら true。
- * 外食のメニューは在庫に出ないので対象外。
+ * 外食のメニュー（`_menus`）は在庫に出ないので対象外（`loadFoods` は `_foods` だけを読む）。
  */
 /** この起動中にページを読めなかった品目（同じ品目ばかり試して先に進めなくならないように） */
 const unreachable = new Set<string>();
@@ -88,7 +88,7 @@ const unreachable = new Set<string>();
 export async function fillSomeImages(): Promise<boolean> {
   if (await Demo.isDemo()) return false;
   const foods = [...(await loadFoods(true)).values()]
-    .filter((f) => f.status === 'done' && !f.chain && !f.imageUrl && f.sources.length > 0 && !unreachable.has(f.foodId))
+    .filter((f) => f.status === 'done' && !f.imageUrl && f.sources.length > 0 && !unreachable.has(f.foodId))
     .sort((a, b) => b.purchaseCount - a.purchaseCount)
     .slice(0, PER_RUN);
   if (foods.length === 0) return false;

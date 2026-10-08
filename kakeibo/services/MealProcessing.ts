@@ -19,7 +19,7 @@ import {
   IdentifiedDish, InventoryLine, NutritionQuery, NutritionResult, ReceiptLine, UsedItem,
 } from '../providers/GeminiMeal';
 import { listInventory, remainLabel, consume, InventoryItem } from './InventoryService';
-import { Food, findMenu, foodKey, freshNutrition, loadFoods, saveResearched } from './FoodService';
+import { Food, findFood, findMenu, freshNutrition, loadFoods, loadMenuIndex, saveResearched } from './FoodService';
 import { rowsFromReceipts } from './ReceiptProcessing';
 import * as CategoryService from './CategoryService';
 import {
@@ -290,18 +290,22 @@ export async function recordMeal(
 
   // 栄養: 食品データにあればそれを使い、無いものだけまとめて調べる
   const foods = await loadFoods();
+  // 外食のメニューは行数が多いので、外食の料理があるときだけ読む（読めなければ調べる側に回す）
+  const menuIndex = dishes.some((d, i) => d.kind === 'eat_out' && storeOf(i))
+    ? await loadMenuIndex().catch(() => null)
+    : null;
   const whole: (NutritionResult | null)[] = dishes.map((d, i) => {
     // 家にある商品を食べた（1 品だけ・見分けられている）→ 食品データ × 食べた割合
     if (d.kind === 'packaged' && d.used.length === 1 && d.choices.length === 0) {
       const ref = inventory[d.used[0].index];
-      const food = ref && freshNutrition(foods.get(foodKey(ref.name)));
+      const food = ref && freshNutrition(findFood(foods, ref.name, ref.store));
       const n = food ? nutrientsFromFood(food, ref, d.used[0]) : null;
       if (food && n) return { nutrients: n, official: food.source === 'grounding' };
     }
     if (d.kind !== 'home' && d.used.length === 0) {
       const food = d.kind === 'eat_out' && storeOf(i)
-        ? findMenu(foods, storeOf(i), [nameOf(i), d.name])
-        : freshNutrition(foods.get(foodKey(nameOf(i))));
+        ? (menuIndex ? findMenu(menuIndex, storeOf(i), [nameOf(i), d.name]) : undefined)
+        : freshNutrition(findFood(foods, nameOf(i), linked?.store ?? ''));
       if (food && food.basis === 'package') return { nutrients: food.nutrients, official: food.source === 'grounding' };
     }
     return null;

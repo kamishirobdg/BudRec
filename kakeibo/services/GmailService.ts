@@ -178,7 +178,7 @@ export async function runGmailImport(): Promise<void> {
           items:         data.items,
         };
         await appendRow(row);
-        await recordPurchases(data.items ?? []);
+        await recordPurchases(data.items ?? [], data.store);
         await markGmailMessageProcessed(ref.id, 'ok');
         imported++;
       } catch (e) {

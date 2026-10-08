@@ -81,7 +81,7 @@ export async function saveReceiptRows(rows: ExpenseRow[]): Promise<SaveResult> {
 
   if (saved.length === 0) throw new Error('スプレッドシートに書き込めませんでした');
   // 食品データに購入回数と価格を記録する（栄養は空き時間に調べる）
-  await recordPurchases(saved.flatMap((r) => r.items ?? []));
+  for (const r of saved) await recordPurchases(r.items ?? [], r.store);
   // 一覧の「前回の登録」から後で見直せるようにする。
   // デモ中は appendRow がメモリ上のオーバーレイに積むだけで実データは書かれないが、
   // saved にはマスク前の実データ（店名・金額）が入っているため、

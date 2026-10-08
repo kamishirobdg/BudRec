@@ -12,7 +12,7 @@ import {
 import {
   InventoryItem, keepInStock, listInventory, markUsedUp, remainLabel,
 } from '../services/InventoryService';
-import { researchNow } from '../services/FoodService';
+import { findFood, loadFoods, researchNow } from '../services/FoodService';
 import FoodThumb from '../components/FoodThumb';
 
 const STORAGE_LABEL: Record<string, string> = { chilled: '冷蔵', frozen: '冷凍', ambient: '常温', '': 'その他' };
@@ -67,8 +67,10 @@ export default function InventoryView({ onConfirmCount }: { onConfirmCount?: (n:
   };
 
   const reresearch = (item: InventoryItem) => run(item, async () => {
+    // 店のオリジナル商品はチェーン名と組の鍵で入っているので、同じ鍵で調べ直す
+    const known = findFood(await loadFoods(), item.name, item.store);
     const food = await researchNow({
-      name: item.name, chain: '', kind: item.kind === 'ingredient' ? 'ingredient' : 'packaged', content: item.quantity,
+      name: item.name, chain: known?.chain ?? '', kind: item.kind === 'ingredient' ? 'ingredient' : 'packaged', content: item.quantity,
     });
     Alert.alert(food && Object.values(food.nutrients).some((v) => v !== null) ? '栄養を更新しました' : '見つかりませんでした');
   });
@@ -89,7 +91,7 @@ export default function InventoryView({ onConfirmCount }: { onConfirmCount?: (n:
         return (
           <View style={styles.card}>
             <View style={styles.cardTop}>
-              <FoodThumb name={item.name} />
+              <FoodThumb name={item.name} store={item.store} />
               <Text style={styles.name} numberOfLines={1}>{item.name}</Text>
               <Text style={styles.remain}>{remainLabel(item)}</Text>
             </View>

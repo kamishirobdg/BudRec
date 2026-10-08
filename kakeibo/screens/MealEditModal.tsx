@@ -489,7 +489,7 @@ export default function MealEditModal({ target, onClose, onSaved }: Props) {
                         <View style={styles.chips}>
                           {d.choices.map((c) => (
                             <View key={c.itemId} style={styles.choiceItem}>
-                              <FoodThumb name={c.name} size={32} />
+                              <FoodThumb name={c.name} store={c.store} size={32} />
                               <Chip
                                 small
                                 label={`${c.name}（${c.store} ${c.bought}）`}

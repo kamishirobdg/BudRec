@@ -22,6 +22,7 @@ import {
   TAB_KEYS, TAB_LABELS, TabLayout, getPhotoRetentionDays, getTabLayout, subscribeTabLayout,
 } from './services/PreferencesService';
 import SettingsScreen from './screens/SettingsScreen';
+import { repairHeaders } from './services/HeaderRepair';
 import { cleanupOldPhotos } from './services/PhotoStore';
 import * as OcrWorker from './services/OcrWorker';
 import { registerBackgroundOcr } from './services/BackgroundOcr';
@@ -156,10 +157,13 @@ function AppContent() {
     cleanupSharedPhotos();
     // 保存期間（設定画面。既定は無期限）を過ぎた端末内の写真を消す
     getPhotoRetentionDays().then((days) => cleanupOldPhotos(days)).catch(() => {});
+    // 後から列を足したシートの見出しを補う（起動直後の読み込みと重ならないよう少し待つ）
+    const headerTimer = setTimeout(() => { void repairHeaders(); }, 15_000);
     // 代理入力の相手の候補として、この端末のユーザー名を共有の一覧に載せる
     getCurrentUserRaw()
       .then((name) => registerUser(name))
       .catch((e) => console.warn('[App] ユーザー名を登録できなかった:', e instanceof Error ? e.message : e));
+    return () => clearTimeout(headerTimer);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [signedIn, userNameSet]);
 

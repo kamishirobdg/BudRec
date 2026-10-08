@@ -8,7 +8,7 @@
 
 import { SheetsInternal, ITEMS_RANGE } from './SheetsService';
 import { FoodQuery, FoodNutrition } from '../providers/GeminiMeal';
-import { Food, foodKey, loadFoods, saveResearched } from './FoodService';
+import { Food, foodKey, loadFoods, loadMenuIndex, saveResearched } from './FoodService';
 import { NUTRIENTS, sanitizeNutrients } from './Nutrients';
 import { readJsonArray, removeFile, writeJson } from './jsonFileStore';
 
@@ -109,9 +109,11 @@ async function collectCandidates(): Promise<Candidate[]> {
  * 載せた品目は覚えておき、取り込みのときに答えに無かったものは 30 日載せない。
  */
 export async function buildResearchRequest(): Promise<{ text: string; count: number; remaining: number }> {
-  const [candidates, foods] = await Promise.all([collectCandidates(), loadFoods(true)]);
-  // 外食のメニューは `チェーン名|品名` の鍵で入るので、チェーン名を問わず品名で「調べ済み」を判断する
-  const settled = new Set([...foods.values()].filter((f) => !isDue(f)).map((f) => foodKey(f.name)));
+  const [candidates, foods, menus] = await Promise.all([
+    collectCandidates(), loadFoods(true), loadMenuIndex().then((i) => i.menus).catch(() => new Map<string, Food>()),
+  ]);
+  // 外食のメニュー・店のオリジナル商品は `チェーン名|品名` の鍵で入るので、チェーン名を問わず品名で「調べ済み」を判断する
+  const settled = new Set([...foods.values(), ...menus.values()].filter((f) => !isDue(f)).map((f) => foodKey(f.name)));
   const skipped = new Set(readSkipped().map((s) => s.key));
   const due = candidates.filter((c) => !settled.has(foodKey(c.name)) && !skipped.has(foodKey(c.name)));
   const batch = due.slice(0, PER_REQUEST);

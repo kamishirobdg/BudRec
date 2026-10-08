@@ -23,6 +23,8 @@ export interface ReceiptItem {
   shelfDays?: number;
   /** 入っている個数（6 本入りなら 6）。数えられないものは省略 */
   pieces?:   number;
+  /** 店のオリジナル商品（コンビニ・スーパーの PB、店内調理の弁当・総菜・パン）。食品データの鍵を店ごとに分ける */
+  ownBrand?: boolean;
 }
 
 /**
@@ -133,19 +135,22 @@ function receiptRules(categories: string[]): string {
 ${list}
 
 出力例（レシート 2 枚が写っている画像）:
-{"receipts":[{"store":"セブンイレブン","amount":1280,"date":"2026-04-07","time":"18:42","category":"食費","items":[{"name":"ﾂﾅﾏﾖｵﾆｷﾞﾘ","price":150,"normalized":"ツナマヨおにぎり","quantity":1,"unit":"個","kind":"packaged","storage":"chilled","shelfDays":1,"pieces":1}]},{"store":"マツモトキヨシ","amount":3480,"date":"2026-04-07","time":"19:05","category":"日用品","items":[]}]}`;
+{"receipts":[{"store":"セブンイレブン","amount":1280,"date":"2026-04-07","time":"18:42","category":"食費","items":[{"name":"ﾂﾅﾏﾖｵﾆｷﾞﾘ","price":150,"normalized":"ツナマヨおにぎり","quantity":1,"unit":"個","kind":"packaged","storage":"chilled","shelfDays":1,"pieces":1,"ownBrand":true}]},{"store":"マツモトキヨシ","amount":3480,"date":"2026-04-07","time":"19:05","category":"日用品","items":[]}]}`;
 }
 
 /** 品目の各項目の説明（レシート・メール共通） */
 const ITEM_FIELDS_GUIDE = `各品目の項目:
   - name: レシート・メールの表記そのまま（半角カナや略称も直さない）
   - price: その品目の金額（数値）
-  - normalized: 一般的な品名に直したもの（例: ｺｸｻﾝﾌﾞﾀｺﾏ → 国産豚こま切れ肉）。直せなければ name と同じ
+  - normalized: 一般的な品名に直したもの（例: ｺｸｻﾝﾌﾞﾀｺﾏ → 国産豚こま切れ肉）。直せなければ name と同じ。
+    商品名のある商品（メーカー品・店のオリジナル商品）は商品名を残す（例: ﾌｧﾐﾁｷ → ファミチキ。「からあげ」のような一般名にしない）
   - quantity / unit: 内容量か個数（例: 300 / g、2 / 個、1 / パック）。表記に無ければ省略する。推測しない
   - kind: ingredient（調理に使う食材・調味料）/ packaged（弁当・パン・菓子・飲料・アイスなどそのまま食べる食品）/ non_food（食品以外）
   - storage: 食品の保存のしかた。chilled（冷蔵）/ frozen（冷凍食品・アイス）/ ambient（常温。米・乾物・調味料・缶詰・菓子など）。食品以外は省略
   - shelfDays: 買ってから食べきるまでの目安の日数（例: 肉・魚 3、卵 14、牛乳 7、冷凍食品 60、米 60）。食品以外は省略
-  - pieces: 個数で数えられる商品の入り数（アイス 6 本入りなら 6、ヨーグルト 4 個パックなら 4、1 個売りなら 1）。数えられないもの（肉 300g など）は省略`;
+  - pieces: 個数で数えられる商品の入り数（アイス 6 本入りなら 6、ヨーグルト 4 個パックなら 4、1 個売りなら 1）。数えられないもの（肉 300g など）は省略
+  - ownBrand: その店（チェーン）でしか売っていない商品なら true。コンビニ・スーパーのプライベートブランド（セブンプレミアム、ファミマル、トップバリュなど）、
+    店で作った弁当・おにぎり・サンドイッチ・総菜・パン、店の名前が付いた商品（ファミチキ、からあげクンなど）。メーカーの商品・生鮮食材・食品以外は false`;
 
 /** メール本文用プロンプト（取引でない場合は amount=0 を返させる） */
 export function buildEmailPrompt(categories: string[]): string {
@@ -213,9 +218,10 @@ const RECEIPT_PROPERTIES = {
         storage:    { type: 'STRING', enum: ['chilled', 'frozen', 'ambient'] },
         shelfDays:  { type: 'NUMBER' },
         pieces:     { type: 'NUMBER' },
+        ownBrand:   { type: 'BOOLEAN' },
       },
       required: ['name', 'price'],
-      propertyOrdering: ['name', 'price', 'normalized', 'quantity', 'unit', 'kind', 'storage', 'shelfDays', 'pieces'],
+      propertyOrdering: ['name', 'price', 'normalized', 'quantity', 'unit', 'kind', 'storage', 'shelfDays', 'pieces', 'ownBrand'],
     },
   },
 } as const;
@@ -398,6 +404,7 @@ function toReceiptItem(raw: any): ReceiptItem | null {
     storage:    ['chilled', 'frozen', 'ambient'].includes(storage) ? (storage as ItemStorage) : undefined,
     shelfDays:  Number.isFinite(shelfDays) && shelfDays > 0 ? Math.round(shelfDays) : undefined,
     pieces:     Number.isFinite(pieces) && pieces >= 1 ? Math.round(pieces) : undefined,
+    ownBrand:   raw?.ownBrand === true ? true : undefined,
   };
 }
 
