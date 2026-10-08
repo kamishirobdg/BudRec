@@ -13,7 +13,9 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { setCurrentUser } from '../services/UserService';
-import { RegisteredUser, getDeviceId, listRegisteredUsers, registerUser } from '../services/SheetsService';
+import {
+  RegisteredUser, getDeviceId, getUniqueUsersRaw, listRegisteredUsers, registerUser,
+} from '../services/SheetsService';
 
 interface Props {
   onDone: () => void;
@@ -28,7 +30,8 @@ const ACTIVE_MS = 30 * 24 * 60 * 60 * 1000;
  * 再インストール直後に既定名のままメール取り込みが走って
  * 誤った名義のレコードが作られるのを防ぐ。
  *
- * 共有の一覧（_users）に登録済みの名前をボタンで並べる。この端末が前に使っていた名前は
+ * 共有の一覧（_users）に登録済みの名前と、当月（足りなければ前月）の支出の記録に出てくる名前をボタンで並べる。
+ * この端末が前に使っていた名前は
  * 端末 ID（同じ署名なら再インストールしても変わらない）で分かるので、最初から選んでおく。
  */
 export default function UserSetupScreen({ onDone }: Props) {
@@ -37,13 +40,20 @@ export default function UserSetupScreen({ onDone }: Props) {
   const [loading, setLoading]   = useState(true);
   const [users, setUsers]       = useState<RegisteredUser[]>([]);
   const [deviceId, setDeviceId] = useState('');
+  // 支出の記録に出てくる名前（_users がまだ無い・相手の端末がまだ登録していないときの候補）
+  const [recorded, setRecorded] = useState<string[]>([]);
 
   useEffect(() => {
     (async () => {
       try {
-        const [list, me] = await Promise.all([listRegisteredUsers(), getDeviceId()]);
+        const [list, me, inRecords] = await Promise.all([
+          listRegisteredUsers(),
+          getDeviceId(),
+          getUniqueUsersRaw().catch(() => [] as string[]),
+        ]);
         setUsers(list);
         setDeviceId(me);
+        setRecorded(inRecords);
         const mine = list.find((u) => u.deviceId === me);
         if (mine) setName(mine.name);
       } catch {
@@ -54,7 +64,7 @@ export default function UserSetupScreen({ onDone }: Props) {
     })();
   }, []);
 
-  const names = [...new Set(users.map((u) => u.name))];
+  const names = [...new Set([...users.map((u) => u.name), ...recorded])];
 
   const save = async (value: string) => {
     setSaving(true);
