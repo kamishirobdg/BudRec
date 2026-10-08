@@ -37,8 +37,15 @@ export interface NutrientStatus {
 }
 
 /** 年齢区分（食事摂取基準の成人の区分） */
-export function ageGroup(birthYear: number, now: Date = new Date()): string {
-  const age = now.getFullYear() - birthYear;
+/** 満年齢（birthDate は 'YYYY-MM-DD'） */
+export function ageOf(birthDate: string, now: Date = new Date()): number {
+  const [y, m, d] = birthDate.split('-').map(Number);
+  const beforeBirthday = now.getMonth() + 1 < m || (now.getMonth() + 1 === m && now.getDate() < d);
+  return now.getFullYear() - y - (beforeBirthday ? 1 : 0);
+}
+
+export function ageGroup(birthDate: string, now: Date = new Date()): string {
+  const age = ageOf(birthDate, now);
   if (age < 30) return '18-29';
   if (age < 50) return '30-49';
   if (age < 65) return '50-64';
@@ -60,11 +67,11 @@ function fmt(n: number): string {
 }
 
 function driFor(key: string, prefs: NutritionPrefs, now: Date): DriValue | undefined {
-  const { birthYear, sex, activity } = prefs.profile;
-  if (!birthYear || !sex) return undefined;
+  const { birthDate, sex, activity } = prefs.profile;
+  if (!birthDate || !sex) return undefined;
   const table = DRI_2025[key];
   if (!table) return undefined;
-  const group = ageGroup(birthYear, now);
+  const group = ageGroup(birthDate, now);
   // 75 歳以上の「高い」は表に無いので「ふつう」に寄せる
   return key === 'ENERC_KCAL'
     ? table[`${sex}|${group}|${activity}`] ?? table[`${sex}|${group}|II`]
@@ -151,7 +158,7 @@ export function judgeDay(totals: Record<string, number | null>, prefs: Nutrition
 
 /** プロフィールが入っているか（入っていなければ、自分の目標の分しか判定できない） */
 export function hasProfile(prefs: NutritionPrefs): boolean {
-  return !!prefs.profile.birthYear && !!prefs.profile.sex;
+  return !!prefs.profile.birthDate && !!prefs.profile.sex;
 }
 
 /**

@@ -5,7 +5,7 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { NUTRIENTS } from '../services/Nutrients';
-import { Activity, NutritionPrefs, Sex, savePrefs } from '../services/NutritionPrefsService';
+import { Activity, NutritionPrefs, Sex, normalizeBirthDate, savePrefs } from '../services/NutritionPrefsService';
 
 const ACTIVITY_LABEL: Record<Activity, string> = { I: '低い', II: 'ふつう', III: '高い' };
 
@@ -21,7 +21,7 @@ interface Props {
 export default function NutritionPrefsModal({ user, prefs, onClose, onSaved }: Props) {
   const [visible, setVisible] = useState<string[]>(prefs.visible);
   const [targets, setTargets] = useState<Record<string, string>>({});
-  const [birthYear, setBirthYear] = useState('');
+  const [birthDate, setBirthDate] = useState('');
   const [sex, setSex]             = useState<Sex | null>(null);
   const [activity, setActivity]   = useState<Activity>('II');
   const [saving, setSaving]   = useState(false);
@@ -31,7 +31,7 @@ export default function NutritionPrefsModal({ user, prefs, onClose, onSaved }: P
     if (!user) return;
     setVisible(prefs.visible);
     setTargets(Object.fromEntries(Object.entries(prefs.targets).map(([k, v]) => [k, String(v)])));
-    setBirthYear(prefs.profile.birthYear ? String(prefs.profile.birthYear) : '');
+    setBirthDate(prefs.profile.birthDate ? prefs.profile.birthDate.replace(/-/g, '/') : '');
     setSex(prefs.profile.sex);
     setActivity(prefs.profile.activity);
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -52,16 +52,15 @@ export default function NutritionPrefsModal({ user, prefs, onClose, onSaved }: P
       if (v.trim() !== '' && Number.isFinite(n) && n > 0) parsed[k] = n;
     }
     // 表示の順番は栄養素の定義順にそろえる
-    const y = Number(birthYear.trim());
-    const year = Number.isInteger(y) && y > 1900 && y <= new Date().getFullYear() ? y : null;
-    if (birthYear.trim() !== '' && year === null) {
-      Alert.alert('生まれた年を西暦 4 桁で入れてください');
+    const date = normalizeBirthDate(birthDate);
+    if (birthDate.trim() !== '' && date === null) {
+      Alert.alert('生年月日を「1990/4/15」の形で入れてください');
       return;
     }
     const next: NutritionPrefs = {
       visible: NUTRIENTS.map((n) => n.key).filter((k) => visible.includes(k)),
       targets: parsed,
-      profile: { birthYear: year, sex, activity },
+      profile: { birthDate: date, sex, activity },
     };
     setSaving(true);
     try {
@@ -91,14 +90,14 @@ export default function NutritionPrefsModal({ user, prefs, onClose, onSaved }: P
                 {/* 食事摂取基準の値を選ぶのに使う */}
                 <View style={styles.profile}>
                   <View style={styles.profileRow}>
-                    <Text style={styles.profileLabel}>生まれた年</Text>
+                    <Text style={styles.profileLabel}>生年月日</Text>
                     <TextInput
                       style={styles.yearInput}
-                      value={birthYear}
-                      onChangeText={setBirthYear}
-                      keyboardType="number-pad"
-                      placeholder="1990"
-                      maxLength={4}
+                      value={birthDate}
+                      onChangeText={setBirthDate}
+                      keyboardType="numbers-and-punctuation"
+                      placeholder="1990/4/15"
+                      maxLength={10}
                     />
                   </View>
                   <View style={styles.profileRow}>
@@ -171,7 +170,7 @@ const styles = StyleSheet.create({
   profileRow:   { flexDirection: 'row', alignItems: 'center', gap: 8 },
   profileLabel: { width: 80, fontSize: 13, color: '#374151' },
   yearInput: {
-    width: 80, fontSize: 14, borderWidth: 1, borderColor: '#e5e7eb', borderRadius: 8,
+    width: 120, fontSize: 14, borderWidth: 1, borderColor: '#e5e7eb', borderRadius: 8,
     paddingHorizontal: 8, paddingVertical: 4, color: '#1f2937',
   },
   chip:           { paddingHorizontal: 12, paddingVertical: 4, borderRadius: 14, borderWidth: 1, borderColor: '#d1d5db', backgroundColor: '#fff' },

@@ -62,7 +62,7 @@ export default function DayView(props: Props) {
   return (
     <ScrollView contentContainerStyle={styles.body} refreshControl={<RefreshControl refreshing={loading} onRefresh={onRefresh} />}>
       {!hasProfile(prefs) && (
-        <Text style={styles.notice}>「表示」で生まれた年と性別を入れると、食事摂取基準で過不足を判定します</Text>
+        <Text style={styles.notice}>「表示」で生年月日と性別を入れると、食事摂取基準で過不足を判定します</Text>
       )}
 
       <View style={styles.card}>

@@ -3,7 +3,7 @@
  * 両方の端末で同じ設定にするため共有シートに置く。仕様は docs/meal-nutrition-spec.md §3.6。
  *
  * | user | visible（栄養素キーの JSON 配列） | targets（{"ENERC_KCAL": 2000, ...}。任意） |
- * | birth_year | sex（male / female） | activity（I / II / III。身体活動レベル） |
+ * | birth_date（YYYY-MM-DD）| sex（male / female） | activity（I / II / III。身体活動レベル） |
  *
  * 生年・性別・活動レベルから、食事摂取基準の値（年齢区分）を決める（§11）。
  */
@@ -13,13 +13,14 @@ import { DEFAULT_VISIBLE, NUTRIENT_KEYS } from './Nutrients';
 import * as Demo from './DemoService';
 
 const SHEET = '_nutrition_prefs';
-export const NUTRITION_PREFS_HEADER = ['user', 'visible', 'targets', 'birth_year', 'sex', 'activity'];
+export const NUTRITION_PREFS_HEADER = ['user', 'visible', 'targets', 'birth_date', 'sex', 'activity'];
 
 export type Sex = 'male' | 'female';
 export type Activity = 'I' | 'II' | 'III';
 
 export interface NutritionProfile {
-  birthYear: number | null;
+  /** 'YYYY-MM-DD' */
+  birthDate: string | null;
   sex:       Sex | null;
   activity:  Activity;
 }
@@ -31,13 +32,27 @@ export interface NutritionPrefs {
   profile: NutritionProfile;
 }
 
-export const DEFAULT_PROFILE: NutritionProfile = { birthYear: null, sex: null, activity: 'II' };
+export const DEFAULT_PROFILE: NutritionProfile = { birthDate: null, sex: null, activity: 'II' };
+
+/**
+ * 生年月日を 'YYYY-MM-DD' に揃える（「1990/4/15」「1990年4月15日」「19900415」も受ける）。実在しない日付は null。
+ * Hermes で日付文字列を new Date に渡さない
+ */
+export function normalizeBirthDate(input: unknown): string | null {
+  const s = String(input ?? '').trim();
+  const m = s.match(/^(\d{4})[\/\-年.]?(\d{1,2})[\/\-月.]?(\d{1,2})日?$/);
+  if (!m) return null;
+  const [y, mo, d] = [+m[1], +m[2], +m[3]];
+  const date = new Date(y, mo - 1, d);
+  if (date.getFullYear() !== y || date.getMonth() !== mo - 1 || date.getDate() !== d) return null;
+  if (y < 1900 || date.getTime() > Date.now()) return null;
+  return `${y}-${String(mo).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+}
 export const DEFAULT_PREFS: NutritionPrefs = { visible: [...DEFAULT_VISIBLE], targets: {}, profile: DEFAULT_PROFILE };
 
-function parseProfile(birthYear: unknown, sex: unknown, activity: unknown): NutritionProfile {
-  const y = Number(birthYear);
+function parseProfile(birthDate: unknown, sex: unknown, activity: unknown): NutritionProfile {
   return {
-    birthYear: Number.isInteger(y) && y > 1900 && y < 2100 ? y : null,
+    birthDate: normalizeBirthDate(birthDate),
     sex: sex === 'male' || sex === 'female' ? sex : null,
     activity: activity === 'I' || activity === 'III' ? activity : 'II',
   };
@@ -94,8 +109,14 @@ export async function savePrefs(user: string, prefs: NutritionPrefs): Promise<vo
   rows.forEach((c, i) => { if (i > 0 && c[0] === user) index = i; });
   const p = prefs.profile;
   const values = [[
-    user, JSON.stringify(prefs.visible), JSON.stringify(prefs.targets), p.birthYear ?? '', p.sex ?? '', p.activity,
+    user, JSON.stringify(prefs.visible), JSON.stringify(prefs.targets), p.birthDate ?? '', p.sex ?? '', p.activity,
   ]];
+  // 見出しを今の列に合わせる（生年 birth_year だった頃のシートも生年月日の見出しにする）
+  await client.put(
+    `/values/${encodeURIComponent(SHEET)}!A1:F1`,
+    { values: [NUTRITION_PREFS_HEADER] },
+    { params: { valueInputOption: 'RAW' } },
+  );
   if (index > 0) {
     await client.put(
       `/values/${encodeURIComponent(SHEET)}!A${index + 1}:F${index + 1}`,
