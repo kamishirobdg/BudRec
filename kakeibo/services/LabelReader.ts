@@ -16,6 +16,12 @@ export interface NutritionLabel {
   basis:     'piece' | 'package' | 'per100g';
   /** 内容量（「45g」「6 本」など。読めなければ空） */
   content:   string;
+  /** 内容量の重さ（g。個包装込みの総量でなく中身の量。読めなければ null） */
+  packageGrams:     number | null;
+  /** 1 袋に入っている数（「標準 20 粒」「12 枚入り」など。書いていなければ null） */
+  piecesPerPackage: number | null;
+  /** 表示の単位の重さ（「1 袋（45g）あたり」なら 45、「100g あたり」なら 100。分からなければ null） */
+  unitGrams:        number | null;
   /** 表示の単位あたりの栄養 */
   nutrients: Nutrients;
 }
@@ -27,6 +33,9 @@ const SCHEMA = {
     unitLabel: { type: 'STRING' },
     basis:     { type: 'STRING', enum: ['piece', 'package', 'per100g'] },
     content:   { type: 'STRING' },
+    packageGrams:     { type: 'NUMBER' },
+    piecesPerPackage: { type: 'NUMBER' },
+    unitGrams:        { type: 'NUMBER' },
     nutrients: {
       type: 'OBJECT',
       properties: Object.fromEntries(NUTRIENTS.map((n) => [n.key, { type: 'NUMBER' }])),
@@ -45,6 +54,9 @@ export async function readNutritionLabel(imageBase64: string, signal?: AbortSign
   包装の中にいくつか入っていて、その 1 つ分（5 食入りの 1 食、6 本入りの 1 本、「1 食分（40g）あたり」など）なら piece。
   「100g・100ml あたり」なら per100g
 - content: 内容量（「45g」「6 本」など。書いていなければ空）
+- packageGrams: 内容量の重さ（g）。書いていなければ省略
+- piecesPerPackage: 1 袋に入っている数（「標準 20 粒」「12 枚入り」「個包装 8 袋」など）。書いていなければ省略（推測しない）
+- unitGrams: 表示の単位の重さ（g）。「1 袋（45g）あたり」なら 45、「100g あたり」なら 100、「1 粒（4g）あたり」なら 4。書いていなければ省略
 - nutrients: 表示の単位あたりの値。キーは次のとおりで、表示に無いものは省く:
 ${list}
 「熱量」「エネルギー」は ENERC_KCAL、「食塩相当量」は NACL_EQ、「炭水化物」は CHOCDF-、「糖質」は CHOAVLDF-。
@@ -57,7 +69,11 @@ ${list}
   const nutrients = sanitizeNutrients(parsed.nutrients);
   if (!Object.values(nutrients).some((v) => v !== null)) throw new Error('栄養成分表示を読めませんでした');
   const basis = parsed.basis === 'per100g' ? 'per100g' : parsed.basis === 'piece' ? 'piece' : 'package';
+  const pos = (v: unknown) => (Number(v) > 0 ? Number(v) : null);
   return {
+    packageGrams: pos(parsed.packageGrams) ?? (Number(String(parsed.content ?? '').match(/(\d+(?:\.\d+)?)\s*g/i)?.[1]) || null),
+    piecesPerPackage: pos(parsed.piecesPerPackage),
+    unitGrams: basis === 'per100g' ? 100 : pos(parsed.unitGrams),
     name: String(parsed.name ?? '').trim(),
     unitLabel: String(parsed.unitLabel ?? '').trim() || (basis === 'per100g' ? '100g あたり' : '1 個あたり'),
     basis,
