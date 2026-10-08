@@ -15,6 +15,7 @@ import { File, Directory, Paths } from 'expo-file-system';
 import { manipulateAsync, SaveFormat } from 'expo-image-manipulator';
 import { SheetsInternal, newEntryId } from './SheetsService';
 import { localUri, receiptPhotoRef } from './PhotoStore';
+import { isMealShared } from './MealService';
 import type { MealRow } from './MealService';
 import * as Demo from './DemoService';
 
@@ -142,7 +143,8 @@ async function upload(p: {
 export async function ensureMealShared(rows: MealRow[], sharedBy: string): Promise<void> {
   try {
     if (rows.length === 0 || (await Demo.isDemo())) return;
-    if (new Set(rows.filter((r) => !r.deleted).map((r) => r.user)).size < 2) return;
+    // 共有する食事（二人で食べた・編集画面で共有にした）だけ相手に写真を見せる
+    if (!isMealShared(rows.filter((r) => !r.deleted))) return;
     const mealId = rows[0].mealId;
     const shared = await listShared();
     const already = new Set(shared.filter((s) => s.mealId === mealId).map((s) => s.sourceRef));

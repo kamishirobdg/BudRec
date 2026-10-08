@@ -227,7 +227,6 @@ export default function SummaryScreen({ onSignedOut }: Props) {
   }, []);
 
   const loadRows = useCallback(async (range: RangeSpec) => {
-    setLoading(true);
     // ユーザー名・デモ設定は端末ローカル読み出しのみ（通信不要）。
     // Sheets 側が落ちていてもここは常に反映しておく（オフラインキャッシュの絞り込みに使うため）
     let isDemo = false;
@@ -239,6 +238,11 @@ export default function SummaryScreen({ onSignedOut }: Props) {
     } catch (e) {
       console.error('[SummaryScreen] ローカル設定の読み込み失敗:', e);
     }
+    // 前に読めた内容が端末にあれば先に出し、通信が終わったら差し替える（待たせない）。
+    // 編集は書く前に行の rev を確かめるので、古い内容から操作しても上書き事故にはならない
+    const early = isDemo ? null : RowsCache.get(range);
+    if (early) setRows(early.rows);
+    setLoading(!early);
     try {
       const [list, partial] = await Promise.all([
         getRowsForRange(range),

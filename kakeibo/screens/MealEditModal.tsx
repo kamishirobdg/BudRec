@@ -7,6 +7,7 @@ import {
   Modal,
   ScrollView,
   StyleSheet,
+  Switch,
   Text,
   TextInput,
   TouchableOpacity,
@@ -122,6 +123,8 @@ export default function MealEditModal({ target, onClose, onSaved }: Props) {
   const [partner, setPartner] = useState<string | null>(null);
   const [newDish, setNewDish] = useState('');
   const [history, setHistory] = useState<HistoryEntry[] | null>(null);
+  // 「相手と共有」を触ったときの値（null = 触っていない。二人で食べた食事なら共有）
+  const [sharedFlag, setSharedFlag] = useState<boolean | null>(null);
 
   const isNewMeal = target?.mode === 'new';
   const sheetName = target?.mode === 'edit' ? target.sheetName : null;
@@ -138,6 +141,7 @@ export default function MealEditModal({ target, onClose, onSaved }: Props) {
       setLoading(true);
       setHistory(null);
       setNewDish('');
+      setSharedFlag(null);
       try {
         const user = await getCurrentUser();
         const others = (await getUniqueUsers()).filter((u) => u !== user);
@@ -173,7 +177,12 @@ export default function MealEditModal({ target, onClose, onSaved }: Props) {
     : epochToTimestamp(target.shotAt);
   const photoRefs = [...new Set(loaded.flatMap((r) => r.photoRefs))];
   const entryIds = [...new Set(loaded.map((r) => r.entryId).filter(Boolean))];
+  // 共有の既定: 前に決めた値があればそれ、無ければ食べた人が 2 人以上なら共有
+  const autoShared = loaded.find((r) => r.shared !== undefined)?.shared
+    ?? new Set(drafts.flatMap((d) => d.eaters.map((e) => e.user))).size > 1;
+  const shared = sharedFlag ?? autoShared;
   const changed =
+    (sharedFlag !== null && sharedFlag !== autoShared) ||
     drafts.length !== toDrafts(loaded).length ||
     drafts.some((d) => d.isNew || d.refreshed || d.chosen !== null || d.dish.trim() !== d.originalDish
       || eatersKey(d.eaters) !== eatersKey(d.originalEaters));
@@ -232,6 +241,8 @@ export default function MealEditModal({ target, onClose, onSaved }: Props) {
         status: resolved.choices.length > 0 ? 'needs_review' : 'edited', assignedBy: manual ? 'manual' : d.assignedBy,
         photoRefs: photoRef ? [photoRef] : photoRefs, rev: 0, sources: d.sources, updatedBy: me, updatedAt: '',
         choices: resolved.choices,
+        // 触っていなければ前の値のまま（未設定なら食べた人の数で決まる）
+        shared: sharedFlag ?? loaded.find((r) => r.shared !== undefined)?.shared,
       }));
     });
 
@@ -467,6 +478,17 @@ export default function MealEditModal({ target, onClose, onSaved }: Props) {
                 {eatenAt}{loaded[0]?.store ? `　${loaded[0].store}` : ''}
               </Text>
               {needsReview && <Text style={styles.reviewNote}>内容を確認して保存してください</Text>}
+              {partner && (
+                <View style={styles.shareRow}>
+                  <Text style={styles.shareLabel}>{partner} と共有</Text>
+                  <Switch
+                    value={shared}
+                    onValueChange={(v) => setSharedFlag(v)}
+                    trackColor={{ false: '#ccc', true: '#a5d6a7' }}
+                    thumbColor={shared ? '#2e7d32' : '#f4f3f4'}
+                  />
+                </View>
+              )}
 
               {drafts.map((d) => {
                 const shared = d.eaters.length > 1;
@@ -682,6 +704,8 @@ const styles = StyleSheet.create({
   ratioLegend:    { fontSize: 12, color: '#6b7280' },
   choiceBox:      { gap: 6, backgroundColor: '#fffbeb', borderRadius: 10, padding: 10 },
   choiceTitle:    { fontSize: 13, color: '#b45309', fontWeight: '700' },
+  shareRow:       { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', backgroundColor: '#fff', borderRadius: 12, paddingHorizontal: 12, paddingVertical: 4 },
+  shareLabel:     { fontSize: 14, color: '#1f2937' },
   choiceItem:     { flexDirection: 'row', alignItems: 'center', gap: 4 },
   reresearch:     { fontSize: 12, color: '#2563eb', fontWeight: '600' },
   addRow:    { flexDirection: 'row', gap: 8 },

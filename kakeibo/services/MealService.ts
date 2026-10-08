@@ -65,6 +65,11 @@ export interface MealRow {
   updatedAt:      string;
   /** 在庫のどれか見分けられなかったときの候補。選ばれるまで在庫の残りは減らさない */
   choices:        ItemChoice[];
+  /**
+   * 相手の端末にも見せるか（食事単位。全部の行に同じ値を入れる）。未設定は「二人で食べた食事なら共有」。
+   * スプレッドシート自体は二人で共有しているので、アプリ上の見え方の区別
+   */
+  shared?:        boolean;
   deleted?:       boolean;
   rowIndex?:      number;
   sheetName?:     string;
@@ -73,9 +78,9 @@ export interface MealRow {
 export const MEALS_HEADER = [
   'meal_id', 'dish_id', 'eaten_at', 'user', 'kind', 'store', 'dish', 'portion', 'nutrients',
   'nutrient_source', 'confidence', 'entry_id', 'item_refs', 'status', 'assigned_by', 'photo_refs',
-  'rev', 'sources', 'updated_by', 'updated_at', 'deleted', 'choices',
+  'rev', 'sources', 'updated_by', 'updated_at', 'deleted', 'choices', 'shared',
 ];
-const MEALS_RANGE = 'A:V';
+const MEALS_RANGE = 'A:W';
 
 const HISTORY_SHEET = '_history';
 
@@ -106,6 +111,7 @@ function toCells(r: MealRow): (string | number)[] {
     JSON.stringify(r.itemRefs), r.status, r.assignedBy, JSON.stringify(r.photoRefs),
     r.rev, JSON.stringify(r.sources), r.updatedBy, r.updatedAt, r.deleted ? 'TRUE' : 'FALSE',
     JSON.stringify(r.choices ?? []),
+    r.shared === undefined ? '' : r.shared ? 'TRUE' : 'FALSE',
   ];
 }
 
@@ -143,6 +149,7 @@ function fromCells(c: string[], rowIndex: number, sheetName: string): MealRow {
     updatedAt:      c[19] ?? '',
     deleted:        (c[20] ?? '').toString().toUpperCase() === 'TRUE',
     choices:        parseJsonCell<ItemChoice[]>(c[21], []),
+    shared:         c[22] === undefined || c[22] === '' ? undefined : String(c[22]).toUpperCase() === 'TRUE',
     rowIndex,
     sheetName,
   };
@@ -176,6 +183,13 @@ export async function mealExists(sheetName: string, mealId: string): Promise<boo
     q.op.kind === 'appendRaw' && q.op.sheetName === sheetName && q.op.rows.some((r) => r[0] === mealId));
   if (queued) return true;
   return (await getMeal(sheetName, mealId)).length > 0;
+}
+
+/** 相手の端末にも見せる食事か（印が無ければ、二人で食べた食事なら共有） */
+export function isMealShared(rows: MealRow[]): boolean {
+  const flag = rows.find((r) => r.shared !== undefined)?.shared;
+  if (flag !== undefined) return flag;
+  return new Set(rows.map((r) => r.user)).size > 1;
 }
 
 export function mealRev(rows: MealRow[]): number {
@@ -245,7 +259,7 @@ export async function saveMeal(
     const row: MealRow = { ...r, mealId, rev, updatedBy: savedBy, updatedAt: now, deleted: false };
     const existing = currentByKey.get(keyOf(r));
     if (existing?.rowIndex) {
-      updates.push({ range: `'${sheetName}'!A${existing.rowIndex}:V${existing.rowIndex}`, values: [toCells(row)] });
+      updates.push({ range: `'${sheetName}'!A${existing.rowIndex}:W${existing.rowIndex}`, values: [toCells(row)] });
       saved.push({ ...row, rowIndex: existing.rowIndex, sheetName });
     } else {
       appends.push(toCells(row));
@@ -256,7 +270,7 @@ export async function saveMeal(
   for (const r of current) {
     if (nextKeys.has(keyOf(r)) || !r.rowIndex) continue;
     const row: MealRow = { ...r, rev, updatedBy: savedBy, updatedAt: now, deleted: true };
-    updates.push({ range: `'${sheetName}'!A${r.rowIndex}:V${r.rowIndex}`, values: [toCells(row)] });
+    updates.push({ range: `'${sheetName}'!A${r.rowIndex}:W${r.rowIndex}`, values: [toCells(row)] });
   }
 
   if (updates.length > 0) {

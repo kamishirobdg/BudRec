@@ -1,187 +1,185 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import {
-  ActivityIndicator,
-  Alert,
-  RefreshControl,
-  SectionList,
-  StyleSheet,
-  Text,
-  TouchableOpacity,
-  View,
-} from 'react-native';
-import { getMeals, MealRow } from '../services/MealService';
-import { NutrientTotal, nutrientDef, sumNutrients } from '../services/Nutrients';
-import { DEFAULT_PREFS, NutritionPrefs, loadPrefs } from '../services/NutritionPrefsService';
-import NutritionPrefsModal from './NutritionPrefsModal';
+import { Alert, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import { getMeals, isMealShared, MealRow } from '../services/MealService';
+import { sumNutrients } from '../services/Nutrients';
 import { getCurrentUser } from '../services/UserService';
-import { getUniqueUsers } from '../services/SheetsService';
 import * as OcrWorker from '../services/OcrWorker';
 import * as ReceiptQueue from '../services/ReceiptQueueService';
+import { DEFAULT_PREFS, NutritionPrefs, loadPrefs } from '../services/NutritionPrefsService';
+import { NutrientStatus, dayOf, judgeDay, shiftDay, today } from '../services/NutritionJudge';
+import {
+  Supplement, SupplementSkip, loadSupplements, setSkipped, supplementNutrients, supplementsOn,
+} from '../services/SupplementService';
+import { cachedLoad } from '../services/LocalCache';
 import MealEditModal, { MealTarget } from './MealEditModal';
+import NutritionPrefsModal from './NutritionPrefsModal';
+import SupplementsModal from './SupplementsModal';
 import InventoryView from './InventoryView';
+import DayView, { MealGroup } from './nutrition/DayView';
+import TrendView from './nutrition/TrendView';
 
-function pad(n: number): string {
-  return String(n).padStart(2, '0');
+type View_ = 'day' | 'trend' | 'stock';
+
+const WEEKDAY = ['日', '月', '火', '水', '木', '金', '土'];
+
+function monthOfDay(day: string): string {
+  return day.slice(0, 7);
 }
 
-function monthOf(d: Date): string {
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}`;
-}
-
-function shiftMonth(ym: string, delta: number): string {
-  const [y, m] = ym.split('-').map(Number);
-  return monthOf(new Date(y, m - 1 + delta, 1));
-}
-
-type Period = 'day' | 'week' | 'month';
-const PERIOD_LABEL: Record<Period, string> = { day: '日', week: '週', month: '月' };
-
-/** 'YYYY/MM/DD …' / 'YYYY-MM-DD …' の日付部分（Hermes では new Date に文字列を渡さない） */
-function dayOf(ts: string): Date {
-  const m = ts.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})/);
-  return m ? new Date(+m[1], +m[2] - 1, +m[3]) : new Date(0);
-}
-
-function md(d: Date): string {
-  return `${d.getMonth() + 1}/${d.getDate()}`;
+function dayLabel(day: string): string {
+  const [y, m, d] = day.split('-').map(Number);
+  return `${m}/${d}（${WEEKDAY[new Date(y, m - 1, d).getDay()]}）`;
 }
 
 /**
- * 期間の見出しと並び順の鍵。週は月曜始まり。一覧は 1 か月ずつ読むので、月をまたぐ週は
- * 表示中の月の分だけになる。見出しもその範囲に合わせる（「10/1〜10/5」）
+ * 「食事」タブ。1 日ごとに自分の栄養を見る（食事摂取基準での過不足・サプリを含む）。
+ * 出すのは自分が食べた食事と、相手と共有された食事だけ。仕様は docs/meal-nutrition-spec.md §11。
+ *
+ * 表示を待たせないよう、前に読めた内容（端末の控え）をすぐ出し、通信が終わったら差し替える。
  */
-function periodOf(ts: string, period: Period): { key: string; title: string } {
-  const d = dayOf(ts);
-  if (period === 'month') return { key: monthOf(d), title: `${d.getFullYear()}年${d.getMonth() + 1}月` };
-  if (period === 'week') {
-    const mon = new Date(d.getFullYear(), d.getMonth(), d.getDate() - ((d.getDay() + 6) % 7));
-    const sun = new Date(mon.getFullYear(), mon.getMonth(), mon.getDate() + 6);
-    const first = new Date(d.getFullYear(), d.getMonth(), 1);
-    const last = new Date(d.getFullYear(), d.getMonth() + 1, 0);
-    const from = mon < first ? first : mon;
-    const to = sun > last ? last : sun;
-    return { key: `${monthOf(from)}-${pad(from.getDate())}`, title: `${md(from)}〜${md(to)}` };
-  }
-  return { key: `${monthOf(d)}-${pad(d.getDate())}`, title: ts.slice(0, 10) };
-}
-
-/** 見出しの栄養の表示。週・月は 1 日あたりの平均にして目標と比べる */
-function totalsLabel(totals: Record<string, NutrientTotal>, prefs: NutritionPrefs, days: number, period: Period): string {
-  const parts = prefs.visible.map((k) => {
-    const t = totals[k];
-    const def = nutrientDef(k);
-    if (!t || !def) return null;
-    const v = Math.round((t.value / (period === 'day' ? 1 : Math.max(1, days))) * 10) / 10;
-    const target = prefs.targets[k];
-    return `${def.label} ${v}${target ? `/${target}` : ''}${def.unit}${t.partial ? '+' : ''}`;
-  }).filter(Boolean);
-  return (period === 'day' ? '' : `1日平均（${days}日）　`) + parts.join('　');
-}
-
-interface MealGroup {
-  mealId:    string;
-  sheetName: string;
-  eatenAt:   string;
-  store:     string;
-  rows:      MealRow[];
-}
-
-/** 食事の一覧。日ごとに、選んだ人の栄養の合計を出す */
 export default function MealsScreen() {
-  const [month, setMonth]       = useState(monthOf(new Date()));
-  const [rows, setRows]         = useState<MealRow[]>([]);
-  const [loading, setLoading]   = useState(false);
-  const [person, setPerson]     = useState('');
-  const [people, setPeople]     = useState<string[]>([]);
-  const [target, setTarget]     = useState<MealTarget | null>(null);
-  const [deferred, setDeferred] = useState(0);
-  const [view, setView]         = useState<'meals' | 'stock'>('meals');
-  // 「食べきりましたか？」の数（在庫タブの見出しに出す）
-  const [confirmCount, setConfirmCount] = useState(0);
-  const [period, setPeriod]     = useState<Period>('day');
+  const [view, setView]         = useState<View_>('day');
+  const [day, setDay]           = useState(today());
+  const [span, setSpan]         = useState<7 | 30>(7);
+  const [me, setMe]             = useState('');
+  const [mealsByMonth, setMealsByMonth] = useState<Record<string, MealRow[]>>({});
   const [prefsMap, setPrefsMap] = useState<Map<string, NutritionPrefs>>(new Map());
-  const [prefsUser, setPrefsUser] = useState<string | null>(null);
   // 一度も読めていないうちに設定を開くと、既定の内容で保存して目標値を消してしまうので開かせない
   const [prefsReady, setPrefsReady] = useState(false);
-  const prefs = prefsMap.get(person) ?? DEFAULT_PREFS;
+  const [sups, setSups]         = useState<{ supplements: Supplement[]; skips: SupplementSkip[] }>({ supplements: [], skips: [] });
+  const [loading, setLoading]   = useState(false);
+  const [target, setTarget]     = useState<MealTarget | null>(null);
+  const [prefsOpen, setPrefsOpen] = useState(false);
+  const [supsOpen, setSupsOpen]   = useState(false);
+  const [deferred, setDeferred] = useState(0);
+  const [confirmCount, setConfirmCount] = useState(0);
+  const prefs = prefsMap.get(me) ?? DEFAULT_PREFS;
 
-  // 月を素早く切り替えたとき、前の月の遅れて返った結果で上書きしない
+  // 見ている日（と推移の期間）に要る月。朝 4 時区切りなので、翌月 1 日の深夜の食事は前の月の最後の日に入る
+  const months = useMemo(() => {
+    const from = view === 'trend' ? shiftDay(day, -(span - 1)) : day;
+    const set = new Set<string>();
+    for (let d = from; d <= shiftDay(day, 1); d = shiftDay(d, 1)) set.add(monthOfDay(d));
+    return [...set];
+  }, [day, span, view]);
+
+  const loadMonths = useCallback(async (list: string[]) => {
+    await Promise.all(list.map((m) => cachedLoad(`meals_${m}`, () => getMeals(m), (cached) => {
+      setMealsByMonth((prev) => (prev[m] ? prev : { ...prev, [m]: cached }));
+    }).then((fresh) => setMealsByMonth((prev) => ({ ...prev, [m]: fresh })))));
+  }, []);
+
+  // 引き下げて読み直すときは、そのとき見ている月を読む
+  const monthsRef = useRef(months);
+  monthsRef.current = months;
   const requestSeq = useRef(0);
-  const load = useCallback(async () => {
+  const loadAll = useCallback(async () => {
     const seq = ++requestSeq.current;
     setLoading(true);
     try {
-      const [me, users, meals, prefsLoaded] = await Promise.all([
-        getCurrentUser(), getUniqueUsers(), getMeals(month),
-        // 表示設定が読めなくても一覧は出す（前に読めた設定はそのまま使う）
-        loadPrefs().catch(() => null),
+      const user = await getCurrentUser();
+      setMe(user);
+      await Promise.all([
+        cachedLoad('nutrition_prefs', async () => [...(await loadPrefs()).entries()], (entries) => setPrefsMap(new Map(entries)))
+          .then((entries) => { setPrefsMap(new Map(entries)); setPrefsReady(true); }),
+        cachedLoad('supplements', loadSupplements, setSups).then(setSups),
+        loadMonths(monthsRef.current),
       ]);
-      if (seq !== requestSeq.current) return;
-      if (prefsLoaded) {
-        setPrefsMap(prefsLoaded);
-        setPrefsReady(true);
-      }
-      setPeople([me, ...users.filter((u) => u !== me)]);
-      setPerson((p) => p || me);
-      setRows(meals);
     } catch (e) {
-      Alert.alert('読み込み失敗', e instanceof Error ? e.message : String(e));
+      if (seq === requestSeq.current) Alert.alert('読み込み失敗', e instanceof Error ? e.message : String(e));
     } finally {
-      setLoading(false);
+      if (seq === requestSeq.current) setLoading(false);
     }
-  }, [month]);
+  }, [loadMonths]);
 
-  useEffect(() => { load(); }, [load]);
+  useEffect(() => { loadAll(); }, [loadAll]);
+  // 日付・期間を変えたら、足りない月だけ読む
+  useEffect(() => {
+    const missing = months.filter((m) => !mealsByMonth[m]);
+    if (missing.length > 0) loadMonths(missing).catch(() => {});
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [months]);
 
-  // 推定待ちの食事の数（無料枠切れで後から処理されるもの）。食事が記録されたら読み直す
+  // 推定待ちの食事の数。食事が記録されたら読み直す
   useEffect(() => {
     const refresh = () =>
       setDeferred(ReceiptQueue.listItems().filter((i) => i.kind === 'meal' && i.status === 'deferred').length);
     refresh();
     return OcrWorker.subscribe((e) => {
       refresh();
-      if (e.type === 'saved') load();
+      if (e.type === 'saved') loadMonths(months).catch(() => {});
     });
-  }, [load]);
+  }, [loadMonths, months]);
 
-  const sections = useMemo(() => {
-    const groups = new Map<string, MealGroup>();
-    for (const r of rows) {
-      const g = groups.get(r.mealId) ?? { mealId: r.mealId, sheetName: r.sheetName ?? '', eatenAt: r.eatenAt, store: r.store, rows: [] };
-      g.rows.push(r);
-      groups.set(r.mealId, g);
+  /** 自分が食べた食事と、共有された食事を、食事ごとにまとめる */
+  const groups = useMemo(() => {
+    const byMeal = new Map<string, MealRow[]>();
+    for (const rows of Object.values(mealsByMonth)) {
+      for (const r of rows) byMeal.set(r.mealId, [...(byMeal.get(r.mealId) ?? []), r]);
     }
-    const byPeriod = new Map<string, { title: string; meals: MealGroup[] }>();
-    for (const g of groups.values()) {
-      const { key, title } = periodOf(g.eatenAt, period);
-      const entry = byPeriod.get(key) ?? { title, meals: [] };
-      entry.meals.push(g);
-      byPeriod.set(key, entry);
-    }
-    return [...byPeriod.entries()]
-      .sort((a, b) => (a[0] < b[0] ? 1 : -1))
-      .map(([key, { title, meals }]) => {
-        const mine = meals.flatMap((m) => m.rows.filter((r) => r.user === person));
-        return {
-          key,
-          title,
-          data: meals.sort((a, b) => (a.eatenAt < b.eatenAt ? 1 : -1)),
-          totals: sumNutrients(mine.map((r) => r.nutrients)),
-          // 平均は、その人の記録がある日の数で割る（記録していない日まで割ると少なく見える）
-          days: new Set(mine.map((r) => r.eatenAt.slice(0, 10))).size,
-          hasPerson: mine.length > 0,
-        };
+    const out: (MealGroup & { day: string })[] = [];
+    for (const rows of byMeal.values()) {
+      const mine = rows.some((r) => r.user === me);
+      if (!mine && !isMealShared(rows)) continue;
+      out.push({
+        mealId: rows[0].mealId, sheetName: rows[0].sheetName ?? '', eatenAt: rows[0].eatenAt, store: rows[0].store,
+        rows, partnerOnly: !mine, day: dayOf(rows[0].eatenAt),
       });
-  }, [rows, person, period]);
+    }
+    return out.sort((a, b) => (a.eatenAt < b.eatenAt ? 1 : -1));
+  }, [mealsByMonth, me]);
 
-  const reviewCount = new Set(rows.filter((r) => r.status === 'needs_review').map((r) => r.mealId)).size;
+  const dayMeals = groups.filter((g) => g.day === day);
+  const daySups = supplementsOn(me, day, sups.supplements, sups.skips);
+
+  const trendDays = useMemo(() => {
+    if (view !== 'trend') return [];
+    const out: { day: string; statuses: NutrientStatus[] | null }[] = [];
+    for (let i = span - 1; i >= 0; i--) {
+      const d = shiftDay(day, -i);
+      const mine = groups.filter((g) => g.day === d).flatMap((g) => g.rows.filter((r) => r.user === me).map((r) => r.nutrients));
+      const supN = supplementNutrients(supplementsOn(me, d, sups.supplements, sups.skips));
+      // 食事の記録が無い日は推移に入れない（サプリだけの日を「食べていない日」として数えない）
+      if (mine.length === 0) {
+        out.push({ day: d, statuses: null });
+        continue;
+      }
+      const list = [...mine, ...supN];
+      const totals: Record<string, number | null> = {};
+      for (const [k, t] of Object.entries(sumNutrients(list))) totals[k] = t.partial && t.value === 0 ? null : t.value;
+      out.push({ day: d, statuses: judgeDay(totals, prefs) });
+    }
+    return out;
+  }, [view, span, day, groups, me, sups, prefs]);
+
+  const reviewCount = new Set(groups.filter((g) => g.rows.some((r) => r.status === 'needs_review')).map((g) => g.mealId)).size;
+
+  const toggleSupplement = async (s: Supplement, taken: boolean) => {
+    // 先に画面へ反映し、書けなかったら読み直す
+    setSups((prev) => ({
+      ...prev,
+      skips: taken
+        ? prev.skips.filter((k) => !(k.user === me && k.date === day && k.supplementId === s.supplementId))
+        : [...prev.skips, { user: me, date: day, supplementId: s.supplementId, rowIndex: 0 }],
+    }));
+    try {
+      await setSkipped(me, day, s.supplementId, !taken, sups.skips);
+      const fresh = await loadSupplements();
+      setSups(fresh);
+    } catch (e) {
+      Alert.alert('保存失敗', e instanceof Error ? e.message : String(e));
+      loadSupplements().then(setSups).catch(() => {});
+    }
+  };
 
   const segment = (
     <View style={styles.segment}>
-      {(['meals', 'stock'] as const).map((v) => (
+      {(['day', 'trend', 'stock'] as const).map((v) => (
         <TouchableOpacity key={v} style={[styles.segBtn, view === v && styles.segBtnActive]} onPress={() => setView(v)}>
           <Text style={[styles.segText, view === v && styles.segTextActive]}>
-            {v === 'meals' ? `食事${reviewCount > 0 ? `（要確認 ${reviewCount}）` : ''}` : `在庫${confirmCount > 0 ? `（確認 ${confirmCount}）` : ''}`}
+            {v === 'day' ? `1日${reviewCount > 0 ? `（要確認 ${reviewCount}）` : ''}`
+              : v === 'trend' ? '推移'
+                : `在庫${confirmCount > 0 ? `（確認 ${confirmCount}）` : ''}`}
           </Text>
         </TouchableOpacity>
       ))}
@@ -201,107 +199,75 @@ export default function MealsScreen() {
     <View style={styles.container}>
       {segment}
       <View style={styles.toolbar}>
-        <TouchableOpacity onPress={() => setMonth((m) => shiftMonth(m, -1))}>
+        <TouchableOpacity onPress={() => setDay((d) => shiftDay(d, -1))}>
           <Text style={styles.arrow}>‹</Text>
         </TouchableOpacity>
-        <Text style={styles.month}>{month.replace('-', '年')}月</Text>
-        <TouchableOpacity onPress={() => setMonth((m) => shiftMonth(m, 1))}>
-          <Text style={styles.arrow}>›</Text>
+        <TouchableOpacity onPress={() => setDay(today())}>
+          <Text style={styles.date}>{dayLabel(day)}{view === 'trend' ? ` まで ${span} 日` : ''}</Text>
         </TouchableOpacity>
-        <View style={styles.people}>
-          {people.map((p) => (
-            <TouchableOpacity key={p} style={[styles.chip, person === p && styles.chipActive]} onPress={() => setPerson(p)}>
-              <Text style={[styles.chipText, person === p && styles.chipTextActive]}>{p}</Text>
-            </TouchableOpacity>
-          ))}
+        <TouchableOpacity onPress={() => setDay((d) => (d < today() ? shiftDay(d, 1) : d))}>
+          <Text style={[styles.arrow, day >= today() && styles.arrowDisabled]}>›</Text>
+        </TouchableOpacity>
+        <View style={styles.tools}>
+          <TouchableOpacity style={styles.toolBtn} onPress={() => setSupsOpen(true)}>
+            <Text style={styles.toolText}>サプリ</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={styles.toolBtn}
+            onPress={() => {
+              if (!prefsReady) {
+                Alert.alert('読み込み中', '設定を読み込んでから開いてください');
+                return;
+              }
+              setPrefsOpen(true);
+            }}
+          >
+            <Text style={styles.toolText}>表示</Text>
+          </TouchableOpacity>
         </View>
       </View>
 
-      <View style={styles.subbar}>
-        {(['day', 'week', 'month'] as const).map((p) => (
-          <TouchableOpacity key={p} style={[styles.chip, period === p && styles.chipActive]} onPress={() => setPeriod(p)}>
-            <Text style={[styles.chipText, period === p && styles.chipTextActive]}>{PERIOD_LABEL[p]}</Text>
-          </TouchableOpacity>
-        ))}
-        <TouchableOpacity
-          style={styles.prefsBtn}
-          onPress={() => {
-            if (!prefsReady) {
-              Alert.alert('読み込み失敗', '表示の設定を読み込めませんでした。引き下げて読み直してください');
-              return;
-            }
-            if (person) setPrefsUser(person);
-          }}
-        >
-          <Text style={styles.prefsText}>表示</Text>
-        </TouchableOpacity>
-      </View>
+      {deferred > 0 && <Text style={styles.deferred}>推定待ち {deferred} 件（無料枠が戻ったら自動で処理）</Text>}
 
-      {deferred > 0 && (
-        <Text style={styles.deferred}>推定待ち {deferred} 件（無料枠が戻ったら自動で処理）</Text>
+      {view === 'day' ? (
+        <DayView
+          me={me}
+          day={day}
+          meals={dayMeals}
+          prefs={prefs}
+          supplements={daySups}
+          supplementNutrients={supplementNutrients(daySups)}
+          loading={loading}
+          onRefresh={loadAll}
+          onOpenMeal={(g) => setTarget({ mode: 'edit', sheetName: g.sheetName, mealId: g.mealId })}
+          onToggleSupplement={toggleSupplement}
+        />
+      ) : (
+        <TrendView days={trendDays} prefs={prefs} span={span} onSpan={setSpan} loading={loading} onRefresh={loadAll} />
       )}
 
-      <SectionList
-        sections={sections}
-        keyExtractor={(g) => g.mealId}
-        stickySectionHeadersEnabled={false}
-        refreshControl={<RefreshControl refreshing={loading} onRefresh={load} />}
-        contentContainerStyle={styles.list}
-        ListEmptyComponent={loading ? <ActivityIndicator style={{ marginTop: 24 }} /> : <Text style={styles.empty}>記録がありません</Text>}
-        renderSectionHeader={({ section }) => (
-          <View style={styles.dayHeader}>
-            <Text style={styles.dayTitle}>{section.title}</Text>
-            {section.hasPerson && (
-              <Text style={styles.dayTotals}>{totalsLabel(section.totals, prefs, section.days, period)}</Text>
-            )}
-          </View>
-        )}
-        renderItem={({ item }) => {
-          const mine = item.rows.filter((r) => r.user === person);
-          const kcal = mine.reduce((s, r) => s + (r.nutrients['ENERC_KCAL'] ?? 0), 0);
-          const review = item.rows.some((r) => r.status === 'needs_review');
-          const dishes = [...new Map(item.rows.map((r) => [r.dishId, r])).values()];
-          return (
-            <TouchableOpacity
-              style={styles.card}
-              onPress={() => setTarget({ mode: 'edit', sheetName: item.sheetName, mealId: item.mealId })}
-            >
-              <View style={styles.cardTop}>
-                <Text style={styles.time}>{item.eatenAt.slice(11, 16)}</Text>
-                <Text style={styles.store} numberOfLines={1}>{item.store || (item.rows[0].kind === 'home' ? '自炊' : '')}</Text>
-                {review && <Text style={styles.badge}>要確認</Text>}
-                {mine.length > 0 && <Text style={styles.kcal}>{Math.round(kcal)} kcal</Text>}
-              </View>
-              {dishes.map((d) => {
-                const eaters = item.rows.filter((r) => r.dishId === d.dishId);
-                const who = eaters.length > 1
-                  ? eaters.map((e) => `${e.user}${Math.round(e.portion * 10)}`).join(':')
-                  : eaters[0].user;
-                return (
-                  <Text key={d.dishId} style={styles.dish} numberOfLines={1}>
-                    {d.dish}<Text style={styles.who}>　{who}</Text>
-                  </Text>
-                );
-              })}
-            </TouchableOpacity>
-          );
+      <NutritionPrefsModal
+        user={prefsOpen ? me : null}
+        prefs={prefs}
+        onClose={() => setPrefsOpen(false)}
+        onSaved={(next) => {
+          setPrefsMap((prev) => new Map(prev).set(me, next));
+          setPrefsOpen(false);
         }}
       />
 
-      <NutritionPrefsModal
-        user={prefsUser}
-        prefs={prefsMap.get(prefsUser ?? '') ?? DEFAULT_PREFS}
-        onClose={() => setPrefsUser(null)}
-        onSaved={(next) => {
-          if (prefsUser) setPrefsMap((prev) => new Map(prev).set(prefsUser, next));
-          setPrefsUser(null);
-        }}
+      <SupplementsModal
+        visible={supsOpen}
+        user={me}
+        supplements={sups.supplements}
+        onClose={() => setSupsOpen(false)}
+        onChanged={() => { loadSupplements().then(setSups).catch(() => {}); }}
       />
 
       <MealEditModal
         target={target}
         onClose={() => setTarget(null)}
-        onSaved={() => { setTarget(null); load(); }}
+        onSaved={() => { setTarget(null); loadMonths(months).catch(() => {}); }}
       />
     </View>
   );
@@ -318,42 +284,15 @@ const styles = StyleSheet.create({
   segText:       { fontSize: 14, fontWeight: '600', color: '#374151' },
   segTextActive: { color: '#fff' },
   toolbar: {
-    flexDirection: 'row', alignItems: 'center', gap: 12,
-    paddingHorizontal: 16, paddingVertical: 10, backgroundColor: '#fff',
-    borderBottomWidth: 1, borderBottomColor: '#eee',
-  },
-  arrow:  { fontSize: 24, color: '#2e7d32', paddingHorizontal: 4 },
-  month:  { fontSize: 16, fontWeight: 'bold', color: '#222' },
-  people: { flexDirection: 'row', gap: 6, marginLeft: 'auto' },
-  chip: {
-    paddingHorizontal: 12, paddingVertical: 4, borderRadius: 14,
-    borderWidth: 1, borderColor: '#d1d5db', backgroundColor: '#fff',
-  },
-  chipActive:     { backgroundColor: '#2e7d32', borderColor: '#2e7d32' },
-  chipText:       { fontSize: 12, color: '#374151', fontWeight: '600' },
-  chipTextActive: { color: '#fff' },
-  subbar: {
-    flexDirection: 'row', alignItems: 'center', gap: 6,
+    flexDirection: 'row', alignItems: 'center', gap: 10,
     paddingHorizontal: 16, paddingVertical: 8, backgroundColor: '#fff',
     borderBottomWidth: 1, borderBottomColor: '#eee',
   },
-  prefsBtn:  { marginLeft: 'auto', paddingHorizontal: 12, paddingVertical: 4, borderRadius: 14, borderWidth: 1, borderColor: '#2e7d32' },
-  prefsText: { fontSize: 12, color: '#2e7d32', fontWeight: '600' },
-  deferred: { fontSize: 12, color: '#6b7280', paddingHorizontal: 16, paddingTop: 8 },
-  list:     { padding: 16, paddingBottom: 40, gap: 10 },
-  empty:    { textAlign: 'center', color: '#888', marginTop: 24 },
-  dayHeader: { paddingTop: 8, paddingBottom: 4 },
-  dayTitle:  { fontSize: 14, fontWeight: 'bold', color: '#374151' },
-  dayTotals: { fontSize: 12, color: '#2e7d32', marginTop: 2 },
-  card:      { backgroundColor: '#fff', borderRadius: 16, padding: 14, gap: 4, marginBottom: 8 },
-  cardTop:   { flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 2 },
-  time:      { fontSize: 13, color: '#6b7280', fontWeight: '600' },
-  store:     { flex: 1, fontSize: 14, color: '#111', fontWeight: '600' },
-  badge: {
-    fontSize: 11, color: '#b45309', backgroundColor: '#fef3c7', fontWeight: '700',
-    paddingHorizontal: 6, paddingVertical: 2, borderRadius: 6, overflow: 'hidden',
-  },
-  kcal:      { fontSize: 13, color: '#2e7d32', fontWeight: '700' },
-  dish:      { fontSize: 14, color: '#1f2937' },
-  who:       { fontSize: 12, color: '#6b7280' },
+  arrow:         { fontSize: 24, color: '#2e7d32', paddingHorizontal: 4 },
+  arrowDisabled: { color: '#d1d5db' },
+  date:          { fontSize: 15, fontWeight: 'bold', color: '#222' },
+  tools:         { flexDirection: 'row', gap: 6, marginLeft: 'auto' },
+  toolBtn:       { paddingHorizontal: 12, paddingVertical: 4, borderRadius: 14, borderWidth: 1, borderColor: '#2e7d32' },
+  toolText:      { fontSize: 12, color: '#2e7d32', fontWeight: '600' },
+  deferred:      { fontSize: 12, color: '#6b7280', paddingHorizontal: 16, paddingTop: 8 },
 });

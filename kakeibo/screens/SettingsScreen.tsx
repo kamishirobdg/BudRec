@@ -37,6 +37,7 @@ import {
 } from '../services/SheetsService';
 import * as WriteQueue from '../services/WriteQueueService';
 import * as RowsCache from '../services/RowsCacheService';
+import { clearCache } from '../services/LocalCache';
 import * as LastBatch from '../services/LastBatchService';
 import * as Demo from '../services/DemoService';
 import { runGmailImport, getSkippedMessageSummaries, SkippedMessageSummary } from '../services/GmailService';
@@ -392,6 +393,8 @@ export default function SettingsScreen({ onSignedOut }: Props) {
               // 同じ端末で別アカウントに切り替えることがあるため、
               // 前アカウントのデータがオフラインキャッシュ・「前回の登録」として残らないようにする
               RowsCache.clear();
+              // 食事・表示設定・サプリの控えも消す（別のアカウントのデータを出さない）
+              clearCache();
               LastBatch.clearLastBatch();
               onSignedOut();
             } catch (e) {

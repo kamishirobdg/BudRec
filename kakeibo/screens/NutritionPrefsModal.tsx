@@ -5,7 +5,9 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { NUTRIENTS } from '../services/Nutrients';
-import { NutritionPrefs, savePrefs } from '../services/NutritionPrefsService';
+import { Activity, NutritionPrefs, Sex, savePrefs } from '../services/NutritionPrefsService';
+
+const ACTIVITY_LABEL: Record<Activity, string> = { I: '低い', II: 'ふつう', III: '高い' };
 
 interface Props {
   /** 設定する人（null なら閉じている） */
@@ -19,6 +21,9 @@ interface Props {
 export default function NutritionPrefsModal({ user, prefs, onClose, onSaved }: Props) {
   const [visible, setVisible] = useState<string[]>(prefs.visible);
   const [targets, setTargets] = useState<Record<string, string>>({});
+  const [birthYear, setBirthYear] = useState('');
+  const [sex, setSex]             = useState<Sex | null>(null);
+  const [activity, setActivity]   = useState<Activity>('II');
   const [saving, setSaving]   = useState(false);
 
   // 開いたときだけ読み込む（開いている間に一覧が読み直されても入力中の値を戻さない）
@@ -26,6 +31,9 @@ export default function NutritionPrefsModal({ user, prefs, onClose, onSaved }: P
     if (!user) return;
     setVisible(prefs.visible);
     setTargets(Object.fromEntries(Object.entries(prefs.targets).map(([k, v]) => [k, String(v)])));
+    setBirthYear(prefs.profile.birthYear ? String(prefs.profile.birthYear) : '');
+    setSex(prefs.profile.sex);
+    setActivity(prefs.profile.activity);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user]);
 
@@ -44,7 +52,17 @@ export default function NutritionPrefsModal({ user, prefs, onClose, onSaved }: P
       if (v.trim() !== '' && Number.isFinite(n) && n > 0) parsed[k] = n;
     }
     // 表示の順番は栄養素の定義順にそろえる
-    const next: NutritionPrefs = { visible: NUTRIENTS.map((n) => n.key).filter((k) => visible.includes(k)), targets: parsed };
+    const y = Number(birthYear.trim());
+    const year = Number.isInteger(y) && y > 1900 && y <= new Date().getFullYear() ? y : null;
+    if (birthYear.trim() !== '' && year === null) {
+      Alert.alert('生まれた年を西暦 4 桁で入れてください');
+      return;
+    }
+    const next: NutritionPrefs = {
+      visible: NUTRIENTS.map((n) => n.key).filter((k) => visible.includes(k)),
+      targets: parsed,
+      profile: { birthYear: year, sex, activity },
+    };
     setSaving(true);
     try {
       await savePrefs(user, next);
@@ -67,11 +85,45 @@ export default function NutritionPrefsModal({ user, prefs, onClose, onSaved }: P
               <Text style={styles.close}>✕</Text>
             </TouchableOpacity>
           </View>
-          <View style={styles.colHead}>
-            <Text style={styles.colHeadText}>栄養素</Text>
-            <Text style={[styles.colHeadText, styles.targetHead]}>1 日の目標</Text>
-          </View>
           <FlatList
+            ListHeaderComponent={
+              <>
+                {/* 食事摂取基準の値を選ぶのに使う */}
+                <View style={styles.profile}>
+                  <View style={styles.profileRow}>
+                    <Text style={styles.profileLabel}>生まれた年</Text>
+                    <TextInput
+                      style={styles.yearInput}
+                      value={birthYear}
+                      onChangeText={setBirthYear}
+                      keyboardType="number-pad"
+                      placeholder="1990"
+                      maxLength={4}
+                    />
+                  </View>
+                  <View style={styles.profileRow}>
+                    <Text style={styles.profileLabel}>性別</Text>
+                    {(['male', 'female'] as const).map((v) => (
+                      <TouchableOpacity key={v} style={[styles.chip, sex === v && styles.chipActive]} onPress={() => setSex(v)}>
+                        <Text style={[styles.chipText, sex === v && styles.chipTextActive]}>{v === 'male' ? '男性' : '女性'}</Text>
+                      </TouchableOpacity>
+                    ))}
+                  </View>
+                  <View style={styles.profileRow}>
+                    <Text style={styles.profileLabel}>活動量</Text>
+                    {(['I', 'II', 'III'] as const).map((v) => (
+                      <TouchableOpacity key={v} style={[styles.chip, activity === v && styles.chipActive]} onPress={() => setActivity(v)}>
+                        <Text style={[styles.chipText, activity === v && styles.chipTextActive]}>{ACTIVITY_LABEL[v]}</Text>
+                      </TouchableOpacity>
+                    ))}
+                  </View>
+                </View>
+                <View style={styles.colHead}>
+                  <Text style={styles.colHeadText}>表示する栄養素</Text>
+                  <Text style={[styles.colHeadText, styles.targetHead]}>自分の目標</Text>
+                </View>
+              </>
+            }
             data={NUTRIENTS}
             keyExtractor={(n) => n.key}
             keyboardShouldPersistTaps="handled"
@@ -114,7 +166,18 @@ const styles = StyleSheet.create({
   },
   title:  { fontSize: 16, fontWeight: 'bold', color: '#1a1a1a' },
   close:  { fontSize: 20, color: '#666', paddingHorizontal: 8 },
-  colHead: { flexDirection: 'row', paddingHorizontal: 16, paddingTop: 10 },
+  colHead: { flexDirection: 'row', paddingTop: 10, paddingBottom: 4 },
+  profile:      { backgroundColor: '#fff', borderRadius: 12, padding: 12, gap: 10 },
+  profileRow:   { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  profileLabel: { width: 80, fontSize: 13, color: '#374151' },
+  yearInput: {
+    width: 80, fontSize: 14, borderWidth: 1, borderColor: '#e5e7eb', borderRadius: 8,
+    paddingHorizontal: 8, paddingVertical: 4, color: '#1f2937',
+  },
+  chip:           { paddingHorizontal: 12, paddingVertical: 4, borderRadius: 14, borderWidth: 1, borderColor: '#d1d5db', backgroundColor: '#fff' },
+  chipActive:     { backgroundColor: '#2e7d32', borderColor: '#2e7d32' },
+  chipText:       { fontSize: 13, color: '#374151', fontWeight: '600' },
+  chipTextActive: { color: '#fff' },
   colHeadText: { fontSize: 12, color: '#888', fontWeight: '600' },
   targetHead: { marginLeft: 'auto', marginRight: 40 },
   list:   { padding: 16, paddingTop: 6, gap: 6 },
