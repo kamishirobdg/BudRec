@@ -26,11 +26,11 @@ import { getUniqueUsers } from '../services/SheetsService';
 import { epochToTimestamp } from '../services/MealProcessing';
 import { archiveMealPhoto, mealPhotoRef } from '../services/PhotoStore';
 import { ensureMealShared, markSettled } from '../services/SharedPhotos';
-import { researchNow, saveResearched } from '../services/FoodService';
+import { findFood, loadFoods, researchNow, saveResearched } from '../services/FoodService';
 import { NutritionLabel, readNutritionLabel } from '../services/LabelReader';
 import NutrientEditModal from '../components/NutrientEditModal';
 import * as ImagePicker from 'expo-image-picker';
-import { consume } from '../services/InventoryService';
+import { consume, listInventory } from '../services/InventoryService';
 import FoodThumb from '../components/FoodThumb';
 
 export type MealTarget =
@@ -75,6 +75,8 @@ interface DishDraft {
   refreshed:      boolean;
   /** 栄養を手で直した・包装の表示から入れた（名前を変えても調べ直して上書きしない） */
   manualNutrition: boolean;
+  /** この編集で包装の表示から入れた（保存できたら食品データにも入れる） */
+  label?: NutritionLabel;
 }
 
 const RATIOS = [0.5, 0.6, 0.7, 0.4, 0.3];
@@ -109,7 +111,7 @@ function toDrafts(rows: MealRow[]): DishDraft[] {
       choices: first.choices ?? [],
       chosen: null,
       refreshed: false,
-      manualNutrition: first.nutrientSource === 'manual',
+      manualNutrition: first.nutrientSource === 'manual' || first.nutrientSource === 'label',
     };
   });
 }
@@ -290,23 +292,44 @@ export default function MealEditModal({ target, onClose, onSaved }: Props) {
     }
   };
 
-  /** 栄養を直した値にする。包装の表示から入れたときは、食品データにも入れる（次からはその値を使う） */
+  /** 栄養を直した値にする。包装の表示から入れたときは、保存できたら食品データにも入れる（次からはその値を使う） */
   const applyNutrients = (dishId: string, nutrients: Nutrients, label: NutritionLabel | null) => {
-    const d = drafts.find((x) => x.dishId === dishId);
     update(dishId, {
       whole: nutrients,
-      nutrientSource: label ? 'grounding' : 'manual',
+      nutrientSource: label ? 'label' : 'manual',
       confidence: 'high',
       refreshed: true,
       manualNutrition: true,
+      label: label ?? undefined,
     });
     setNutEdit(null);
-    if (label && d) {
-      saveResearched([{
-        query: { name: d.dish.trim(), chain: '', kind: 'packaged', content: label.content },
-        result: { nutrients: label.nutrients, basis: label.basis, official: true },
-        sources: [],
-      }]).catch((e) => console.warn('[Meal] 食品データに入れられなかった:', e instanceof Error ? e.message : e));
+  };
+
+  /**
+   * 包装の表示から入れた品を食品データに入れる（保存できた後に呼ぶ。失敗しても投げない）。
+   * 品名の鍵に加えて、在庫の品目を食べた品なら在庫の品名（店のオリジナル商品はチェーン付き）の鍵にも入れる
+   */
+  const saveLabels = async (list: DishDraft[]) => {
+    const withLabel = list.filter((d) => d.label);
+    if (withLabel.length === 0) return;
+    try {
+      const [inventory, foods] = await Promise.all([listInventory(true).catch(() => []), loadFoods()]);
+      const entries = withLabel.flatMap((d) => {
+        const names = [{ name: d.dish.trim(), chain: '' }];
+        for (const ref of d.itemRefs) {
+          const item = inventory.find((i) => i.itemId === ref.itemId);
+          if (item) names.push({ name: item.name, chain: findFood(foods, item.name, item.store)?.chain ?? '' });
+        }
+        const unique = [...new Map(names.map((n) => [`${n.chain}|${n.name}`, n])).values()];
+        return unique.map((n) => ({
+          query: { name: n.name, chain: n.chain, kind: 'packaged' as const, content: d.label!.content },
+          result: { nutrients: d.label!.nutrients, basis: d.label!.basis, official: true },
+          sources: [],
+        }));
+      });
+      await saveResearched(entries);
+    } catch (e) {
+      console.warn('[Meal] 食品データに入れられなかった:', e instanceof Error ? e.message : e);
     }
   };
 
@@ -432,6 +455,7 @@ export default function MealEditModal({ target, onClose, onSaved }: Props) {
           return { itemId: d.chosen!, pieces: ref?.usedPieces, ratio: ref?.usedRatio };
         }));
       await logCorrections(corrections(list));
+      await saveLabels(list);
       // 共有してから確定日時を書く（この保存で新しく共有した写真にも 7 日の期限を付ける）
       await ensureMealShared(saved, me);
       await markSettled(mealId);
@@ -618,7 +642,9 @@ export default function MealEditModal({ target, onClose, onSaved }: Props) {
                     ) : (
                       <Text style={styles.sub}>
                         {kcal(d.whole)}（1品）
-                        {d.nutrientSource === 'grounding' ? '・公式' : d.nutrientSource === 'manual' ? '・手入力' : '・推定'}
+                        {d.nutrientSource === 'grounding' ? '・公式'
+                          : d.nutrientSource === 'label' ? '・表示'
+                            : d.nutrientSource === 'manual' ? '・手入力' : '・推定'}
                       </Text>
                     )}
 

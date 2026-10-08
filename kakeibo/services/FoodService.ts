@@ -503,6 +503,7 @@ async function saveResearchedTo(
     const next: Food = {
       ...base,
       kind: base.kind || query.kind,
+      content: query.content || base.content,
       nutrients: got ? result.nutrients : base.nutrients,
       basis: got ? result.basis : base.basis,
       source: got ? (result.official ? 'grounding' : 'estimate') : base.source,

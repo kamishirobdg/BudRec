@@ -41,7 +41,9 @@ export async function readNutritionLabel(imageBase64: string, signal?: AbortSign
   const prompt = `食品のパッケージの写真です。栄養成分表示を読み、JSON のみを返してください。
 - name: 商品名（写っていれば。日本語で）
 - unitLabel: 表示の単位をそのまま（「1 袋（45g）あたり」「1 本あたり」「100g あたり」など）
-- basis: 表示の単位が「1 袋・1 個・1 食・1 パック」なら package、「複数入りの 1 本・1 個」なら piece、「100g・100ml あたり」なら per100g
+- basis: 表示の単位が**包装 1 つ全部**（1 袋・1 個売りの 1 個・1 パック全部）なら package。
+  包装の中にいくつか入っていて、その 1 つ分（5 食入りの 1 食、6 本入りの 1 本、「1 食分（40g）あたり」など）なら piece。
+  「100g・100ml あたり」なら per100g
 - content: 内容量（「45g」「6 本」など。書いていなければ空）
 - nutrients: 表示の単位あたりの値。キーは次のとおりで、表示に無いものは省く:
 ${list}

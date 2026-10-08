@@ -257,11 +257,20 @@ function packageFraction(ref: InventoryRef, used: UsedItem): number | null {
 }
 
 /** 食品データの栄養（単位つき）から、食べた分の栄養を出す。出せなければ null */
-function nutrientsFromFood(food: Food, ref: InventoryRef, used: UsedItem): Nutrients | null {
-  // 複数入りの商品の公式表示は 1 個あたりが普通なので、個数を直接掛ける
-  if (food.basis === 'piece') return used.pieces ? scaleNutrients(food.nutrients, used.pieces) : null;
-  if (food.basis !== 'package') return null;
+function nutrientsFromFood(food: Food, ref: InventoryRef, used: UsedItem, grams?: number): Nutrients | null {
   const f = packageFraction(ref, used);
+  // 複数入りの商品の公式表示は 1 個あたりが普通なので、個数を直接掛ける（個数が無ければ入り数 × 使った割合）
+  if (food.basis === 'piece') {
+    const pieces = used.pieces ?? (f !== null && ref.pieces ? f * ref.pieces : null);
+    return pieces ? scaleNutrients(food.nutrients, pieces) : null;
+  }
+  // 100g あたり: 写真から見積もった量、無ければ内容量（g）× 使った割合
+  if (food.basis === 'per100g') {
+    const content = Number(food.content.match(/^(\d+(?:\.\d+)?)\s*g$/i)?.[1]);
+    const g = grams ?? (f !== null && content > 0 ? content * f : null);
+    return g ? scaleNutrients(food.nutrients, g / 100) : null;
+  }
+  if (food.basis !== 'package') return null;
   return f === null ? null : scaleNutrients(food.nutrients, f);
 }
 
@@ -299,7 +308,7 @@ export async function recordMeal(
     if (d.kind === 'packaged' && d.used.length === 1 && d.choices.length === 0) {
       const ref = inventory[d.used[0].index];
       const food = ref && freshNutrition(findFood(foods, ref.name, ref.store));
-      const n = food ? nutrientsFromFood(food, ref, d.used[0]) : null;
+      const n = food ? nutrientsFromFood(food, ref, d.used[0], d.grams) : null;
       if (food && n) return { nutrients: n, official: food.source === 'grounding' };
     }
     if (d.kind !== 'home' && d.used.length === 0) {
