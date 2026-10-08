@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, Alert, Animated, AppState, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import { ActivityIndicator, Alert, Animated, AppState, Modal, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { createNavigationContainerRef, NavigationContainer } from '@react-navigation/native';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
-import { SafeAreaProvider } from 'react-native-safe-area-context';
+import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { StatusBar } from 'expo-status-bar';
 import { Ionicons } from '@expo/vector-icons';
 import HomeScreen from './screens/HomeScreen';
@@ -18,7 +18,10 @@ import { runGmailImport } from './services/GmailService';
 import { flushWriteQueue, registerUser } from './services/SheetsService';
 import { loadConfig as loadDemoConfig } from './services/DemoService';
 import { flushPendingPurchases } from './services/FoodService';
-import { getPhotoRetentionDays } from './services/PreferencesService';
+import {
+  TAB_KEYS, TAB_LABELS, TabLayout, getPhotoRetentionDays, getTabLayout, subscribeTabLayout,
+} from './services/PreferencesService';
+import SettingsScreen from './screens/SettingsScreen';
 import { cleanupOldPhotos } from './services/PhotoStore';
 import * as OcrWorker from './services/OcrWorker';
 import { registerBackgroundOcr } from './services/BackgroundOcr';
@@ -75,6 +78,15 @@ function AppContent() {
     }
     setOcrProgress(OcrWorker.getProgress());
   }), []);
+
+  // タブの表示と並び順（設定画面で変えるとすぐ反映する）
+  const [tabLayout, setTabLayoutState] = useState<TabLayout>({ order: [...TAB_KEYS], hidden: [] });
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  useEffect(() => {
+    getTabLayout().then(setTabLayoutState).catch(() => {});
+    return subscribeTabLayout(setTabLayoutState);
+  }, []);
+  const visibleTabs = tabLayout.order.filter((k) => !tabLayout.hidden.includes(k));
 
   const goToSummary = () => {
     setOcrToastState(null);
@@ -189,58 +201,71 @@ function AppContent() {
             screenOptions={{
               headerShown: true,
               tabBarActiveTintColor: '#2563eb',
+              // 設定はどのタブからでも開けるようにする（一覧タブを隠しても設定に戻れるように）。
+              // 一覧タブは「個人」と並べて自前で出す
+              headerRight: () => (
+                <TouchableOpacity onPress={() => setSettingsOpen(true)} style={styles.headerGear}>
+                  <Text style={styles.headerGearText}>⚙</Text>
+                </TouchableOpacity>
+              ),
             }}
           >
-            <Tab.Screen
-              name="Camera"
-              options={{
-                title: '撮影',
-                tabBarIcon: ({ color, size }) => (
-                  <Ionicons name="camera" color={color} size={size} />
-                ),
-              }}
-            >
-              {() => (
-                // タブ単位でも囲む。片方の画面が落ちてももう片方は使えるようにする
-                <ErrorBoundary>
-                  <CameraScreen
-                    onSignedOut={() => setSignedIn(false)}
-                    onStatusChange={setOcrStatus}
-                    onSuccess={setOcrToast}
-                  />
-                </ErrorBoundary>
-              )}
-            </Tab.Screen>
-            <Tab.Screen
-              name="Meals"
-              options={{
-                title: '食事',
-                tabBarIcon: ({ color, size }) => (
-                  <Ionicons name="restaurant" color={color} size={size} />
-                ),
-              }}
-            >
-              {() => (
-                <ErrorBoundary>
-                  <MealsScreen />
-                </ErrorBoundary>
-              )}
-            </Tab.Screen>
-            <Tab.Screen
-              name="Summary"
-              options={{
-                title: '一覧',
-                tabBarIcon: ({ color, size }) => (
-                  <Ionicons name="list" color={color} size={size} />
-                ),
-              }}
-            >
-              {() => (
-                <ErrorBoundary>
-                  <SummaryScreen onSignedOut={() => setSignedIn(false)} />
-                </ErrorBoundary>
-              )}
-            </Tab.Screen>
+            {visibleTabs.map((key) => {
+              if (key === 'Camera') return (
+                <Tab.Screen
+                  key={key}
+                  name="Camera"
+                  options={{
+                    title: TAB_LABELS.Camera,
+                    tabBarIcon: ({ color, size }) => <Ionicons name="camera" color={color} size={size} />,
+                  }}
+                >
+                  {() => (
+                    // タブ単位でも囲む。片方の画面が落ちてももう片方は使えるようにする
+                    <ErrorBoundary>
+                      <CameraScreen
+                        onSignedOut={() => setSignedIn(false)}
+                        onStatusChange={setOcrStatus}
+                        onSuccess={setOcrToast}
+                        onOpenSettings={() => setSettingsOpen(true)}
+                      />
+                    </ErrorBoundary>
+                  )}
+                </Tab.Screen>
+              );
+              if (key === 'Meals') return (
+                <Tab.Screen
+                  key={key}
+                  name="Meals"
+                  options={{
+                    title: TAB_LABELS.Meals,
+                    tabBarIcon: ({ color, size }) => <Ionicons name="restaurant" color={color} size={size} />,
+                  }}
+                >
+                  {() => (
+                    <ErrorBoundary>
+                      <MealsScreen />
+                    </ErrorBoundary>
+                  )}
+                </Tab.Screen>
+              );
+              return (
+                <Tab.Screen
+                  key={key}
+                  name="Summary"
+                  options={{
+                    title: TAB_LABELS.Summary,
+                    tabBarIcon: ({ color, size }) => <Ionicons name="list" color={color} size={size} />,
+                  }}
+                >
+                  {() => (
+                    <ErrorBoundary>
+                      <SummaryScreen onSignedOut={() => setSignedIn(false)} />
+                    </ErrorBoundary>
+                  )}
+                </Tab.Screen>
+              );
+            })}
           </Tab.Navigator>
         </NavigationContainer>
       )}
@@ -266,7 +291,7 @@ function AppContent() {
           <View pointerEvents="none">
             <Text style={styles.toastText}>{ocrToast.text}</Text>
           </View>
-          {currentRoute !== 'Summary' && (
+          {currentRoute !== 'Summary' && visibleTabs.includes('Summary') && (
             <TouchableOpacity style={styles.toastBtn} onPress={goToSummary}>
               <Text style={styles.toastBtnText}>一覧へ</Text>
             </TouchableOpacity>
@@ -274,12 +299,39 @@ function AppContent() {
         </Animated.View>
       )}
 
+      {/* 一覧タブ以外から開く設定（一覧タブは自分の画面の中で開く） */}
+      <Modal visible={settingsOpen} animationType="slide" onRequestClose={() => setSettingsOpen(false)}>
+        <SafeAreaView style={styles.settingsContainer}>
+          <View style={styles.settingsHeader}>
+            <Text style={styles.settingsTitle}>設定</Text>
+            <TouchableOpacity onPress={() => setSettingsOpen(false)}>
+              <Text style={styles.settingsClose}>閉じる</Text>
+            </TouchableOpacity>
+          </View>
+          <SettingsScreen
+            onSignedOut={() => {
+              setSettingsOpen(false);
+              setSignedIn(false);
+            }}
+          />
+        </SafeAreaView>
+      </Modal>
+
       <StatusBar style="auto" />
     </SafeAreaProvider>
   );
 }
 
 const styles = StyleSheet.create({
+  headerGear:        { paddingHorizontal: 16, paddingVertical: 4 },
+  headerGearText:    { fontSize: 20 },
+  settingsContainer: { flex: 1, backgroundColor: '#fff' },
+  settingsHeader: {
+    flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
+    paddingHorizontal: 16, paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: '#eee',
+  },
+  settingsTitle: { fontSize: 17, fontWeight: 'bold', color: '#1a1a1a' },
+  settingsClose: { fontSize: 15, color: '#2563eb', fontWeight: '600' },
   statusBanner: {
     position:        'absolute',
     top:             56,

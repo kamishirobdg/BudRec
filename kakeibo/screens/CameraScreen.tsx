@@ -50,9 +50,11 @@ interface Props {
   onSignedOut:    () => void;
   onStatusChange: (msg: string) => void;
   onSuccess:      (msg: string) => void;
+  /** ヘッダーの ⚙ から設定を開く */
+  onOpenSettings?: () => void;
 }
 
-export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }: Props) {
+export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess, onOpenSettings }: Props) {
   const navigation = useNavigation();
   const [permission, requestPermission] = useCameraPermissions();
   const [facing] = useState<CameraType>('back');
@@ -135,17 +137,24 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
   useLayoutEffect(() => {
     navigation.setOptions({
       headerRight: () => (
-        <TouchableOpacity
-          style={[styles.proxyHeaderBtn, proxyMode && styles.proxyHeaderBtnActive]}
-          onPress={handleProxyToggle}
-        >
-          <Text style={[styles.proxyHeaderBtnText, proxyMode && styles.proxyHeaderBtnTextActive]}>
-            {proxyMode ? `代理: ${proxyUser}` : '代理入力'}
-          </Text>
-        </TouchableOpacity>
+        <View style={styles.headerRight}>
+          <TouchableOpacity
+            style={[styles.proxyHeaderBtn, proxyMode && styles.proxyHeaderBtnActive]}
+            onPress={handleProxyToggle}
+          >
+            <Text style={[styles.proxyHeaderBtnText, proxyMode && styles.proxyHeaderBtnTextActive]}>
+              {proxyMode ? `代理: ${proxyUser}` : '代理入力'}
+            </Text>
+          </TouchableOpacity>
+          {onOpenSettings && (
+            <TouchableOpacity onPress={onOpenSettings} style={styles.headerGear}>
+              <Text style={styles.headerGearText}>⚙</Text>
+            </TouchableOpacity>
+          )}
+        </View>
       ),
     });
-  }, [navigation, proxyMode, proxyUser, handleProxyToggle]);
+  }, [navigation, proxyMode, proxyUser, handleProxyToggle, onOpenSettings]);
 
   /** 撮影時点の代理相手で積む（後から代理入力を切り替えても変わらない） */
   const enqueue = (base64: string) => {
@@ -842,6 +851,9 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     elevation: 6,
   },
+  headerRight:    { flexDirection: 'row', alignItems: 'center' },
+  headerGear:     { paddingRight: 16, paddingLeft: 4, paddingVertical: 4 },
+  headerGearText: { fontSize: 20 },
   proxyHeaderBtn: {
     marginRight: 12,
     paddingHorizontal: 10,

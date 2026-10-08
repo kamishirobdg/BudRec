@@ -20,6 +20,54 @@ export async function setSortKey(key: SortKey): Promise<void> {
   await setItem(SORT_KEY, key);
 }
 
+// ─── タブの表示と並び順 ───────────────────────────────────────────────────────
+//
+// 端末ごと。少なくとも 1 つは表示する（全部消すと画面が無くなる）
+
+export const TAB_KEYS = ['Camera', 'Meals', 'Summary'] as const;
+export type TabKey = typeof TAB_KEYS[number];
+export const TAB_LABELS: Record<TabKey, string> = { Camera: '撮影', Meals: '食事', Summary: '一覧' };
+
+export interface TabLayout {
+  /** 表示する順（隠したタブも含む） */
+  order:  TabKey[];
+  hidden: TabKey[];
+}
+
+const TAB_LAYOUT = 'tab_layout';
+const DEFAULT_TAB_LAYOUT: TabLayout = { order: [...TAB_KEYS], hidden: [] };
+const tabListeners = new Set<(layout: TabLayout) => void>();
+
+function sanitizeTabLayout(raw: unknown): TabLayout {
+  const r = (raw && typeof raw === 'object' ? raw : {}) as Partial<TabLayout>;
+  const isKey = (k: unknown): k is TabKey => (TAB_KEYS as readonly unknown[]).includes(k);
+  const order = (Array.isArray(r.order) ? r.order.filter(isKey) : []).filter((k, i, a) => a.indexOf(k) === i);
+  // 後から増えたタブは末尾に足す
+  for (const k of TAB_KEYS) if (!order.includes(k)) order.push(k);
+  const hidden = Array.isArray(r.hidden) ? r.hidden.filter(isKey) : [];
+  return { order, hidden: hidden.length >= order.length ? [] : hidden };
+}
+
+export async function getTabLayout(): Promise<TabLayout> {
+  try {
+    return sanitizeTabLayout(JSON.parse((await getItem(TAB_LAYOUT)) ?? 'null'));
+  } catch {
+    return DEFAULT_TAB_LAYOUT;
+  }
+}
+
+export async function setTabLayout(layout: TabLayout): Promise<void> {
+  const next = sanitizeTabLayout(layout);
+  await setItem(TAB_LAYOUT, JSON.stringify(next));
+  for (const l of tabListeners) l(next);
+}
+
+/** 設定画面で変えたら、すぐにタブへ反映するために使う */
+export function subscribeTabLayout(listener: (layout: TabLayout) => void): () => void {
+  tabListeners.add(listener);
+  return () => { tabListeners.delete(listener); };
+}
+
 // ─── 写真の保存期間 ───────────────────────────────────────────────────────────
 //
 // レシート・食事の写真は端末にしか無いので、設定も端末ごと。0 = 無期限（既定）
