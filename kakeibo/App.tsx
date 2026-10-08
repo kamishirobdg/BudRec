@@ -18,6 +18,8 @@ import { runGmailImport } from './services/GmailService';
 import { flushWriteQueue, registerUser } from './services/SheetsService';
 import { loadConfig as loadDemoConfig } from './services/DemoService';
 import { flushPendingPurchases } from './services/FoodService';
+import { getPhotoRetentionDays } from './services/PreferencesService';
+import { cleanupOldPhotos } from './services/PhotoStore';
 import * as OcrWorker from './services/OcrWorker';
 import { registerBackgroundOcr } from './services/BackgroundOcr';
 
@@ -140,6 +142,8 @@ function AppContent() {
     registerBackgroundOcr();
     // 期限（保存から 7 日・共有から 14 日）を過ぎた共有写真を共有用シートから消す
     cleanupSharedPhotos();
+    // 保存期間（設定画面。既定は無期限）を過ぎた端末内の写真を消す
+    getPhotoRetentionDays().then((days) => cleanupOldPhotos(days)).catch(() => {});
     // 代理入力の相手の候補として、この端末のユーザー名を共有の一覧に載せる
     getCurrentUserRaw()
       .then((name) => registerUser(name))

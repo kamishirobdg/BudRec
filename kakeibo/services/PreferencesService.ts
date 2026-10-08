@@ -20,6 +20,22 @@ export async function setSortKey(key: SortKey): Promise<void> {
   await setItem(SORT_KEY, key);
 }
 
+// ─── 写真の保存期間 ───────────────────────────────────────────────────────────
+//
+// レシート・食事の写真は端末にしか無いので、設定も端末ごと。0 = 無期限（既定）
+
+const PHOTO_RETENTION_DAYS = 'photo_retention_days';
+export const PHOTO_RETENTION_OPTIONS = [0, 90, 180, 365] as const;
+
+export async function getPhotoRetentionDays(): Promise<number> {
+  const v = Number(await getItem(PHOTO_RETENTION_DAYS));
+  return (PHOTO_RETENTION_OPTIONS as readonly number[]).includes(v) ? v : 0;
+}
+
+export async function setPhotoRetentionDays(days: number): Promise<void> {
+  await setItem(PHOTO_RETENTION_DAYS, String(days));
+}
+
 // ─── 固定費 月次適用 ──────────────────────────────────────────────────────────
 //
 // **これは「起動のたびに通信しない」ための端末ローカルの目印にすぎない。**

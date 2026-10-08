@@ -1,5 +1,5 @@
 /**
- * 登録済みのレシート写真を端末内に残す。
+ * 登録済みのレシート写真・食事の写真を端末内に残す（保存期間を設定していれば、過ぎたものを消す）。
  *
  * 保存先: `<documentDirectory>/photos/receipts/`
  * 対応表: `<documentDirectory>/photo-index.json`（支出行の entry_id → 写真の参照）
@@ -87,6 +87,37 @@ export function archiveMealPhoto(uri: string, keepOriginal = false): string | nu
 /** 食事の写真を保存先へ移したときの参照（移す前に記録へ書くため、先に決められるようにしておく） */
 export function mealPhotoRef(uri: string): string {
   return `local:${MEAL_DIR.join('/')}/${new File(uri).name}`;
+}
+
+/**
+ * 保存期間を過ぎたレシート・食事の写真を消す（アプリを開いたときに呼ぶ）。消した枚数を返す。
+ * 日数は保存した日（ファイルの更新日時）から数える。対応表からも外す。失敗しても投げない。
+ */
+export function cleanupOldPhotos(days: number, now: number = Date.now()): number {
+  if (days <= 0) return 0;
+  const limit = now - days * 24 * 60 * 60 * 1000;
+  let removed = 0;
+  for (const parts of [RECEIPT_DIR, MEAL_DIR]) {
+    try {
+      const dir = new Directory(Paths.document, ...parts);
+      if (!dir.exists) continue;
+      for (const entry of dir.list()) {
+        if (!(entry instanceof File)) continue;
+        const at = entry.modificationTime ?? entry.creationTime;
+        if (at && at < limit) {
+          entry.delete();
+          removed++;
+        }
+      }
+    } catch (e) {
+      console.warn('[PhotoStore] 古い写真を消せなかった:', e instanceof Error ? e.message : e);
+    }
+  }
+  if (removed > 0) {
+    const index = readJsonArray<PhotoIndexEntry>(INDEX_FILE).filter((e) => localUri(e.ref) !== null);
+    writeJson(INDEX_FILE, index);
+  }
+  return removed;
 }
 
 /** `local:` の参照を、この端末のファイル URI にする（無ければ null） */
