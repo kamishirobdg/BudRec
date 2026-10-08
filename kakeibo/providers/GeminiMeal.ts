@@ -40,6 +40,10 @@ export interface IdentifiedDish {
   used:       UsedItem[];
   /** 在庫のうち、どれなのか見分けられない候補（2 つ以上のときだけ）。ユーザーに後で選んでもらう */
   choices:    number[];
+  /** 写真から見積もった、食べた分の量（g）。見積もれなければ undefined */
+  grams?:     number;
+  /** 写っている栄養成分表示から読んだ、食べた分のエネルギー（kcal）。読めなければ undefined */
+  labelKcal?: number;
 }
 
 /** 在庫の 1 品（写真の料理・食品と突き合わせる候補） */
@@ -85,9 +89,11 @@ const DISH_ITEM_SCHEMA = {
       },
     },
     choices: { type: 'ARRAY', items: { type: 'NUMBER' } },
+    grams:     { type: 'NUMBER' },
+    labelKcal: { type: 'NUMBER' },
   },
   required: ['name', 'kind', 'shared', 'count', 'eater', 'confidence'],
-  propertyOrdering: ['name', 'kind', 'shared', 'count', 'eater', 'confidence', 'used', 'choices'],
+  propertyOrdering: ['name', 'kind', 'shared', 'count', 'eater', 'confidence', 'used', 'choices', 'grams', 'labelKcal'],
 };
 
 /** 料理の各項目の説明（写真の振り分けのプロンプトに入れる） */
@@ -105,8 +111,8 @@ export function buildDishGuide(ctx: DishContext): string {
   return `${people}
 ${corrections}${inventory}
 写真に写っている料理・食品ごとに 1 つ:
-- name: 料理名。チェーン店のメニューと分かる場合は公式のメニュー名に近い名前（例: 牛丼 並盛）。
-  家にある商品と分かれば、その品名
+- name: 料理名。日本語で書く（外国の商品はパッケージのカタカナ表記か、日本語の一般名。例: Butter waffles → バターワッフル）。
+  チェーン店のメニューと分かる場合は公式のメニュー名に近い名前（例: 牛丼 並盛）。家にある商品と分かれば、その品名
 - kind: eat_out（飲食店の料理）/ packaged（コンビニ・スーパーの弁当・パン・菓子・飲料・アイスなどの商品）/ home（家で作った料理）
 - shared: 焼肉・寿司の盛り合わせ・鍋・大皿料理など、一品で完結せず取り分けて食べるものは true。一人前の料理は false
 - count: 同じ一人前の料理がいくつ写っているか（取り分ける料理は 1）
@@ -121,6 +127,11 @@ ${corrections}${inventory}
 - choices: 家にある食材・商品のうち、**同じ種類の候補が複数あってどれなのか写真から見分けられない**とき、
   その候補の index を全部入れる（例: 冷凍からあげが 2 種類あるとき）。見分けられる・候補が 1 つなら空配列。
   見分けられないときも used には最も可能性の高いものを入れておく
+
+- grams: 写っている分（食べた分）の量を g で見積もる。一緒に写っている物（箸・手・食器・包装・キーボードなど）の大きさを手がかりにする。
+  個包装の菓子は 1 袋の中身の量（例: 個包装のワッフル 1 枚なら 20〜30g）。見積もれなければ省略
+- labelKcal: 包装の栄養成分表示（裏の表や、表の「1 個あたり ○kcal」の表示）が写っていて読めれば、写っている分のエネルギー（kcal）。
+  表示が「100g あたり」「1 食（15g）あたり」なら、grams の量に換算する。読めなければ省略（推測で入れない）
 
 食べ物以外（食器・調味料の容器・メニュー表）は含めない。料理・食品が写っていなければ dishes は空配列。`;
 }
@@ -157,6 +168,8 @@ export function dishesFromParsed(parsed: any, inventorySize: number): Identified
           ratio:  Number(u?.ratio) > 0 ? Math.min(1, Number(u.ratio)) : undefined,
         })),
       choices: [...new Set<number>((Array.isArray(d?.choices) ? d.choices : []).filter(validIndex).map(Number))],
+      grams:     Number(d?.grams) > 0 ? Number(d.grams) : undefined,
+      labelKcal: Number(d?.labelKcal) > 0 ? Number(d.labelKcal) : undefined,
     }))
     .map((d) => ({ ...d, choices: d.choices.length >= 2 ? d.choices : [] }))
     .filter((d) => d.name.length > 0);

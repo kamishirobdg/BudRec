@@ -330,15 +330,30 @@ export async function recordMeal(
         store: storeOf(i),
         name:  used.length > 0 ? `${nameOf(i)}（使った食材: ${used.join('、')}）` : nameOf(i),
         kind:  d.kind,
+        // 写真から見積もった量があれば渡す（無いと「商品 1 個」が袋全体の量と取り違えられることがある）
+        // 外食はメニューの一人前が決まっているので渡さない
+        amount: d.kind === 'packaged' && used.length === 0 && d.grams ? `約 ${Math.round(d.grams)}g` : undefined,
       };
     });
     const res = await lookupNutrition(queries, { signal });
     sources = res.sources;
-    todo.forEach((i, k) => { whole[i] = res.results[k]; });
-    // 外食のメニュー・家の外で買った商品は食品データに足す（次からは調べずに済む）
+    todo.forEach((i, k) => {
+      const r = res.results[k];
+      const label = dishes[i].labelKcal;
+      const kcal = r.nutrients['ENERC_KCAL'];
+      // 写っている栄養成分表示のエネルギーが読めたら、それに合わせて全体を直す（推定より包装の表示を信じる）
+      whole[i] = label && kcal && kcal > 0
+        ? { nutrients: scaleNutrients(r.nutrients, label / kcal), official: true }
+        : label
+          ? { nutrients: { ...r.nutrients, ENERC_KCAL: label }, official: true }
+          : r;
+    });
+    // 外食のメニュー・家の外で買った商品は食品データに足す（次からは調べずに済む）。
+    // 写真から量を見積もった・包装の表示を読んだものは、その回の量の値なので足さない
     await saveResearched(todo
       .map((i, k) => ({ i, k }))
-      .filter(({ i }) => dishes[i].kind !== 'home' && dishes[i].used.length === 0)
+      .filter(({ i }) => dishes[i].kind !== 'home' && dishes[i].used.length === 0 &&
+        !(dishes[i].kind === 'packaged' && (dishes[i].grams || dishes[i].labelKcal)))
       .map(({ i, k }) => ({
         query: { name: nameOf(i), chain: dishes[i].kind === 'eat_out' ? storeOf(i) : '', kind: dishes[i].kind, content: '' },
         result: { nutrients: res.results[k].nutrients, basis: 'package' as const, official: res.results[k].official },
