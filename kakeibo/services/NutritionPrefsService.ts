@@ -3,7 +3,7 @@
  * 両方の端末で同じ設定にするため共有シートに置く。仕様は docs/meal-nutrition-spec.md §3.6。
  *
  * | user | visible（栄養素キーの JSON 配列） | targets（{"ENERC_KCAL": 2000, ...}。任意） |
- * | birth_date（YYYY-MM-DD）| sex（male / female） | activity（I / II / III。身体活動レベル） |
+ * | birth_date（YYYY-MM-DD）| sex（male / female） | activity（auto / I / II / III。身体活動レベル。auto は歩数から決める） |
  *
  * 生年・性別・活動レベルから、食事摂取基準の値（年齢区分）を決める（§11）。
  */
@@ -22,7 +22,8 @@ export interface NutritionProfile {
   /** 'YYYY-MM-DD' */
   birthDate: string | null;
   sex:       Sex | null;
-  activity:  Activity;
+  /** auto = ヘルスコネクトの歩数から決める（記録が足りなければ「ふつう」） */
+  activity:  Activity | 'auto';
 }
 
 export interface NutritionPrefs {
@@ -32,7 +33,13 @@ export interface NutritionPrefs {
   profile: NutritionProfile;
 }
 
-export const DEFAULT_PROFILE: NutritionProfile = { birthDate: null, sex: null, activity: 'II' };
+export const DEFAULT_PROFILE: NutritionProfile = { birthDate: null, sex: null, activity: 'auto' };
+
+/** 判定に使う活動レベル（auto なら歩数から決めた値。決められなければ「ふつう」） */
+export function resolveProfile(prefs: NutritionPrefs, autoLevel: Activity | null): NutritionPrefs {
+  if (prefs.profile.activity !== 'auto') return prefs;
+  return { ...prefs, profile: { ...prefs.profile, activity: autoLevel ?? 'II' } };
+}
 
 /**
  * 生年月日を 'YYYY-MM-DD' に揃える（「1990/4/15」「1990年4月15日」「19900415」も受ける）。実在しない日付は null。
@@ -54,7 +61,7 @@ function parseProfile(birthDate: unknown, sex: unknown, activity: unknown): Nutr
   return {
     birthDate: normalizeBirthDate(birthDate),
     sex: sex === 'male' || sex === 'female' ? sex : null,
-    activity: activity === 'I' || activity === 'III' ? activity : 'II',
+    activity: activity === 'I' || activity === 'II' || activity === 'III' ? activity : 'auto',
   };
 }
 

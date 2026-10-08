@@ -11,6 +11,7 @@ import { SheetsInternal, HEADER_ROW, ITEMS_HEADER_ROW, USERS_HEADER } from './Sh
 import { MEALS_HEADER } from './MealService';
 import { FOOD_HEADER, MENU_SHEET } from './FoodService';
 import { NUTRITION_PREFS_HEADER } from './NutritionPrefsService';
+import { ACTIVITY_HEADER } from './ActivityService';
 import * as Demo from './DemoService';
 
 function expectedHeader(sheet: string): readonly string[] | null {
@@ -20,6 +21,7 @@ function expectedHeader(sheet: string): readonly string[] | null {
   if (sheet === '_foods' || sheet === MENU_SHEET) return FOOD_HEADER;
   if (sheet === '_users') return USERS_HEADER;
   if (sheet === '_nutrition_prefs') return NUTRITION_PREFS_HEADER;
+  if (sheet === '_activity') return ACTIVITY_HEADER;
   return null;
 }
 

@@ -3,7 +3,7 @@
     "name": "Bud-Rec",
     "slug": "kakeibo",
     "scheme": "com.svnsfy.kakeibo",
-    "version": "2.8.3",
+    "version": "2.9.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
@@ -23,7 +23,16 @@
         "backgroundColor": "#2e7d32"
       },
       "edgeToEdgeEnabled": true,
-      "predictiveBackGestureEnabled": false
+      "predictiveBackGestureEnabled": false,
+      "permissions": [
+        "android.permission.health.READ_STEPS",
+        "android.permission.health.READ_SLEEP",
+        "android.permission.health.READ_ACTIVE_CALORIES_BURNED",
+        "android.permission.health.READ_TOTAL_CALORIES_BURNED",
+        "android.permission.health.READ_EXERCISE",
+        "android.permission.health.READ_WEIGHT",
+        "android.permission.health.READ_BODY_FAT"
+      ]
     },
     "web": {
       "favicon": "./assets/favicon.png"
@@ -32,7 +41,16 @@
       "expo-secure-store",
       "expo-web-browser",
       "./plugins/withOcrForegroundService",
-      "expo-background-task"
+      "expo-background-task",
+      "react-native-health-connect",
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "minSdkVersion": 26
+          }
+        }
+      ]
     ],
     "extra": {
       "eas": {

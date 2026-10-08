@@ -24,9 +24,9 @@ export async function setSortKey(key: SortKey): Promise<void> {
 //
 // 端末ごと。少なくとも 1 つは表示する（全部消すと画面が無くなる）
 
-export const TAB_KEYS = ['Camera', 'Meals', 'Summary'] as const;
+export const TAB_KEYS = ['Camera', 'Meals', 'Body', 'Summary'] as const;
 export type TabKey = typeof TAB_KEYS[number];
-export const TAB_LABELS: Record<TabKey, string> = { Camera: '撮影', Meals: '食事', Summary: '一覧' };
+export const TAB_LABELS: Record<TabKey, string> = { Camera: '撮影', Meals: '食事', Body: 'からだ', Summary: '一覧' };
 
 export interface TabLayout {
   /** 表示する順（隠したタブも含む） */
@@ -42,8 +42,12 @@ function sanitizeTabLayout(raw: unknown): TabLayout {
   const r = (raw && typeof raw === 'object' ? raw : {}) as Partial<TabLayout>;
   const isKey = (k: unknown): k is TabKey => (TAB_KEYS as readonly unknown[]).includes(k);
   const order = (Array.isArray(r.order) ? r.order.filter(isKey) : []).filter((k, i, a) => a.indexOf(k) === i);
-  // 後から増えたタブは末尾に足す
-  for (const k of TAB_KEYS) if (!order.includes(k)) order.push(k);
+  // 後から増えたタブは、既定の並びで前にあるタブの後ろに差し込む（からだは食事の隣）
+  TAB_KEYS.forEach((k, i) => {
+    if (order.includes(k)) return;
+    const prev = TAB_KEYS.slice(0, i).reverse().find((p) => order.includes(p));
+    order.splice(prev ? order.indexOf(prev) + 1 : 0, 0, k);
+  });
   const hidden = Array.isArray(r.hidden) ? r.hidden.filter(isKey) : [];
   return { order, hidden: hidden.length >= order.length ? [] : hidden };
 }

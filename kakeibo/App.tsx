@@ -9,6 +9,8 @@ import HomeScreen from './screens/HomeScreen';
 import CameraScreen from './screens/CameraScreen';
 import SummaryScreen from './screens/SummaryScreen';
 import MealsScreen from './screens/MealsScreen';
+import BodyScreen from './screens/BodyScreen';
+import { syncActivity } from './services/ActivityService';
 import { cleanupExpired as cleanupSharedPhotos } from './services/SharedPhotos';
 import UserSetupScreen from './screens/UserSetupScreen';
 import ErrorBoundary from './components/ErrorBoundary';
@@ -166,6 +168,8 @@ function AppContent() {
     // 後から列を足したシートの見出しを補う（起動直後の読み込みと重ならないよう少し待つ）
     const headerTimer = setTimeout(() => { void repairHeaders(); }, 15_000);
     // 代理入力の相手の候補として、この端末のユーザー名を共有の一覧に載せる
+    // ヘルスコネクトの歩数・睡眠などを `_activity` に写す（許可済みのときだけ。確認は出さない）
+    getCurrentUserRaw().then((name) => syncActivity(name)).catch(() => {});
     getCurrentUserRaw()
       .then((name) => registerUser(name))
       .catch((e) => console.warn('[App] ユーザー名を登録できなかった:', e instanceof Error ? e.message : e));
@@ -239,6 +243,22 @@ function AppContent() {
                         onSuccess={setOcrToast}
                         onOpenSettings={() => setSettingsOpen(true)}
                       />
+                    </ErrorBoundary>
+                  )}
+                </Tab.Screen>
+              );
+              if (key === 'Body') return (
+                <Tab.Screen
+                  key={key}
+                  name="Body"
+                  options={{
+                    title: TAB_LABELS.Body,
+                    tabBarIcon: ({ color, size }) => <Ionicons name="body" color={color} size={size} />,
+                  }}
+                >
+                  {() => (
+                    <ErrorBoundary>
+                      <BodyScreen />
                     </ErrorBoundary>
                   )}
                 </Tab.Screen>

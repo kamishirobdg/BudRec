@@ -5,7 +5,8 @@ import { sumNutrients } from '../services/Nutrients';
 import { getCurrentUser } from '../services/UserService';
 import * as OcrWorker from '../services/OcrWorker';
 import * as ReceiptQueue from '../services/ReceiptQueueService';
-import { DEFAULT_PREFS, NutritionPrefs, loadPrefs } from '../services/NutritionPrefsService';
+import { DEFAULT_PREFS, NutritionPrefs, loadPrefs, resolveProfile } from '../services/NutritionPrefsService';
+import { DayActivity, autoActivityLevel, loadActivity } from '../services/ActivityService';
 import { NutrientStatus, dayOf, judgeDay, shiftDay, today } from '../services/NutritionJudge';
 import {
   Supplement, SupplementSkip, loadSupplements, setSkipped, supplementNutrients, supplementsOn,
@@ -55,7 +56,11 @@ export default function MealsScreen() {
   const [confirmCount, setConfirmCount] = useState(0);
   // 保存中のサプリ（続けて切り替えると、前の保存と順番が入れ違って最後の操作が残らないので待たせる）
   const [supSaving, setSupSaving] = useState<string | null>(null);
+  const [activity, setActivity] = useState<DayActivity[]>([]);
   const prefs = prefsMap.get(me) ?? DEFAULT_PREFS;
+  // 活動レベルが「自動」なら、ヘルスコネクトの歩数から決めた値で判定する
+  const autoLevel = useMemo(() => autoActivityLevel(activity, me, today()), [activity, me]);
+  const judgedPrefs = useMemo(() => resolveProfile(prefs, autoLevel), [prefs, autoLevel]);
 
   /** 書き換えた後の内容を、画面と端末の控えの両方に入れる（控えが古いと、次に開いたとき元に戻って見える） */
   const applySups = (next: { supplements: Supplement[]; skips: SupplementSkip[] }) => {
@@ -95,6 +100,7 @@ export default function MealsScreen() {
         cachedLoad('nutrition_prefs', async () => [...(await loadPrefs()).entries()], (entries) => setPrefsMap(new Map(entries)))
           .then((entries) => { setPrefsMap(new Map(entries)); setPrefsReady(true); }),
         cachedLoad('supplements', loadSupplements, setSups).then(setSups),
+        cachedLoad('activity', loadActivity, setActivity).then(setActivity).catch(() => {}),
         loadMonths(monthsRef.current),
       ]);
     } catch (e) {
@@ -159,10 +165,10 @@ export default function MealsScreen() {
       const list = [...mine, ...supN];
       const totals: Record<string, number | null> = {};
       for (const [k, t] of Object.entries(sumNutrients(list))) totals[k] = t.partial && t.value === 0 ? null : t.value;
-      out.push({ day: d, statuses: judgeDay(totals, prefs) });
+      out.push({ day: d, statuses: judgeDay(totals, judgedPrefs) });
     }
     return out;
-  }, [view, span, day, groups, me, sups, prefs]);
+  }, [view, span, day, groups, me, sups, judgedPrefs]);
 
   const reviewCount = new Set(groups.filter((g) => g.rows.some((r) => r.status === 'needs_review')).map((g) => g.mealId)).size;
 
@@ -249,7 +255,7 @@ export default function MealsScreen() {
           me={me}
           day={day}
           meals={dayMeals}
-          prefs={prefs}
+          prefs={judgedPrefs}
           supplements={daySups}
           supplementNutrients={supplementNutrients(daySups)}
           loading={loading}
@@ -259,12 +265,13 @@ export default function MealsScreen() {
           supplementSaving={supSaving !== null}
         />
       ) : (
-        <TrendView days={trendDays} prefs={prefs} span={span} onSpan={setSpan} loading={loading} onRefresh={loadAll} />
+        <TrendView days={trendDays} prefs={judgedPrefs} span={span} onSpan={setSpan} loading={loading} onRefresh={loadAll} />
       )}
 
       <NutritionPrefsModal
         user={prefsOpen ? me : null}
         prefs={prefs}
+        autoActivity={autoLevel}
         onClose={() => setPrefsOpen(false)}
         onSaved={(next) => {
           applyPrefs(new Map(prefsMap).set(me, next));

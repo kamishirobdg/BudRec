@@ -12,18 +12,20 @@ const ACTIVITY_LABEL: Record<Activity, string> = { I: '低い', II: 'ふつう',
 interface Props {
   /** 設定する人（null なら閉じている） */
   user:    string | null;
+  /** 歩数から決めた活動レベル（記録が足りなければ null） */
+  autoActivity?: Activity | null;
   prefs:   NutritionPrefs;
   onClose: () => void;
   onSaved: (prefs: NutritionPrefs) => void;
 }
 
 /** 食事の一覧に出す栄養素と、1 日の目標値を選ぶ（人ごと。両方の端末で同じ設定になる） */
-export default function NutritionPrefsModal({ user, prefs, onClose, onSaved }: Props) {
+export default function NutritionPrefsModal({ user, prefs, onClose, onSaved, autoActivity = null }: Props) {
   const [visible, setVisible] = useState<string[]>(prefs.visible);
   const [targets, setTargets] = useState<Record<string, string>>({});
   const [birthDate, setBirthDate] = useState('');
   const [sex, setSex]             = useState<Sex | null>(null);
-  const [activity, setActivity]   = useState<Activity>('II');
+  const [activity, setActivity]   = useState<Activity | 'auto'>('auto');
   const [saving, setSaving]   = useState(false);
 
   // 開いたときだけ読み込む（開いている間に一覧が読み直されても入力中の値を戻さない）
@@ -110,9 +112,11 @@ export default function NutritionPrefsModal({ user, prefs, onClose, onSaved }: P
                   </View>
                   <View style={styles.profileRow}>
                     <Text style={styles.profileLabel}>活動量</Text>
-                    {(['I', 'II', 'III'] as const).map((v) => (
+                    {(['auto', 'I', 'II', 'III'] as const).map((v) => (
                       <TouchableOpacity key={v} style={[styles.chip, activity === v && styles.chipActive]} onPress={() => setActivity(v)}>
-                        <Text style={[styles.chipText, activity === v && styles.chipTextActive]}>{ACTIVITY_LABEL[v]}</Text>
+                        <Text style={[styles.chipText, activity === v && styles.chipTextActive]}>
+                          {v === 'auto' ? `自動${autoActivity ? `（${ACTIVITY_LABEL[autoActivity]}）` : ''}` : ACTIVITY_LABEL[v]}
+                        </Text>
                       </TouchableOpacity>
                     ))}
                   </View>
@@ -167,7 +171,7 @@ const styles = StyleSheet.create({
   close:  { fontSize: 20, color: '#666', paddingHorizontal: 8 },
   colHead: { flexDirection: 'row', paddingTop: 10, paddingBottom: 4 },
   profile:      { backgroundColor: '#fff', borderRadius: 12, padding: 12, gap: 10 },
-  profileRow:   { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  profileRow:   { flexDirection: 'row', alignItems: 'center', gap: 6, flexWrap: 'wrap' },
   profileLabel: { width: 80, fontSize: 13, color: '#374151' },
   yearInput: {
     width: 120, fontSize: 14, borderWidth: 1, borderColor: '#e5e7eb', borderRadius: 8,
