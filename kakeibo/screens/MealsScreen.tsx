@@ -10,7 +10,9 @@ import {
   View,
 } from 'react-native';
 import { getMeals, MealRow } from '../services/MealService';
-import { DEFAULT_VISIBLE, nutrientDef, sumNutrients } from '../services/Nutrients';
+import { NutrientTotal, nutrientDef, sumNutrients } from '../services/Nutrients';
+import { DEFAULT_PREFS, NutritionPrefs, loadPrefs } from '../services/NutritionPrefsService';
+import NutritionPrefsModal from './NutritionPrefsModal';
 import { getCurrentUser } from '../services/UserService';
 import { getUniqueUsers } from '../services/SheetsService';
 import * as OcrWorker from '../services/OcrWorker';
@@ -29,6 +31,44 @@ function monthOf(d: Date): string {
 function shiftMonth(ym: string, delta: number): string {
   const [y, m] = ym.split('-').map(Number);
   return monthOf(new Date(y, m - 1 + delta, 1));
+}
+
+type Period = 'day' | 'week' | 'month';
+const PERIOD_LABEL: Record<Period, string> = { day: '日', week: '週', month: '月' };
+
+/** 'YYYY/MM/DD …' / 'YYYY-MM-DD …' の日付部分（Hermes では new Date に文字列を渡さない） */
+function dayOf(ts: string): Date {
+  const m = ts.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})/);
+  return m ? new Date(+m[1], +m[2] - 1, +m[3]) : new Date(0);
+}
+
+function md(d: Date): string {
+  return `${d.getMonth() + 1}/${d.getDate()}`;
+}
+
+/** 期間の見出しと並び順の鍵。週は月曜始まり */
+function periodOf(ts: string, period: Period): { key: string; title: string } {
+  const d = dayOf(ts);
+  if (period === 'month') return { key: monthOf(d), title: `${d.getFullYear()}年${d.getMonth() + 1}月` };
+  if (period === 'week') {
+    const mon = new Date(d.getFullYear(), d.getMonth(), d.getDate() - ((d.getDay() + 6) % 7));
+    const sun = new Date(mon.getFullYear(), mon.getMonth(), mon.getDate() + 6);
+    return { key: `${monthOf(mon)}-${pad(mon.getDate())}`, title: `${md(mon)}〜${md(sun)}` };
+  }
+  return { key: `${monthOf(d)}-${pad(d.getDate())}`, title: ts.slice(0, 10) };
+}
+
+/** 見出しの栄養の表示。週・月は 1 日あたりの平均にして目標と比べる */
+function totalsLabel(totals: Record<string, NutrientTotal>, prefs: NutritionPrefs, days: number, period: Period): string {
+  const parts = prefs.visible.map((k) => {
+    const t = totals[k];
+    const def = nutrientDef(k);
+    if (!t || !def) return null;
+    const v = Math.round((t.value / (period === 'day' ? 1 : Math.max(1, days))) * 10) / 10;
+    const target = prefs.targets[k];
+    return `${def.label} ${v}${target ? `/${target}` : ''}${def.unit}${t.partial ? '+' : ''}`;
+  }).filter(Boolean);
+  return (period === 'day' ? '' : `1日平均（${days}日）　`) + parts.join('　');
 }
 
 interface MealGroup {
@@ -51,6 +91,10 @@ export default function MealsScreen() {
   const [view, setView]         = useState<'meals' | 'stock'>('meals');
   // 「食べきりましたか？」の数（在庫タブの見出しに出す）
   const [confirmCount, setConfirmCount] = useState(0);
+  const [period, setPeriod]     = useState<Period>('day');
+  const [prefsMap, setPrefsMap] = useState<Map<string, NutritionPrefs>>(new Map());
+  const [prefsUser, setPrefsUser] = useState<string | null>(null);
+  const prefs = prefsMap.get(person) ?? DEFAULT_PREFS;
 
   // 月を素早く切り替えたとき、前の月の遅れて返った結果で上書きしない
   const requestSeq = useRef(0);
@@ -58,8 +102,13 @@ export default function MealsScreen() {
     const seq = ++requestSeq.current;
     setLoading(true);
     try {
-      const [me, users, meals] = await Promise.all([getCurrentUser(), getUniqueUsers(), getMeals(month)]);
+      const [me, users, meals, prefsLoaded] = await Promise.all([
+        getCurrentUser(), getUniqueUsers(), getMeals(month),
+        // 表示設定が読めなくても既定の表示で一覧は出す
+        loadPrefs().catch(() => new Map<string, NutritionPrefs>()),
+      ]);
       if (seq !== requestSeq.current) return;
+      setPrefsMap(prefsLoaded);
       setPeople([me, ...users.filter((u) => u !== me)]);
       setPerson((p) => p || me);
       setRows(meals);
@@ -90,20 +139,28 @@ export default function MealsScreen() {
       g.rows.push(r);
       groups.set(r.mealId, g);
     }
-    const byDay = new Map<string, MealGroup[]>();
+    const byPeriod = new Map<string, { title: string; meals: MealGroup[] }>();
     for (const g of groups.values()) {
-      const day = g.eatenAt.slice(0, 10);
-      byDay.set(day, [...(byDay.get(day) ?? []), g]);
+      const { key, title } = periodOf(g.eatenAt, period);
+      const entry = byPeriod.get(key) ?? { title, meals: [] };
+      entry.meals.push(g);
+      byPeriod.set(key, entry);
     }
-    return [...byDay.entries()]
+    return [...byPeriod.entries()]
       .sort((a, b) => (a[0] < b[0] ? 1 : -1))
-      .map(([day, meals]) => ({
-        day,
-        data: meals.sort((a, b) => (a.eatenAt < b.eatenAt ? 1 : -1)),
-        totals: sumNutrients(meals.flatMap((m) => m.rows.filter((r) => r.user === person).map((r) => r.nutrients))),
-        hasPerson: meals.some((m) => m.rows.some((r) => r.user === person)),
-      }));
-  }, [rows, person]);
+      .map(([key, { title, meals }]) => {
+        const mine = meals.flatMap((m) => m.rows.filter((r) => r.user === person));
+        return {
+          key,
+          title,
+          data: meals.sort((a, b) => (a.eatenAt < b.eatenAt ? 1 : -1)),
+          totals: sumNutrients(mine.map((r) => r.nutrients)),
+          // 平均は、その人の記録がある日の数で割る（記録していない日まで割ると少なく見える）
+          days: new Set(mine.map((r) => r.eatenAt.slice(0, 10))).size,
+          hasPerson: mine.length > 0,
+        };
+      });
+  }, [rows, person, period]);
 
   const reviewCount = new Set(rows.filter((r) => r.status === 'needs_review').map((r) => r.mealId)).size;
 
@@ -148,6 +205,17 @@ export default function MealsScreen() {
         </View>
       </View>
 
+      <View style={styles.subbar}>
+        {(['day', 'week', 'month'] as const).map((p) => (
+          <TouchableOpacity key={p} style={[styles.chip, period === p && styles.chipActive]} onPress={() => setPeriod(p)}>
+            <Text style={[styles.chipText, period === p && styles.chipTextActive]}>{PERIOD_LABEL[p]}</Text>
+          </TouchableOpacity>
+        ))}
+        <TouchableOpacity style={styles.prefsBtn} onPress={() => person && setPrefsUser(person)}>
+          <Text style={styles.prefsText}>表示</Text>
+        </TouchableOpacity>
+      </View>
+
       {deferred > 0 && (
         <Text style={styles.deferred}>推定待ち {deferred} 件（無料枠が戻ったら自動で処理）</Text>
       )}
@@ -155,21 +223,15 @@ export default function MealsScreen() {
       <SectionList
         sections={sections}
         keyExtractor={(g) => g.mealId}
+        stickySectionHeadersEnabled={false}
         refreshControl={<RefreshControl refreshing={loading} onRefresh={load} />}
         contentContainerStyle={styles.list}
         ListEmptyComponent={loading ? <ActivityIndicator style={{ marginTop: 24 }} /> : <Text style={styles.empty}>記録がありません</Text>}
         renderSectionHeader={({ section }) => (
           <View style={styles.dayHeader}>
-            <Text style={styles.dayTitle}>{section.day}</Text>
+            <Text style={styles.dayTitle}>{section.title}</Text>
             {section.hasPerson && (
-              <Text style={styles.dayTotals}>
-                {DEFAULT_VISIBLE.map((k) => {
-                  const t = section.totals[k];
-                  const def = nutrientDef(k);
-                  if (!t || !def) return null;
-                  return `${def.label} ${Math.round(t.value * 10) / 10}${def.unit}${t.partial ? '+' : ''}`;
-                }).filter(Boolean).join('　')}
-              </Text>
+              <Text style={styles.dayTotals}>{totalsLabel(section.totals, prefs, section.days, period)}</Text>
             )}
           </View>
         )}
@@ -202,6 +264,16 @@ export default function MealsScreen() {
               })}
             </TouchableOpacity>
           );
+        }}
+      />
+
+      <NutritionPrefsModal
+        user={prefsUser}
+        prefs={prefsMap.get(prefsUser ?? '') ?? DEFAULT_PREFS}
+        onClose={() => setPrefsUser(null)}
+        onSaved={(next) => {
+          if (prefsUser) setPrefsMap((prev) => new Map(prev).set(prefsUser, next));
+          setPrefsUser(null);
         }}
       />
 
@@ -239,6 +311,13 @@ const styles = StyleSheet.create({
   chipActive:     { backgroundColor: '#2e7d32', borderColor: '#2e7d32' },
   chipText:       { fontSize: 12, color: '#374151', fontWeight: '600' },
   chipTextActive: { color: '#fff' },
+  subbar: {
+    flexDirection: 'row', alignItems: 'center', gap: 6,
+    paddingHorizontal: 16, paddingVertical: 8, backgroundColor: '#fff',
+    borderBottomWidth: 1, borderBottomColor: '#eee',
+  },
+  prefsBtn:  { marginLeft: 'auto', paddingHorizontal: 12, paddingVertical: 4, borderRadius: 14, borderWidth: 1, borderColor: '#2e7d32' },
+  prefsText: { fontSize: 12, color: '#2e7d32', fontWeight: '600' },
   deferred: { fontSize: 12, color: '#6b7280', paddingHorizontal: 16, paddingTop: 8 },
   list:     { padding: 16, paddingBottom: 40, gap: 10 },
   empty:    { textAlign: 'center', color: '#888', marginTop: 24 },
