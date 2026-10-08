@@ -106,7 +106,7 @@ export async function stopSupplement(s: Supplement): Promise<void> {
 }
 
 /** その日に飲まなかった・飲んだに切り替える */
-export async function setSkipped(user: string, date: string, supplementId: string, skipped: boolean, current: SupplementSkip[]): Promise<void> {
+export async function setSkipped(user: string, date: string, supplementId: string, skipped: boolean): Promise<void> {
   if (await Demo.isDemo()) return;
   const client = await SheetsInternal.createClient();
   if (skipped) {
@@ -120,8 +120,14 @@ export async function setSkipped(user: string, date: string, supplementId: strin
     );
     return;
   }
-  // 飲んだに戻す: その日の印を全部消す（行は残して中身を空にする。行番号をずらさない）
-  const rows = current.filter((k) => k.user === user && k.date === date && k.supplementId === supplementId && k.rowIndex > 0);
+  // 飲んだに戻す: その日の印を全部消す（行は残して中身を空にする。行番号をずらさない）。
+  // 画面の内容（端末の控えのこともある）の行番号は古いことがあるので、シートを読み直して中身で探す
+  const names = await SheetsInternal.listSheetNames(client, true);
+  if (!names.includes(SKIP_SHEET)) return;
+  const res = await client.get(`/values/${encodeURIComponent(SKIP_SHEET)}!A:C`);
+  const rows = ((res.data.values ?? []) as string[][])
+    .map((c, i) => ({ c, rowIndex: i + 1 }))
+    .filter(({ c, rowIndex }) => rowIndex > 1 && c[0] === user && c[1] === date && c[2] === supplementId);
   if (rows.length === 0) return;
   await client.post('/values:batchUpdate', {
     valueInputOption: 'RAW',

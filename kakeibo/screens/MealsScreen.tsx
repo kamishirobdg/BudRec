@@ -10,7 +10,7 @@ import { NutrientStatus, dayOf, judgeDay, shiftDay, today } from '../services/Nu
 import {
   Supplement, SupplementSkip, loadSupplements, setSkipped, supplementNutrients, supplementsOn,
 } from '../services/SupplementService';
-import { cachedLoad } from '../services/LocalCache';
+import { cachedLoad, writeCache } from '../services/LocalCache';
 import MealEditModal, { MealTarget } from './MealEditModal';
 import NutritionPrefsModal from './NutritionPrefsModal';
 import SupplementsModal from './SupplementsModal';
@@ -53,7 +53,19 @@ export default function MealsScreen() {
   const [supsOpen, setSupsOpen]   = useState(false);
   const [deferred, setDeferred] = useState(0);
   const [confirmCount, setConfirmCount] = useState(0);
+  // 保存中のサプリ（続けて切り替えると、前の保存と順番が入れ違って最後の操作が残らないので待たせる）
+  const [supSaving, setSupSaving] = useState<string | null>(null);
   const prefs = prefsMap.get(me) ?? DEFAULT_PREFS;
+
+  /** 書き換えた後の内容を、画面と端末の控えの両方に入れる（控えが古いと、次に開いたとき元に戻って見える） */
+  const applySups = (next: { supplements: Supplement[]; skips: SupplementSkip[] }) => {
+    setSups(next);
+    writeCache('supplements', next);
+  };
+  const applyPrefs = (next: Map<string, NutritionPrefs>) => {
+    setPrefsMap(next);
+    writeCache('nutrition_prefs', [...next.entries()]);
+  };
 
   // 見ている日（と推移の期間）に要る月。朝 4 時区切りなので、翌月 1 日の深夜の食事は前の月の最後の日に入る
   const months = useMemo(() => {
@@ -155,6 +167,8 @@ export default function MealsScreen() {
   const reviewCount = new Set(groups.filter((g) => g.rows.some((r) => r.status === 'needs_review')).map((g) => g.mealId)).size;
 
   const toggleSupplement = async (s: Supplement, taken: boolean) => {
+    if (supSaving) return;
+    setSupSaving(s.supplementId);
     // 先に画面へ反映し、書けなかったら読み直す
     setSups((prev) => ({
       ...prev,
@@ -163,12 +177,13 @@ export default function MealsScreen() {
         : [...prev.skips, { user: me, date: day, supplementId: s.supplementId, rowIndex: 0 }],
     }));
     try {
-      await setSkipped(me, day, s.supplementId, !taken, sups.skips);
-      const fresh = await loadSupplements();
-      setSups(fresh);
+      await setSkipped(me, day, s.supplementId, !taken);
+      applySups(await loadSupplements());
     } catch (e) {
       Alert.alert('保存失敗', e instanceof Error ? e.message : String(e));
-      loadSupplements().then(setSups).catch(() => {});
+      loadSupplements().then(applySups).catch(() => {});
+    } finally {
+      setSupSaving(null);
     }
   };
 
@@ -241,6 +256,7 @@ export default function MealsScreen() {
           onRefresh={loadAll}
           onOpenMeal={(g) => setTarget({ mode: 'edit', sheetName: g.sheetName, mealId: g.mealId })}
           onToggleSupplement={toggleSupplement}
+          supplementSaving={supSaving !== null}
         />
       ) : (
         <TrendView days={trendDays} prefs={prefs} span={span} onSpan={setSpan} loading={loading} onRefresh={loadAll} />
@@ -251,7 +267,7 @@ export default function MealsScreen() {
         prefs={prefs}
         onClose={() => setPrefsOpen(false)}
         onSaved={(next) => {
-          setPrefsMap((prev) => new Map(prev).set(me, next));
+          applyPrefs(new Map(prefsMap).set(me, next));
           setPrefsOpen(false);
         }}
       />
@@ -261,7 +277,7 @@ export default function MealsScreen() {
         user={me}
         supplements={sups.supplements}
         onClose={() => setSupsOpen(false)}
-        onChanged={() => { loadSupplements().then(setSups).catch(() => {}); }}
+        onChanged={() => { loadSupplements().then(applySups).catch(() => {}); }}
       />
 
       <MealEditModal

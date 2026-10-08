@@ -226,6 +226,13 @@ export default function SummaryScreen({ onSignedOut }: Props) {
     setRangeOptions(opts);
   }, []);
 
+  // 最新を読めた範囲（読めた後の画面の変更＝自分の編集も端末の控えに入れる。控えが古いと、次に開いたとき
+  // 自分の編集が戻って見え、その状態で操作すると古い値で書き戻してしまう）
+  const freshRef = useRef<RangeSpec | null>(null);
+  useEffect(() => {
+    if (freshRef.current) RowsCache.save(freshRef.current, rows);
+  }, [rows]);
+
   const loadRows = useCallback(async (range: RangeSpec) => {
     // ユーザー名・デモ設定は端末ローカル読み出しのみ（通信不要）。
     // Sheets 側が落ちていてもここは常に反映しておく（オフラインキャッシュの絞り込みに使うため）
@@ -241,6 +248,7 @@ export default function SummaryScreen({ onSignedOut }: Props) {
     // 前に読めた内容が端末にあれば先に出し、通信が終わったら差し替える（待たせない）。
     // 編集は書く前に行の rev を確かめるので、古い内容から操作しても上書き事故にはならない
     const early = isDemo ? null : RowsCache.get(range);
+    freshRef.current = null;
     if (early) setRows(early.rows);
     setLoading(!early);
     try {
@@ -248,6 +256,7 @@ export default function SummaryScreen({ onSignedOut }: Props) {
         getRowsForRange(range),
         getDefaultPartialAmount(),
       ]);
+      freshRef.current = isDemo ? null : range;
       setRows(list);
       setDefaultPartial(partial);
       setLoadError(null);

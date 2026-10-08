@@ -92,7 +92,10 @@ function judgeOne(key: string, value: number | null, kcal: number | null, prefs:
   /** エネルギー比で判定する */
   const byPercent = (standard: string, low: number | undefined, high: number, ratioKcal: number, extraLow = false): NutrientStatus => {
     const band = { bandLow: low ?? 0, bandHigh: high, plotUnit: '%' };
-    if (value === null || !kcal) return { ...base, standard, ...band, plot: null };
+    if (value === null || !kcal) {
+      // エネルギーが分からなくても、量で不足と分かるもの（たんぱく質の推奨量）は不足にする
+      return { ...base, standard, ...band, plot: null, judgement: extraLow ? 'low' : 'none' };
+    }
     const percent = (value * ratioKcal / kcal) * 100;
     const judgement: Judgement = (low !== undefined && percent < low) || extraLow ? 'low' : percent > high ? 'high' : 'ok';
     return { ...base, standard, percent, judgement, ratio: percent / high, plot: percent, ...band };

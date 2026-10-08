@@ -181,11 +181,12 @@ export default function MealEditModal({ target, onClose, onSaved }: Props) {
   const autoShared = loaded.find((r) => r.shared !== undefined)?.shared
     ?? new Set(drafts.flatMap((d) => d.eaters.map((e) => e.user))).size > 1;
   const shared = sharedFlag ?? autoShared;
-  const changed =
-    (sharedFlag !== null && sharedFlag !== autoShared) ||
+  const shareChanged = sharedFlag !== null && sharedFlag !== autoShared;
+  const contentChanged =
     drafts.length !== toDrafts(loaded).length ||
     drafts.some((d) => d.isNew || d.refreshed || d.chosen !== null || d.dish.trim() !== d.originalDish
       || eatersKey(d.eaters) !== eatersKey(d.originalEaters));
+  const changed = shareChanged || contentChanged;
   const needsReview = loaded.some((r) => r.status === 'needs_review');
 
   const update = (dishId: string, patch: Partial<DishDraft>) =>
@@ -348,6 +349,18 @@ export default function MealEditModal({ target, onClose, onSaved }: Props) {
     try {
       // 変えていなければ「確定」だけ（共有写真を消すまでの 7 日をここから数える）
       if (!changed && !needsReview && !isNewMeal) {
+        await markSettled(mealId);
+        onSaved();
+        return;
+      }
+      // 共有の切り替えだけなら、中身（状態・推定の印）はそのままにする。手で直した扱い（edited）にすると、
+      // 後から撮ったレシートとのひも付けの対象から外れてしまう
+      if (shareChanged && !contentChanged && !needsReview && !isNewMeal) {
+        const saved = await persist(loaded.map((r) => ({ ...r, shared: sharedFlag! })), baseRev);
+        if (!saved) return;
+        setLoaded(saved);
+        setBaseRev(mealRev(saved));
+        await ensureMealShared(saved, me);
         await markSettled(mealId);
         onSaved();
         return;

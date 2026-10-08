@@ -9,7 +9,7 @@ import { NUTRIENTS, Nutrients, nutrientDef, sanitizeNutrients } from '../service
 import {
   Supplement, readSupplementLabel, saveSupplement, stopSupplement,
 } from '../services/SupplementService';
-import { today } from '../services/NutritionJudge';
+import { shiftDay, today } from '../services/NutritionJudge';
 
 interface Props {
   visible:     boolean;
@@ -90,12 +90,24 @@ export default function SupplementsModal({ visible, user, supplements, onClose, 
     if (!(perDay > 0)) { Alert.alert('1 日の量を入れてください'); return; }
     setBusy(true);
     try {
-      await saveSupplement({
-        supplementId: draft.base?.supplementId, rowIndex: draft.base?.rowIndex, user, name,
-        unit: draft.unit.trim() || '粒', perDay,
-        nutrients: sanitizeNutrients(draft.nutrients),
-        started: draft.base?.started || today(), ended: draft.base?.ended ?? '', note: draft.base?.note ?? '',
-      });
+      const nutrients = sanitizeNutrients(draft.nutrients);
+      const base = draft.base;
+      // 飲む量・成分を変えたら、昨日までは前の内容のまま残し、今日から新しい内容で足す（過去の日の合計を変えない）
+      const amountChanged = !!base &&
+        (base.perDay !== perDay || JSON.stringify(sanitizeNutrients(base.nutrients)) !== JSON.stringify(nutrients));
+      if (base && amountChanged && base.started < today()) {
+        await saveSupplement({ ...base, ended: shiftDay(today(), -1) });
+        await saveSupplement({
+          user, name, unit: draft.unit.trim() || '粒', perDay, nutrients,
+          started: today(), ended: base.ended && base.ended >= today() ? base.ended : '', note: base.note,
+        });
+      } else {
+        await saveSupplement({
+          supplementId: base?.supplementId, rowIndex: base?.rowIndex, user, name,
+          unit: draft.unit.trim() || '粒', perDay, nutrients,
+          started: base?.started || today(), ended: base?.ended ?? '', note: base?.note ?? '',
+        });
+      }
       setDraft(null);
       onChanged();
     } catch (e) {

@@ -27,6 +27,8 @@ interface Props {
   onRefresh:   () => void;
   onOpenMeal:  (g: MealGroup) => void;
   onToggleSupplement: (s: Supplement, taken: boolean) => void;
+  /** サプリの切り替えを保存中（終わるまで切り替えられない） */
+  supplementSaving?:  boolean;
 }
 
 const JUDGE_LABEL: Record<Judgement, string> = { low: '不足', ok: '適正', high: '過剰', none: '—' };
@@ -40,7 +42,9 @@ function fmt(v: number | null, unit: string): string {
 
 /** その日の栄養の表・サプリ・食事の一覧 */
 export default function DayView(props: Props) {
-  const { me, meals, prefs, supplements, supplementNutrients, loading, onRefresh, onOpenMeal, onToggleSupplement } = props;
+  const {
+    me, meals, prefs, supplements, supplementNutrients, loading, onRefresh, onOpenMeal, onToggleSupplement, supplementSaving,
+  } = props;
   const [showAll, setShowAll] = useState(false);
 
   const statuses = useMemo(() => {
@@ -85,6 +89,7 @@ export default function DayView(props: Props) {
               <Switch
                 value={!skipped}
                 onValueChange={(v) => onToggleSupplement(supplement, v)}
+                disabled={supplementSaving}
                 trackColor={{ false: '#ccc', true: '#a5d6a7' }}
                 thumbColor={!skipped ? '#2e7d32' : '#f4f3f4'}
               />

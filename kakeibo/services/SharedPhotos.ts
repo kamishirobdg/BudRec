@@ -143,9 +143,12 @@ async function upload(p: {
 export async function ensureMealShared(rows: MealRow[], sharedBy: string): Promise<void> {
   try {
     if (rows.length === 0 || (await Demo.isDemo())) return;
-    // 共有する食事（二人で食べた・編集画面で共有にした）だけ相手に写真を見せる
-    if (!isMealShared(rows.filter((r) => !r.deleted))) return;
     const mealId = rows[0].mealId;
+    // 共有する食事（二人で食べた・編集画面で共有にした）だけ相手に写真を見せる。共有をやめたら送った分を取り下げる
+    if (!isMealShared(rows.filter((r) => !r.deleted))) {
+      await unshareMeal(mealId);
+      return;
+    }
     const shared = await listShared();
     const already = new Set(shared.filter((s) => s.mealId === mealId).map((s) => s.sourceRef));
 
@@ -210,6 +213,14 @@ export async function markSettled(mealId: string): Promise<void> {
   } catch (e) {
     console.warn('[SharedPhotos] 確定日時を書けなかった:', e instanceof Error ? e.message : e);
   }
+}
+
+/** 食事の共有写真を共有用シートから消す（共有をやめたとき）。相手の端末に取り込み済みの分は残る */
+export async function unshareMeal(mealId: string): Promise<void> {
+  const rows = (await listShared()).filter((s) => s.mealId === mealId);
+  if (rows.length === 0) return;
+  const client = await SheetsInternal.createClient();
+  await client.post('/values:batchClear', { ranges: rows.map((s) => `'${SHEET}'!${ROW_RANGE(s.rowIndex)}`) });
 }
 
 /** 期限を過ぎた共有写真を消す。アプリを開いたときに呼ぶ。失敗しても投げない */
