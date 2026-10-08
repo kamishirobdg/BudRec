@@ -165,6 +165,8 @@ const MENU_CACHE_FILE = 'menus-cache.json';
 const MENU_CACHE_MS = 24 * 60 * 60 * 1000;
 let menuCache: { foods: Map<string, Food>; at: number } | null = null;
 let menuInflight: Promise<Map<string, Food>> | null = null;
+/** 書き込むたびに進める。書き込みより前に始まった読み込みの結果を保存しないため */
+let menuGeneration = 0;
 
 /** メニューを全部読む（OFF にしたチェーンも含む）。端末に 1 日保存して使い回す */
 async function loadAllMenus(force = false): Promise<Map<string, Food>> {
@@ -177,11 +179,14 @@ async function loadAllMenus(force = false): Promise<Map<string, Food>> {
     }
     if (menuInflight) return menuInflight;
   }
+  const gen = menuGeneration;
   const task = (async () => {
     const foods = await readTable(MENU_SHEET);
-    menuCache = { foods, at: Date.now() };
-    // 配列 1 つに包んで置く（jsonFileStore は配列として読む）
-    writeJson(MENU_CACHE_FILE, [{ at: menuCache.at, foods: [...foods.values()] }]);
+    if (gen === menuGeneration) {
+      menuCache = { foods, at: Date.now() };
+      // 配列 1 つに包んで置く（jsonFileStore は配列として読む）
+      writeJson(MENU_CACHE_FILE, [{ at: menuCache.at, foods: [...foods.values()] }]);
+    }
     return foods;
   })().finally(() => { if (menuInflight === task) menuInflight = null; });
   menuInflight = task;
@@ -190,6 +195,7 @@ async function loadAllMenus(force = false): Promise<Map<string, Food>> {
 
 /** 端末に保存したメニューを捨てる（取り込み・ON/OFF・書き込みの後） */
 export function invalidateMenus(): void {
+  menuGeneration++;
   menuCache = null;
   removeFile(MENU_CACHE_FILE);
 }
@@ -245,7 +251,10 @@ export function findMenu(index: MenuIndex, store: string, names: string[]): Food
  */
 export function findFood(foods: Map<string, Food>, name: string, store = ''): Food | undefined {
   const chain = store ? retailChainOf(store) : '';
-  return (chain ? foods.get(foodKey(name, chain)) : undefined) ?? foods.get(foodKey(name));
+  const own = chain ? foods.get(foodKey(name, chain)) : undefined;
+  const plain = foods.get(foodKey(name));
+  // まだ調べていない行が、調べ済みの行を隠さないようにする（新しい栄養がある方を先に使う）
+  return (freshNutrition(own) ?? freshNutrition(plain) ?? own ?? plain) || undefined;
 }
 
 /** 品目の鍵（店のオリジナル商品ならチェーン名と組にする） */
@@ -470,12 +479,14 @@ async function writePurchasesNow(food: Purchase[]): Promise<void> {
 
 /** 調べた栄養を保存する（無ければ作る） */
 export async function saveResearched(entries: { query: FoodQuery; result: FoodNutrition; sources: string[] }[]): Promise<void> {
-  // 外食のメニューは `_menus`、それ以外は `_foods` に入れる
-  const menus = entries.filter((e) => e.query.kind === 'eat_out');
-  const others = entries.filter((e) => e.query.kind !== 'eat_out');
+  // 店（チェーン）の分かる外食のメニューは `_menus`、それ以外は `_foods` に入れる。
+  // 店の分からない外食（レシートと結び付かない料理）は品名だけの鍵で引くので `_foods` に置く
+  const isMenu = (e: { query: FoodQuery }) => e.query.kind === 'eat_out' && !!e.query.chain;
+  const menus = entries.filter(isMenu);
+  const others = entries.filter((e) => !isMenu(e));
   if (others.length > 0) await saveResearchedTo(others, await loadFoods(true), SHEET);
-  // メニューは行数が多いので読み直さない（ほかの端末が同じメニューを足していたら同じ鍵の行が増えるが、読むときにまとめる）
-  if (menus.length > 0) await saveResearchedTo(menus, await loadAllMenus(), MENU_SHEET);
+  // 書き換える行の番号がずれていないよう、書く前に読み直す（外から貼り直されている場合がある）
+  if (menus.length > 0) await saveResearchedTo(menus, await loadAllMenus(true), MENU_SHEET);
 }
 
 async function saveResearchedTo(
@@ -515,7 +526,7 @@ export async function saveImageUrls(list: { food: Food; imageUrl: string }[]): P
 export async function researchNow(query: FoodQuery): Promise<Food | null> {
   const { results, sources } = await researchFoods([query]);
   await saveResearched([{ query, result: results[0], sources }]);
-  const table = query.kind === 'eat_out' ? await loadAllMenus() : await loadFoods(true);
+  const table = query.kind === 'eat_out' && query.chain ? await loadAllMenus() : await loadFoods(true);
   return table.get(foodKey(query.name, query.chain)) ?? null;
 }
 

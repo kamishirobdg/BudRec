@@ -55,6 +55,7 @@ import { AuthError } from '../services/AuthService';
 import * as Demo from '../services/DemoService';
 import * as LastBatch from '../services/LastBatchService';
 import SettingsScreen from './SettingsScreen';
+import { onSettingsClosed } from '../services/AppEvents';
 import PersonalModal from './PersonalModal';
 import ReceiptReviewModal, { normalizeTimestampInput } from './ReceiptReviewModal';
 import MemoText from './MemoText';
@@ -292,6 +293,11 @@ export default function SummaryScreen({ onSignedOut }: Props) {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [gmailProgress.finished, gmailProgress.result, loadRows, currentRangeSignature]);
+
+  // ほかのタブから開いた設定を閉じたときも読み直す
+  useEffect(() => onSettingsClosed(() => loadRows(currentRange)),
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  [loadRows, currentRangeSignature]);
 
   /** 設定を閉じる。デモモードの ON/OFF を即座に反映するため再読み込みする */
   const closeSettings = () => {

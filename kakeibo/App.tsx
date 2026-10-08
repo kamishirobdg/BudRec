@@ -23,6 +23,7 @@ import {
 } from './services/PreferencesService';
 import SettingsScreen from './screens/SettingsScreen';
 import { repairHeaders } from './services/HeaderRepair';
+import { emitSettingsClosed } from './services/AppEvents';
 import { cleanupOldPhotos } from './services/PhotoStore';
 import * as OcrWorker from './services/OcrWorker';
 import { registerBackgroundOcr } from './services/BackgroundOcr';
@@ -88,6 +89,11 @@ function AppContent() {
     return subscribeTabLayout(setTabLayoutState);
   }, []);
   const visibleTabs = tabLayout.order.filter((k) => !tabLayout.hidden.includes(k));
+  /** 設定を閉じる。一覧はデモモードの切り替えなどを反映するため読み直す */
+  const closeSettings = () => {
+    setSettingsOpen(false);
+    emitSettingsClosed();
+  };
 
   const goToSummary = () => {
     setOcrToastState(null);
@@ -304,11 +310,11 @@ function AppContent() {
       )}
 
       {/* 一覧タブ以外から開く設定（一覧タブは自分の画面の中で開く） */}
-      <Modal visible={settingsOpen} animationType="slide" onRequestClose={() => setSettingsOpen(false)}>
+      <Modal visible={settingsOpen} animationType="slide" onRequestClose={closeSettings}>
         <SafeAreaView style={styles.settingsContainer}>
           <View style={styles.settingsHeader}>
             <Text style={styles.settingsTitle}>設定</Text>
-            <TouchableOpacity onPress={() => setSettingsOpen(false)}>
+            <TouchableOpacity onPress={closeSettings}>
               <Text style={styles.settingsClose}>閉じる</Text>
             </TouchableOpacity>
           </View>

@@ -25,6 +25,8 @@ export default function ChainsModal({ visible, onClose }: Props) {
   const [counts, setCounts]   = useState<Map<string, number>>(new Map());
   const [loading, setLoading] = useState(false);
   const [busy, setBusy]       = useState(false);
+  // 保存中のチェーン（続けて押すと行が二重に足されるので、保存が終わるまで押せなくする）
+  const [saving, setSaving]   = useState<string | null>(null);
   const [stations, setStations] = useState('');
   const [likes, setLikes]       = useState('');
 
@@ -39,7 +41,10 @@ export default function ChainsModal({ visible, onClose }: Props) {
       const extra: Chain[] = [...menuCounts.keys()]
         .filter((name) => !known.has(name))
         .map((chain) => ({ chain, genre: 'その他', status: 'collected', enabled: true, aliases: [], note: '', rowIndex: 0 }));
-      setChains([...list, ...extra]);
+      // 調査待ち・候補でも、メニューを取り込んだ後なら取り込み済みとして出す
+      const promoted = list.map((c): Chain =>
+        menuCounts.has(c.chain) && c.status !== 'collected' ? { ...c, status: 'collected', enabled: true } : c);
+      setChains([...promoted, ...extra]);
       setCounts(menuCounts);
       if (cond) {
         setStations(cond.stations);
@@ -67,6 +72,8 @@ export default function ChainsModal({ visible, onClose }: Props) {
   }, [chains]);
 
   const toggle = async (c: Chain) => {
+    if (saving) return;
+    setSaving(c.chain);
     const next: Chain = c.status === 'collected'
       ? { ...c, enabled: !c.enabled }
       : { ...c, status: c.status === 'requested' ? 'candidate' : 'requested' };
@@ -82,13 +89,15 @@ export default function ChainsModal({ visible, onClose }: Props) {
     } catch (e) {
       setChains((prev) => prev.map((x) => (x.chain === c.chain ? c : x)));
       Alert.alert('保存失敗', e instanceof Error ? e.message : String(e));
+    } finally {
+      setSaving(null);
     }
   };
 
   const handleSuggest = async () => {
     setBusy(true);
     try {
-      const n = await suggestChains(stations.trim(), likes.trim());
+      const n = await suggestChains(stations.trim(), likes.trim(), [...counts.keys()]);
       await load();
       Alert.alert(n > 0 ? `候補を ${n} 件足しました` : '新しい候補はありませんでした');
     } catch (e) {
@@ -139,6 +148,7 @@ export default function ChainsModal({ visible, onClose }: Props) {
                   <Switch
                     value={item.status === 'collected' ? item.enabled : item.status === 'requested'}
                     onValueChange={() => toggle(item)}
+                    disabled={saving !== null}
                     trackColor={{ false: '#ccc', true: '#a5d6a7' }}
                     thumbColor={(item.status === 'collected' ? item.enabled : item.status === 'requested') ? '#2e7d32' : '#f4f3f4'}
                   />

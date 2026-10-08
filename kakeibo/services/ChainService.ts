@@ -142,10 +142,14 @@ export async function loadChains(force = false): Promise<Chain[]> {
     const res = await client.get(`/values/${encodeURIComponent(SHEET)}!A:G`, {
       params: { valueRenderOption: 'UNFORMATTED_VALUE' },
     });
+    // 同じチェーンの行が 2 行あれば後の行を使う（書き換えるのも後の行）
+    const byName = new Map<string, Chain>();
     ((res.data.values ?? []) as any[][]).forEach((c, i) => {
       if (i === 0 || !String(c[0] ?? '').trim()) return;
-      chains.push(fromCells(c, i + 1));
+      const row = fromCells(c, i + 1);
+      byName.set(row.chain, row);
     });
+    chains.push(...byName.values());
   }
   cache = { chains, at: Date.now() };
   return chains;
@@ -256,16 +260,22 @@ const SUGGEST_SCHEMA = {
  * 行った店・生活圏の駅・好きなものから、メニューの栄養を取り込むとよいチェーン店の候補を出し、
  * `_chains` に candidate として足す。足した件数を返す。
  */
-export async function suggestChains(stations: string, likes: string, signal?: AbortSignal): Promise<number> {
+export async function suggestChains(
+  stations: string,
+  likes: string,
+  /** 一覧には無いがメニューを取り込み済みのチェーン（候補として足さない） */
+  collected: string[] = [],
+  signal?: AbortSignal,
+): Promise<number> {
   await setSuggestConditions(stations, likes);
   const [visited, existing] = await Promise.all([visitedStores(), loadChains(true)]);
-  const known = new Set(existing.map((c) => normalizeStore(c.chain)));
+  const known = new Set([...existing.map((c) => c.chain), ...collected].map(normalizeStore));
   const prompt = `家計簿アプリで外食の栄養を記録するために、メニューの栄養成分を取り込んでおくとよい日本の飲食チェーン店を挙げてください。JSON のみを返してください。
 - 生活圏の駅: ${stations || '（未入力）'}
 - 好きなもの: ${likes || '（未入力）'}
 - 直近 12 か月に行った店（回数）:
 ${visited.map((v) => `  ${v.store}（${v.count}）`).join('\n') || '  （記録なし）'}
-- すでに一覧にあるチェーン（挙げない）: ${existing.map((c) => c.chain).join('、') || 'なし'}
+- すでに一覧にあるチェーン（挙げない）: ${[...existing.map((c) => c.chain), ...collected].join('、') || 'なし'}
 
 条件:
 - 生活圏の駅の近くに店があり、好きなものに合う全国・首都圏のチェーンを優先する。行った店の傾向も参考にする
