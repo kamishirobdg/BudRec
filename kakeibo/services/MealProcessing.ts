@@ -537,6 +537,8 @@ const PENDING_LINKS_FILE = 'pending-links.json';
 const LINK_RETRY_MS = 15 * 60 * 1000;
 /** 何度やっても通らないものをいつまでも残さない */
 const LINK_MAX_ATTEMPTS = 5;
+/** やり直し中の印（notBefore に入れる） */
+const IN_PROGRESS = Number.MAX_SAFE_INTEGER;
 
 interface PendingLink {
   receipt:   SavedReceipt;
@@ -556,20 +558,25 @@ let retrying: Promise<void> | null = null;
 
 /** 時刻を過ぎたひも付け直しをやり直す（アプリが前面に来たとき・定期実行で呼ぶ）。失敗しても投げない */
 export function retryPendingLinks(now: number = Date.now()): Promise<void> {
-  retrying ??= (async () => {
+  if (retrying) return retrying;
+  // 対象が無いと await を通らずに終わるので、`??=` で代入すると終わった後の Promise が残り続ける。
+  // 代入してから、終わったら外す
+  const task = (async () => {
     try {
       const list = readJsonArray<PendingLink>(PENDING_LINKS_FILE);
-      const due = list.filter((p) => p.notBefore <= now);
+      // やり直し中（番兵）のまま残っているのは、前回のやり直しの途中で終了されたもの。もう一度やる
+      const due = list.filter((p) => p.notBefore <= now || p.notBefore === IN_PROGRESS);
       if (due.length === 0) return;
       for (const p of due) {
-        // 先に外しておく。また失敗したら linkReceiptToMeals が回数を増やして積み直す
+        // やり直し中の印を付けておく（回数を引き継ぐため消さない）。また失敗したら linkReceiptToMeals が
+        // 回数を増やして積み直す
         const rest = readJsonArray<PendingLink>(PENDING_LINKS_FILE).filter((x) => x.receipt.entryId !== p.receipt.entryId);
-        writeJson(PENDING_LINKS_FILE, [...rest, { ...p, notBefore: Number.MAX_SAFE_INTEGER }]);
+        writeJson(PENDING_LINKS_FILE, [...rest, { ...p, notBefore: IN_PROGRESS }]);
         await linkReceiptToMeals(p.receipt);
         const after = readJsonArray<PendingLink>(PENDING_LINKS_FILE);
         const mine = after.find((x) => x.receipt.entryId === p.receipt.entryId);
         // 積み直されていなければ（成功・対象なし）外す
-        if (mine && mine.notBefore === Number.MAX_SAFE_INTEGER) {
+        if (mine && mine.notBefore === IN_PROGRESS) {
           const remaining = after.filter((x) => x.receipt.entryId !== p.receipt.entryId);
           if (remaining.length > 0) writeJson(PENDING_LINKS_FILE, remaining);
           else removeFile(PENDING_LINKS_FILE);
@@ -577,9 +584,9 @@ export function retryPendingLinks(now: number = Date.now()): Promise<void> {
       }
     } catch (e) {
       console.warn('[Meal] ひも付け直しのやり直しに失敗:', e instanceof Error ? e.message : e);
-    } finally {
-      retrying = null;
     }
   })();
-  return retrying;
+  retrying = task;
+  task.finally(() => { if (retrying === task) retrying = null; });
+  return task;
 }

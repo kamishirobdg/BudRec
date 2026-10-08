@@ -754,6 +754,25 @@ export async function flushWriteQueue(): Promise<FlushResult> {
     // 競合で止めた行。同じ行の後続を先に送ると、上書きを選んだときに順番が崩れるので送らない
     const blocked = new Set<string>();
     const rowKey = (op: WriteQueue.WriteOp) => ('rowIndex' in op ? `${op.sheetName}:${op.rowIndex}` : null);
+    // 同じ ID の行が既にシートにある追加は送らない（登録の途中で終了されたあと、圏外で保存し直した場合など）。
+    // その行の品目も送らない（最初の登録で書けている）
+    const idsBySheet = new Map<string, Set<string>>();
+    const skippedEntries = new Set<string>();
+    const alreadyInSheet = async (entry: ExpenseRow): Promise<boolean> => {
+      if (!entry.entryId) return false;
+      const sheet = sheetNameFromTimestamp(entry.timestamp);
+      if (!idsBySheet.has(sheet)) {
+        const client = await createClient();
+        const names = await listSheetNames(client, true);
+        const ids = new Set<string>();
+        if (names.includes(sheet)) {
+          const res = await client.get(`/values/${encodeURIComponent(sheet)}!M:M`);
+          for (const c of (res.data.values ?? []) as string[][]) if (c[0]) ids.add(c[0]);
+        }
+        idsBySheet.set(sheet, ids);
+      }
+      return idsBySheet.get(sheet)!.has(entry.entryId);
+    };
     for (const item of WriteQueue.list()) {
       const key = rowKey(item.op);
       if (item.permanent) {
@@ -763,7 +782,19 @@ export async function flushWriteQueue(): Promise<FlushResult> {
       }
       if (key && blocked.has(key)) continue;
       try {
+        if (item.op.kind === 'appendItems' && skippedEntries.has(item.op.entryId)) {
+          WriteQueue.remove(item.id);
+          continue;
+        }
+        if (item.op.kind === 'append' && (await alreadyInSheet(item.op.entry))) {
+          skippedEntries.add(item.op.entry.entryId!);
+          WriteQueue.remove(item.id);
+          continue;
+        }
         const rev = await execWrite(item.op);
+        if (item.op.kind === 'append' && item.op.entry.entryId) {
+          idsBySheet.get(sheetNameFromTimestamp(item.op.entry.timestamp))?.add(item.op.entry.entryId);
+        }
         WriteQueue.remove(item.id);
         if (typeof rev === 'number' && 'rowIndex' in item.op) {
           WriteQueue.advanceBaseRev(item.op.sheetName, item.op.rowIndex, rev);

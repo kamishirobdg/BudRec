@@ -336,7 +336,8 @@ let flushing: Promise<void> | null = null;
 
 /** 記録できなかった購入をまとめて記録する（App の同期で呼ぶ）。失敗したら残して次回に回す */
 export function flushPendingPurchases(): Promise<void> {
-  flushing ??= (async () => {
+  if (flushing) return flushing;
+  const task = (async () => {
     try {
       if (await Demo.isDemo()) return;
       const pending = readJsonArray<PendingPurchase>(PENDING_FILE);
@@ -363,11 +364,12 @@ export function flushPendingPurchases(): Promise<void> {
       }
     } catch (e) {
       console.warn('[Food] 未記録の購入を記録できなかった:', e instanceof Error ? e.message : e);
-    } finally {
-      flushing = null;
     }
   })();
-  return flushing;
+  // await を通らずに終わる経路があるので、代入してから終わったら外す（`??=` だと終わった Promise が残る）
+  flushing = task;
+  task.finally(() => { if (flushing === task) flushing = null; });
+  return task;
 }
 
 /** 購入の記録に失敗した。`remaining` はまだ記録できていない品目 */

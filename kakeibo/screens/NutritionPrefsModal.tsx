@@ -21,11 +21,13 @@ export default function NutritionPrefsModal({ user, prefs, onClose, onSaved }: P
   const [targets, setTargets] = useState<Record<string, string>>({});
   const [saving, setSaving]   = useState(false);
 
+  // 開いたときだけ読み込む（開いている間に一覧が読み直されても入力中の値を戻さない）
   useEffect(() => {
     if (!user) return;
     setVisible(prefs.visible);
     setTargets(Object.fromEntries(Object.entries(prefs.targets).map(([k, v]) => [k, String(v)])));
-  }, [user, prefs]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user]);
 
   const toggle = (key: string) =>
     setVisible((prev) => (prev.includes(key) ? prev.filter((k) => k !== key) : [...prev, key]));

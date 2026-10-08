@@ -86,6 +86,15 @@ export default function UserSetupScreen({ onDone }: Props) {
     const others = users.filter((u) =>
       u.name === trimmed && u.deviceId && u.deviceId !== deviceId && Date.now() - u.lastSeen < ACTIVE_MS);
     if (others.length === 0) {
+      // 支出の記録から拾った名前（どの端末のものか分からない）を選んだときは、相手の名前でないか確かめる
+      const fromRecordsOnly = recorded.includes(trimmed) && !users.some((u) => u.name === trimmed) && names.length > 1;
+      if (fromRecordsOnly) {
+        Alert.alert('名前の確認', `「${trimmed}」で記録します。相手の名前ではありませんか？`, [
+          { text: 'やめる', style: 'cancel' },
+          { text: 'この名前にする', onPress: () => save(trimmed) },
+        ]);
+        return;
+      }
       save(trimmed);
       return;
     }

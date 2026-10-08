@@ -46,14 +46,21 @@ function md(d: Date): string {
   return `${d.getMonth() + 1}/${d.getDate()}`;
 }
 
-/** 期間の見出しと並び順の鍵。週は月曜始まり */
+/**
+ * 期間の見出しと並び順の鍵。週は月曜始まり。一覧は 1 か月ずつ読むので、月をまたぐ週は
+ * 表示中の月の分だけになる。見出しもその範囲に合わせる（「10/1〜10/5」）
+ */
 function periodOf(ts: string, period: Period): { key: string; title: string } {
   const d = dayOf(ts);
   if (period === 'month') return { key: monthOf(d), title: `${d.getFullYear()}年${d.getMonth() + 1}月` };
   if (period === 'week') {
     const mon = new Date(d.getFullYear(), d.getMonth(), d.getDate() - ((d.getDay() + 6) % 7));
     const sun = new Date(mon.getFullYear(), mon.getMonth(), mon.getDate() + 6);
-    return { key: `${monthOf(mon)}-${pad(mon.getDate())}`, title: `${md(mon)}〜${md(sun)}` };
+    const first = new Date(d.getFullYear(), d.getMonth(), 1);
+    const last = new Date(d.getFullYear(), d.getMonth() + 1, 0);
+    const from = mon < first ? first : mon;
+    const to = sun > last ? last : sun;
+    return { key: `${monthOf(from)}-${pad(from.getDate())}`, title: `${md(from)}〜${md(to)}` };
   }
   return { key: `${monthOf(d)}-${pad(d.getDate())}`, title: ts.slice(0, 10) };
 }
@@ -94,6 +101,8 @@ export default function MealsScreen() {
   const [period, setPeriod]     = useState<Period>('day');
   const [prefsMap, setPrefsMap] = useState<Map<string, NutritionPrefs>>(new Map());
   const [prefsUser, setPrefsUser] = useState<string | null>(null);
+  // 一度も読めていないうちに設定を開くと、既定の内容で保存して目標値を消してしまうので開かせない
+  const [prefsReady, setPrefsReady] = useState(false);
   const prefs = prefsMap.get(person) ?? DEFAULT_PREFS;
 
   // 月を素早く切り替えたとき、前の月の遅れて返った結果で上書きしない
@@ -104,11 +113,14 @@ export default function MealsScreen() {
     try {
       const [me, users, meals, prefsLoaded] = await Promise.all([
         getCurrentUser(), getUniqueUsers(), getMeals(month),
-        // 表示設定が読めなくても既定の表示で一覧は出す
-        loadPrefs().catch(() => new Map<string, NutritionPrefs>()),
+        // 表示設定が読めなくても一覧は出す（前に読めた設定はそのまま使う）
+        loadPrefs().catch(() => null),
       ]);
       if (seq !== requestSeq.current) return;
-      setPrefsMap(prefsLoaded);
+      if (prefsLoaded) {
+        setPrefsMap(prefsLoaded);
+        setPrefsReady(true);
+      }
       setPeople([me, ...users.filter((u) => u !== me)]);
       setPerson((p) => p || me);
       setRows(meals);
@@ -211,7 +223,16 @@ export default function MealsScreen() {
             <Text style={[styles.chipText, period === p && styles.chipTextActive]}>{PERIOD_LABEL[p]}</Text>
           </TouchableOpacity>
         ))}
-        <TouchableOpacity style={styles.prefsBtn} onPress={() => person && setPrefsUser(person)}>
+        <TouchableOpacity
+          style={styles.prefsBtn}
+          onPress={() => {
+            if (!prefsReady) {
+              Alert.alert('読み込み失敗', '表示の設定を読み込めませんでした。引き下げて読み直してください');
+              return;
+            }
+            if (person) setPrefsUser(person);
+          }}
+        >
           <Text style={styles.prefsText}>表示</Text>
         </TouchableOpacity>
       </View>

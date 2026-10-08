@@ -66,7 +66,9 @@ export async function savePrefs(user: string, prefs: NutritionPrefs): Promise<vo
   }
   const res = await client.get(`/values/${encodeURIComponent(SHEET)}!A:A`);
   const rows = (res.data.values ?? []) as string[][];
-  const index = rows.findIndex((c, i) => i > 0 && c[0] === user);
+  // 二台が同時に初めて保存すると同じ人の行が 2 行できうる。読むときは後の行を使うので、書くのも後の行にする
+  let index = -1;
+  rows.forEach((c, i) => { if (i > 0 && c[0] === user) index = i; });
   const values = [[user, JSON.stringify(prefs.visible), JSON.stringify(prefs.targets)]];
   if (index > 0) {
     await client.put(
