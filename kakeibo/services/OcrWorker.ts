@@ -26,6 +26,7 @@ import * as ReceiptQueue from './ReceiptQueueService';
 import { saveReceiptRows } from './ReceiptProcessing';
 import {
   MealResult, StoredAnalysis, analyzeCapturedPhoto, epochToTimestamp, linkReceiptToMeals, receiptCandidateOf, recordMeal,
+  retryPendingLinks,
 } from './MealProcessing';
 import { archiveMealPhoto, mealPhotoRef } from './PhotoStore';
 import { mealExists, mealsSheetName } from './MealService';
@@ -110,6 +111,8 @@ export function cancel(): void {
  */
 export function kick(): void {
   if (ReceiptQueue.promoteDeferred() > 0) emit({ type: 'changed' });
+  // 無料枠切れ・圏外でできなかったレシートのひも付け直し（時刻を過ぎたものだけ）
+  void retryPendingLinks();
   if (running || queuedCount() === 0) return;
   loopPromise = runLoop();
 }
@@ -117,6 +120,7 @@ export function kick(): void {
 /** 定期実行から呼ぶ。処理が終わるまで待つ（定期実行はこの Promise が終わると打ち切られる） */
 export async function runPending(): Promise<void> {
   kick();
+  await retryPendingLinks();
   while (loopPromise) {
     const p = loopPromise;
     await p;

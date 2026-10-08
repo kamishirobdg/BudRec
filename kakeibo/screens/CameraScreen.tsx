@@ -24,7 +24,7 @@ import * as ImagePicker from 'expo-image-picker';
 import * as Notifications from 'expo-notifications';
 import { useNavigation } from '@react-navigation/native';
 import * as CategoryService from '../services/CategoryService';
-import { ExpenseRow, getUniqueUsers } from '../services/SheetsService';
+import { ExpenseRow, existingEntryIds, getUniqueUsers } from '../services/SheetsService';
 import { AuthError } from '../services/AuthService';
 import { getCurrentUser } from '../services/UserService';
 import * as ReceiptQueue from '../services/ReceiptQueueService';
@@ -256,7 +256,18 @@ export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess }:
         : 'スプレッドシートに書き込み中...',
     );
     try {
-      const { message: msg, entryIds, saved } = await saveReceiptRows(rows);
+      // 確認画面から保存している途中でアプリが終了されると、確認待ちのまま残る。行の ID は振り分けのときに
+      // 振ってあるので、もう一度保存されたら書けている行は飛ばす（二重に登録しない）。
+      // 調べられなければ（圏外など）全部書く（書き込みは未送信キューに回る）
+      const existing = await existingEntryIds(rows).catch(() => new Set<string>());
+      const done = rows.filter((r) => r.entryId && existing.has(r.entryId));
+      const rest = rows.filter((r) => !(r.entryId && existing.has(r.entryId)));
+      const result = rest.length > 0
+        ? await saveReceiptRows(rest)
+        : { message: '登録済みです', entryIds: [] as string[], saved: [] as ExpenseRow[] };
+      const msg = result.message;
+      const entryIds = [...done.map((r) => r.entryId!), ...result.entryIds];
+      const saved = [...done, ...result.saved];
       ReceiptQueue.completeReceipt(uri, entryIds);
       // 前後の時間の食事にレシートをひも付け直す（待たずに裏で進める）
       void OcrWorker.linkSavedReceipts(saved);

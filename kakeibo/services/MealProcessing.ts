@@ -9,7 +9,10 @@
 
 import { SheetsInternal, ExpenseRow, getRowsRaw, getUniqueUsers, newEntryId } from './SheetsService';
 import { AuthError } from './AuthService';
+import axios from 'axios';
+import { QuotaExceededError } from '../providers/AIProvider';
 import type { ReceiptItem } from '../providers/AIProvider';
+import { readJsonArray, removeFile, writeJson } from './jsonFileStore';
 import { getCurrentUser } from './UserService';
 import {
   analyzePhoto, lookupNutrition, matchReceiptItems,
@@ -520,5 +523,63 @@ export async function linkReceiptToMeals(receipt: SavedReceipt, signal?: AbortSi
   } catch (e) {
     if (e instanceof MealConflictError) return; // 相手が編集中。そちらを優先する
     console.warn('[Meal] レシートとのひも付けに失敗:', e instanceof Error ? e.message : e);
+    // 無料枠切れ・通信の失敗なら後でやり直す（食事が推定値のまま残らないように）
+    if (e instanceof QuotaExceededError || (axios.isAxiosError(e) && !e.response)) {
+      deferLink(receipt, e instanceof QuotaExceededError ? e.retryAt : Date.now() + LINK_RETRY_MS);
+    }
   }
+}
+
+// ─── ひも付け直しのやり直し ───────────────────────────────────────────────────
+
+/** ひも付け直しを後でやり直すレシート（端末のファイル） */
+const PENDING_LINKS_FILE = 'pending-links.json';
+const LINK_RETRY_MS = 15 * 60 * 1000;
+/** 何度やっても通らないものをいつまでも残さない */
+const LINK_MAX_ATTEMPTS = 5;
+
+interface PendingLink {
+  receipt:   SavedReceipt;
+  notBefore: number;
+  attempts:  number;
+}
+
+function deferLink(receipt: SavedReceipt, notBefore: number): void {
+  const list = readJsonArray<PendingLink>(PENDING_LINKS_FILE);
+  const prev = list.find((p) => p.receipt.entryId === receipt.entryId);
+  const attempts = (prev?.attempts ?? 0) + 1;
+  const rest = list.filter((p) => p.receipt.entryId !== receipt.entryId);
+  writeJson(PENDING_LINKS_FILE, attempts > LINK_MAX_ATTEMPTS ? rest : [...rest, { receipt, notBefore, attempts }]);
+}
+
+let retrying: Promise<void> | null = null;
+
+/** 時刻を過ぎたひも付け直しをやり直す（アプリが前面に来たとき・定期実行で呼ぶ）。失敗しても投げない */
+export function retryPendingLinks(now: number = Date.now()): Promise<void> {
+  retrying ??= (async () => {
+    try {
+      const list = readJsonArray<PendingLink>(PENDING_LINKS_FILE);
+      const due = list.filter((p) => p.notBefore <= now);
+      if (due.length === 0) return;
+      for (const p of due) {
+        // 先に外しておく。また失敗したら linkReceiptToMeals が回数を増やして積み直す
+        const rest = readJsonArray<PendingLink>(PENDING_LINKS_FILE).filter((x) => x.receipt.entryId !== p.receipt.entryId);
+        writeJson(PENDING_LINKS_FILE, [...rest, { ...p, notBefore: Number.MAX_SAFE_INTEGER }]);
+        await linkReceiptToMeals(p.receipt);
+        const after = readJsonArray<PendingLink>(PENDING_LINKS_FILE);
+        const mine = after.find((x) => x.receipt.entryId === p.receipt.entryId);
+        // 積み直されていなければ（成功・対象なし）外す
+        if (mine && mine.notBefore === Number.MAX_SAFE_INTEGER) {
+          const remaining = after.filter((x) => x.receipt.entryId !== p.receipt.entryId);
+          if (remaining.length > 0) writeJson(PENDING_LINKS_FILE, remaining);
+          else removeFile(PENDING_LINKS_FILE);
+        }
+      }
+    } catch (e) {
+      console.warn('[Meal] ひも付け直しのやり直しに失敗:', e instanceof Error ? e.message : e);
+    } finally {
+      retrying = null;
+    }
+  })();
+  return retrying;
 }
