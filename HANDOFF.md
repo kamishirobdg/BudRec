@@ -42,7 +42,7 @@
 ### 環境の注意
 - 型チェック: `cd C:\work\BudRec\kakeibo; npx tsc --noEmit`（エラー 0 件が正常）
 - ビルド: android-build スキルの流れ（`npx eas-cli build --platform android --profile preview --non-interactive --no-wait --json` →
-  `C:\work	ools\watch-build.ps1` を切り離して起動。待ち上限 6 時間。結果は `kakeibo/.build-status.txt` と Discord）
+  `C:\work\tools\watch-build.ps1` を切り離して起動。待ち上限 6 時間。結果は `kakeibo/.build-status.txt` と Discord）
 - バージョンはユーザー向けの挙動が変わるコミットごとに `kakeibo/package.json` と `kakeibo/app.json` の両方を上げる
 - ネイティブの部品: react-native-health-connect（v4.1.3）と expo-build-properties（minSdk 26）。app.json の android.permissions に
   ヘルスコネクトの読み取り権限。`plugins/withOcrForegroundService.js` は外さない
