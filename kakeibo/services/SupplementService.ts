@@ -13,7 +13,7 @@ import { nowLabel } from './jsonFileStore';
 import { NUTRIENTS, Nutrients, sanitizeNutrients, scaleNutrients } from './Nutrients';
 import { callGemini } from '../providers/GeminiProvider';
 import { parseJson } from '../providers/AIProvider';
-import { today } from './NutritionJudge';
+import { shiftDay, today } from './NutritionJudge';
 import * as Demo from './DemoService';
 
 const SHEET = '_supplements';
@@ -133,6 +133,40 @@ export async function setSkipped(user: string, date: string, supplementId: strin
     valueInputOption: 'RAW',
     data: rows.map((k) => ({ range: `'${SKIP_SHEET}'!A${k.rowIndex}:C${k.rowIndex}`, values: [['', '', '']] })),
   });
+}
+
+/**
+ * CSV から読んだサプリをまとめて登録する。同じ名前のサプリが既にあれば置き換える
+ * （量・成分が変わっていれば、昨日までは前の内容のまま残して今日から新しい内容にする。同じなら触らない）。
+ * 戻り値は 登録した数・変えた数・同じだった数
+ */
+export async function importSupplements(
+  user: string,
+  list: { name: string; unit: string; perDay: number; nutrients: Nutrients; note: string }[],
+  existing: Supplement[],
+): Promise<{ added: number; updated: number; same: number }> {
+  let added = 0, updated = 0, same = 0;
+  const day = today();
+  for (const s of list) {
+    const nutrients = sanitizeNutrients(s.nutrients);
+    const base = existing.find((e) => e.user === user && e.name === s.name && (!e.ended || e.ended >= day));
+    if (!base) {
+      await saveSupplement({ user, name: s.name, unit: s.unit, perDay: s.perDay, nutrients, started: day, ended: '', note: s.note });
+      added++;
+      continue;
+    }
+    const changed = base.perDay !== s.perDay || base.unit !== s.unit ||
+      JSON.stringify(sanitizeNutrients(base.nutrients)) !== JSON.stringify(nutrients);
+    if (!changed) { same++; continue; }
+    if (base.started < day) {
+      await saveSupplement({ ...base, ended: shiftDay(day, -1) });
+      await saveSupplement({ user, name: s.name, unit: s.unit, perDay: s.perDay, nutrients, started: day, ended: '', note: s.note || base.note });
+    } else {
+      await saveSupplement({ ...base, unit: s.unit, perDay: s.perDay, nutrients, note: s.note || base.note });
+    }
+    updated++;
+  }
+  return { added, updated, same };
 }
 
 /** その日に足すサプリ（飲まなかった日の印が付いているものは skipped） */

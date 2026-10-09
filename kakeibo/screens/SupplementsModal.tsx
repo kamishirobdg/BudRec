@@ -5,10 +5,13 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import * as ImagePicker from 'expo-image-picker';
+import * as DocumentPicker from 'expo-document-picker';
+import { File } from 'expo-file-system';
 import { NUTRIENTS, Nutrients, nutrientDef, sanitizeNutrients } from '../services/Nutrients';
 import {
-  Supplement, readSupplementLabel, saveSupplement, stopSupplement,
+  Supplement, importSupplements, readSupplementLabel, saveSupplement, stopSupplement,
 } from '../services/SupplementService';
+import { ImportedSupplement, describeImported, parseSupplementTable } from '../services/SupplementImport';
 import { shiftDay, today } from '../services/NutritionJudge';
 
 interface Props {
@@ -50,8 +53,50 @@ function summary(n: Nutrients): string {
 export default function SupplementsModal({ visible, user, supplements, onClose, onChanged }: Props) {
   const [draft, setDraft] = useState<Draft | null>(null);
   const [busy, setBusy]   = useState(false);
+  /** CSV から読んだ一覧（登録する前の確認） */
+  const [imported, setImported] = useState<ImportedSupplement[] | null>(null);
 
-  useEffect(() => { if (!visible) setDraft(null); }, [visible]);
+  useEffect(() => { if (!visible) { setDraft(null); setImported(null); } }, [visible]);
+
+  /** CSV / TSV を選んで読む。登録はまだしない（一覧で確かめてから） */
+  const pickCsv = async () => {
+    try {
+      const res = await DocumentPicker.getDocumentAsync({
+        type: ['text/*', 'text/csv', 'text/comma-separated-values', 'text/tab-separated-values', 'application/vnd.ms-excel', '*/*'],
+        copyToCacheDirectory: true,
+      });
+      const uri = res.canceled ? null : res.assets[0]?.uri;
+      if (!uri) return;
+      setBusy(true);
+      const text = await new File(uri).text();
+      const { supplements: list, skipped } = parseSupplementTable(text);
+      if (list.length === 0) {
+        Alert.alert('読めませんでした', '商品名の列と、成分名・含有量の列（または栄養素ごとの列）が要ります');
+        return;
+      }
+      if (skipped > 0) Alert.alert(`${skipped} 行は読めませんでした`, '読めた分だけ一覧に出します');
+      setImported(list);
+    } catch (e) {
+      Alert.alert('読めませんでした', e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleImport = async () => {
+    if (!imported) return;
+    setBusy(true);
+    try {
+      const r = await importSupplements(user, imported, supplements);
+      setImported(null);
+      onChanged();
+      Alert.alert('取り込みました', `登録 ${r.added}・変更 ${r.updated}・同じ ${r.same}`);
+    } catch (e) {
+      Alert.alert('保存失敗', e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const mine = supplements.filter((s) => s.user === user);
   const active = mine.filter((s) => !s.ended || s.ended >= today());
@@ -134,17 +179,31 @@ export default function SupplementsModal({ visible, user, supplements, onClose, 
   };
 
   return (
-    <Modal visible={visible} animationType="slide" onRequestClose={draft ? () => setDraft(null) : onClose}>
+    <Modal visible={visible} animationType="slide" onRequestClose={draft ? () => setDraft(null) : imported ? () => setImported(null) : onClose}>
       <SafeAreaView style={styles.container}>
         <KeyboardAvoidingView style={styles.fill} behavior="height">
           <View style={styles.header}>
-            <Text style={styles.title}>{draft ? (draft.base ? 'サプリを編集' : 'サプリを登録') : 'サプリ'}</Text>
-            <TouchableOpacity onPress={draft ? () => setDraft(null) : onClose}>
-              <Text style={styles.close}>{draft ? '戻る' : '✕'}</Text>
+            <Text style={styles.title}>
+              {draft ? (draft.base ? 'サプリを編集' : 'サプリを登録') : imported ? 'CSV の内容' : 'サプリ'}
+            </Text>
+            <TouchableOpacity onPress={draft ? () => setDraft(null) : imported ? () => setImported(null) : onClose}>
+              <Text style={styles.close}>{draft || imported ? '戻る' : '✕'}</Text>
             </TouchableOpacity>
           </View>
 
-          {!draft ? (
+          {imported ? (
+            <ScrollView contentContainerStyle={styles.body}>
+              {imported.map((s) => (
+                <View key={s.name} style={styles.card}>
+                  <Text style={styles.name}>{s.name}</Text>
+                  <Text style={styles.meta}>{describeImported(s)}</Text>
+                </View>
+              ))}
+              <TouchableOpacity style={[styles.primary, busy && styles.disabled]} onPress={handleImport} disabled={busy}>
+                <Text style={styles.primaryText}>{imported.length} 件を登録</Text>
+              </TouchableOpacity>
+            </ScrollView>
+          ) : !draft ? (
             <ScrollView contentContainerStyle={styles.body}>
               {active.length === 0 && <Text style={styles.empty}>登録したサプリはありません</Text>}
               {active.map((s) => (
@@ -164,6 +223,10 @@ export default function SupplementsModal({ visible, user, supplements, onClose, 
               <TouchableOpacity style={styles.primary} onPress={() => setDraft({ ...EMPTY })}>
                 <Text style={styles.primaryText}>サプリを登録</Text>
               </TouchableOpacity>
+              <TouchableOpacity style={[styles.btn, busy && styles.disabled]} onPress={pickCsv} disabled={busy}>
+                <Text style={styles.btnText}>CSV から読み込む</Text>
+              </TouchableOpacity>
+              {busy && <ActivityIndicator />}
             </ScrollView>
           ) : (
             <ScrollView contentContainerStyle={styles.body} keyboardShouldPersistTaps="handled">
