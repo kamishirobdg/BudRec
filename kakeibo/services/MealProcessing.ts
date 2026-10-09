@@ -19,7 +19,9 @@ import {
   IdentifiedDish, InventoryLine, NutritionQuery, NutritionResult, ReceiptLine, UsedItem,
 } from '../providers/GeminiMeal';
 import { listInventory, remainLabel, consume, InventoryItem } from './InventoryService';
-import { Food, findFood, findMenu, freshNutrition, loadFoods, loadMenuIndex, saveResearched } from './FoodService';
+import {
+  Food, findFood, findMenu, freshNutrition, loadFoods, loadMenuIndex, nutritionOrigin, saveResearched,
+} from './FoodService';
 import { rowsFromReceipts } from './ReceiptProcessing';
 import * as CategoryService from './CategoryService';
 import {
@@ -309,7 +311,7 @@ export async function recordMeal(
       const ref = inventory[d.used[0].index];
       const food = ref && freshNutrition(findFood(foods, ref.name, ref.store));
       const n = food ? nutrientsFromFood(food, ref, d.used[0], d.grams) : null;
-      if (food && n) return { nutrients: n, official: food.source === 'grounding' };
+      if (food && n) return { nutrients: n, ...nutritionOrigin(food) };
     }
     if (d.kind !== 'home' && d.used.length === 0) {
       const food = d.kind === 'eat_out' && storeOf(i)
@@ -325,16 +327,16 @@ export async function recordMeal(
         // （食品データの値が袋全体のものだと、1 枚食べただけで袋全部の量になってしまう）
         if (d.kind === 'packaged' && d.grams) {
           const g = Number(food.content.match(/^(\d+(?:\.\d+)?)\s*g$/i)?.[1]);
-          return g > 0 ? { nutrients: scaleNutrients(food.nutrients, d.grams / g), official: food.source === 'grounding' } : null;
+          return g > 0 ? { nutrients: scaleNutrients(food.nutrients, d.grams / g), ...nutritionOrigin(food) } : null;
         }
-        return { nutrients: food.nutrients, official: food.source === 'grounding' };
+        return { nutrients: food.nutrients, ...nutritionOrigin(food) };
       }
       // 包装の表示から入れた「1 個あたり」「100g あたり」の値（1 つ分 = 1 個。100g あたりは見積もった量を掛ける）
       if (food && d.kind === 'packaged' && food.basis === 'piece') {
-        return { nutrients: food.nutrients, official: food.source === 'grounding' };
+        return { nutrients: food.nutrients, ...nutritionOrigin(food) };
       }
       if (food && d.kind === 'packaged' && food.basis === 'per100g' && d.grams) {
-        return { nutrients: scaleNutrients(food.nutrients, d.grams / 100), official: food.source === 'grounding' };
+        return { nutrients: scaleNutrients(food.nutrients, d.grams / 100), ...nutritionOrigin(food) };
       }
     }
     return null;
@@ -467,16 +469,18 @@ function buildRow(p: {
 }): MealRow {
   const confidence: Confidence =
     p.dishConfidence === 'low' ? 'low' :
-    p.result.official ? p.dishConfidence : 'low';
+    p.result.official ? p.dishConfidence :
+    // 成分表の値でも、食べた量（食材のグラム数）は見積もりなので medium まで
+    p.result.tableSources ? (p.dishConfidence === 'high' ? 'medium' : p.dishConfidence) : 'low';
   return {
     mealId: p.mealId, dishId: p.dishId, eatenAt: p.eatenAt, user: p.user,
     kind: p.kind, store: p.store, dish: p.dish, portion: p.portion,
     nutrients: scaleNutrients(p.result.nutrients, p.portion),
-    nutrientSource: p.result.official ? 'grounding' : 'estimate',
+    nutrientSource: p.result.official ? 'grounding' : p.result.tableSources ? 'food_table' : 'estimate',
     confidence,
     entryId: p.entryId, itemRefs: p.itemRefs, status: 'estimated', assignedBy: 'auto',
     photoRefs: p.photoRef ? [p.photoRef] : [],
-    rev: 1, sources: p.sources, updatedBy: p.updatedBy, updatedAt: p.eatenAt, choices: p.choices,
+    rev: 1, sources: p.result.tableSources ?? p.sources, updatedBy: p.updatedBy, updatedAt: p.eatenAt, choices: p.choices,
   };
 }
 

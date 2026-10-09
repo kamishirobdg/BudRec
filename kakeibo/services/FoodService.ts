@@ -21,6 +21,7 @@ import { researchFoods, FoodQuery, FoodNutrition } from '../providers/GeminiMeal
 import { QuotaExceededError } from '../providers/AIProvider';
 import type { ReceiptItem } from '../providers/AIProvider';
 import * as Demo from './DemoService';
+import { TABLE_MATCH_SINCE } from './FoodTable';
 
 const SHEET = '_foods';
 export const MENU_SHEET = '_menus';
@@ -52,7 +53,8 @@ export interface Food {
   content:       string;
   nutrients:     Nutrients;
   basis:         'piece' | 'package' | 'per100g';
-  source:        'grounding' | 'estimate' | '';
+  /** food_table = 同梱の成分表の値（量り売りの食材） */
+  source:        'grounding' | 'food_table' | 'estimate' | '';
   sources:       string[];
   fetchedAt:     number;
   purchaseCount: number;
@@ -85,7 +87,7 @@ function fromCells(c: any[], rowIndex: number): Food {
     kind: String(c[4] ?? ''), storage: String(c[5] ?? ''), shelfDays: num(c[6]), pieces: num(c[7]),
     content: String(c[8] ?? ''), nutrients: sanitizeNutrients(parseJsonCell(c[9], {})),
     basis: c[10] === 'per100g' ? 'per100g' : c[10] === 'piece' ? 'piece' : 'package',
-    source: c[11] === 'grounding' || c[11] === 'estimate' ? c[11] : '',
+    source: c[11] === 'grounding' || c[11] === 'food_table' || c[11] === 'estimate' ? c[11] : '',
     sources: parseJsonCell<string[]>(c[12], []), fetchedAt: Number(c[13]) || 0,
     purchaseCount: Number(c[14]) || 0, lastPrice: num(c[15]), prices: parseJsonCell<number[]>(c[16], []),
     status: c[17] === 'done' || c[17] === 'failed' ? c[17] : 'pending',
@@ -265,8 +267,18 @@ export function purchaseKey(name: string, store: string, ownBrand: boolean | und
 
 /** 調べ済みで新しい栄養があれば返す */
 export function freshNutrition(f: Food | undefined): Food | null {
-  if (!f || f.status !== 'done' || Date.now() - f.fetchedAt > REFRESH_MS) return null;
+  if (!f || f.status !== 'done' || isStale(f)) return null;
   return Object.values(f.nutrients).some((v) => v !== null) ? f : null;
+}
+
+/** 調べ直しの時期か。成分表の値は変わらないので、照合の決まりを直したときだけ調べ直す */
+export function isStale(f: Food): boolean {
+  return f.source === 'food_table' ? f.fetchedAt < TABLE_MATCH_SINCE : Date.now() - f.fetchedAt > REFRESH_MS;
+}
+
+/** 食品データの値を食事の栄養にするときの出どころ */
+export function nutritionOrigin(f: Food): { official: boolean; tableSources?: string[] } {
+  return f.source === 'food_table' ? { official: false, tableSources: f.sources } : { official: f.source === 'grounding' };
 }
 
 // ─── 書き込み ─────────────────────────────────────────────────────────────────
@@ -506,8 +518,8 @@ async function saveResearchedTo(
       content: query.content || base.content,
       nutrients: got ? result.nutrients : base.nutrients,
       basis: got ? result.basis : base.basis,
-      source: got ? (result.official ? 'grounding' : 'estimate') : base.source,
-      sources: got ? sources : base.sources,
+      source: got ? (result.tableSource ? 'food_table' : result.official ? 'grounding' : 'estimate') : base.source,
+      sources: got ? (result.tableSource ? [result.tableSource] : sources) : base.sources,
       fetchedAt: Date.now(),
       // 調べ直して見つからなくても、前に調べた値は使い続ける
       status: got || base.status === 'done' ? 'done' : 'failed',
@@ -555,7 +567,7 @@ export async function researchSomePending(signal?: AbortSignal): Promise<boolean
 
   const foods = [...(await loadFoods(true)).values()];
   const due = foods
-    .filter((f) => f.status === 'pending' || (f.status === 'done' && Date.now() - f.fetchedAt > REFRESH_MS))
+    .filter((f) => f.status === 'pending' || (f.status === 'done' && isStale(f)))
     .sort((a, b) => b.purchaseCount - a.purchaseCount)
     .slice(0, Math.min(BATCH, DAILY_RESEARCH_LIMIT - counter.count));
   if (due.length === 0) return false;

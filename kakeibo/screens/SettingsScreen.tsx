@@ -40,6 +40,7 @@ import * as RowsCache from '../services/RowsCacheService';
 import { clearCache } from '../services/LocalCache';
 import * as LastBatch from '../services/LastBatchService';
 import * as Demo from '../services/DemoService';
+import { FOOD_TABLE_CREDIT } from '../services/FoodTable';
 import { runGmailImport, getSkippedMessageSummaries, SkippedMessageSummary } from '../services/GmailService';
 import { useGmailProgress } from '../services/GmailProgressService';
 import FoodResearchCard from '../components/FoodResearchCard';
@@ -707,6 +708,7 @@ export default function SettingsScreen({ onSignedOut }: Props) {
             <TouchableOpacity style={styles.signOutBtn} onPress={handleSignOut}>
               <Text style={styles.signOutBtnText}>サインアウト</Text>
             </TouchableOpacity>
+            <Text style={styles.credit}>食品の栄養の一部は「{FOOD_TABLE_CREDIT}」</Text>
           </View>
         }
       />
@@ -881,6 +883,7 @@ const styles = StyleSheet.create({
   footer: { padding: 16, paddingTop: 8 },
   signOutBtn:     { borderRadius: 14, paddingVertical: 14, alignItems: 'center', backgroundColor: '#fff' },
   signOutBtnText: { color: '#e53935', fontSize: 15, fontWeight: '600' },
+  credit:         { marginTop: 16, color: '#9e9e9e', fontSize: 11, textAlign: 'center' },
 
   skippedModalContainer: {
     flex: 1,

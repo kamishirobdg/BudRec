@@ -230,9 +230,9 @@ export default function MealEditModal({ target, onClose, onSaved }: Props) {
         return {
           ...d,
           whole: r.nutrients,
-          nutrientSource: r.official ? 'grounding' : 'estimate',
-          confidence: r.official ? 'high' : 'low',
-          sources,
+          nutrientSource: r.official ? 'grounding' : r.tableSources ? 'food_table' : 'estimate',
+          confidence: r.official ? 'high' : r.tableSources ? 'medium' : 'low',
+          sources: r.tableSources ?? sources,
         };
       });
     } catch (e) {
@@ -345,8 +345,8 @@ export default function MealEditModal({ target, onClose, onSaved }: Props) {
       }
       update(d.dishId, {
         whole: food.nutrients,
-        nutrientSource: food.source === 'grounding' ? 'grounding' : 'estimate',
-        confidence: food.source === 'grounding' ? 'high' : 'low',
+        nutrientSource: food.source === 'grounding' || food.source === 'food_table' ? food.source : 'estimate',
+        confidence: food.source === 'grounding' ? 'high' : food.source === 'food_table' ? 'medium' : 'low',
         sources: food.sources,
         refreshed: true,
         manualNutrition: false,
@@ -643,6 +643,7 @@ export default function MealEditModal({ target, onClose, onSaved }: Props) {
                       <Text style={styles.sub}>
                         {kcal(d.whole)}（1品）
                         {d.nutrientSource === 'grounding' ? '・公式'
+                          : d.nutrientSource === 'food_table' ? '・成分表'
                           : d.nutrientSource === 'label' ? '・表示'
                             : d.nutrientSource === 'manual' ? '・手入力' : '・推定'}
                       </Text>

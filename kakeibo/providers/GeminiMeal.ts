@@ -12,7 +12,8 @@ import {
   RECEIPT_ITEM_SCHEMA, ReceiptData, buildPhotoPrompt, parseJson, receiptsFromParsed,
 } from './AIProvider';
 import { callGemini, callGeminiDetailed } from './GeminiProvider';
-import { NUTRIENTS, Nutrients, sanitizeNutrients } from '../services/Nutrients';
+import { NUTRIENTS, NUTRIENT_KEYS, Nutrients, sanitizeNutrients } from '../services/Nutrients';
+import { TableFood, findTableFood, kcalAgrees, tableSourceLabel } from '../services/FoodTable';
 
 export type DishKind = 'eat_out' | 'packaged' | 'home';
 export type Eater    = 'photographer' | 'partner' | 'both' | 'unknown';
@@ -221,11 +222,16 @@ export interface FoodNutrition {
    */
   basis:     'piece' | 'package' | 'per100g';
   official:  boolean;
+  /** 量り売りの食材で、同梱の成分表の値を使った（そのときの出どころ。sources に残す） */
+  tableSource?: string;
 }
+
+/** 成分表の書き方の食品名を答えさせる指示（「鶏もも肉」ではなく成分表の食品名の語で） */
+const TABLE_NAME_GUIDE = '日本食品標準成分表（八訂）の食品名の書き方（成分表と同じ漢字・かなで、語を空白で区切る。例: 「にわとり 若どり もも 皮つき 生」「ぶた 大型種肉 ばら 脂身つき 生」「たまねぎ りん茎 生」「りょくとうもやし 生」「こいくちしょうゆ」「調合油」「こめ 水稲めし 精白米 うるち米」）';
 
 /**
  * 食品データ（_foods）を作るための調査。商品・メニューは grounding で公式の栄養成分表示を探し、
- * 量り売りの食材は 100g あたりの一般的な値（日本食品標準成分表に相当する値）を返させる。
+ * 量り売りの食材は成分表の食品名を答えさせて同梱の成分表の値を使う（当たらなければ一般的な値の推定）。
  */
 export async function researchFoods(
   queries: FoodQuery[],
@@ -239,12 +245,13 @@ export async function researchFoods(
 - 市販の商品・飲食店のメニューは、Google 検索で**メーカー・店の公式の栄養成分表示**を探して使う。公式の値が見つからなければ一般的な値で推定し、official を false にする
   - 複数入りの商品（6 本入りのアイスなど）は 1 個（1 本）あたりの値にして basis を piece にする
   - 1 個売りの商品・1 パックで食べる商品・飲食店のメニューは、その 1 つ（一人前）あたりで basis を package にする
-- 肉・魚・野菜など量り売りの食材は、100g あたりの一般的な値（日本食品標準成分表に相当する値）にして basis を per100g、official を false にする
+- 肉・魚・野菜など量り売りの食材は、100g あたりの一般的な値（日本食品標準成分表に相当する値）にして basis を per100g、official を false にする。
+  あわせて table_name に、${TABLE_NAME_GUIDE}を入れる
 
 ${list}
 
 返す形:
-{"results":[{"index":0,"basis":"package","official":true,"nutrients":{"ENERC_KCAL":652,"PROT-":20.1, ...}}]}
+{"results":[{"index":0,"basis":"package","official":true,"nutrients":{"ENERC_KCAL":652,"PROT-":20.1, ...}},{"index":1,"basis":"per100g","official":false,"table_name":"にわとり 若どり もも 皮つき 生","nutrients":{...}}]}
 
 nutrients のキーは次のとおり。値が分からないキーは null にする（0 と書かない）:
 ${NUTRIENT_LIST}`;
@@ -253,13 +260,22 @@ ${NUTRIENT_LIST}`;
   const arr: any[] = Array.isArray(parsed?.results) ? parsed.results : [];
   const results = queries.map((_, i): FoodNutrition => {
     const hit = arr.find((r) => Number(r?.index) === i) ?? arr[i];
-    return {
-      nutrients: sanitizeNutrients(hit?.nutrients),
-      basis:     hit?.basis === 'per100g' ? 'per100g' : hit?.basis === 'piece' ? 'piece' : 'package',
-      official:  hit?.official === true,
-    };
+    const nutrients = sanitizeNutrients(hit?.nutrients);
+    const basis = hit?.basis === 'per100g' ? 'per100g' : hit?.basis === 'piece' ? 'piece' : 'package';
+    // 公式の表示が見つかったもの（100g あたりで表示しているハムなど）は、成分表の一般的な値で上書きしない
+    const table = basis === 'per100g' && hit?.official !== true ? matchTable(hit?.table_name, nutrients['ENERC_KCAL']) : null;
+    return table
+      ? { nutrients: table.nutrients, basis, official: false, tableSource: tableSourceLabel(table) }
+      : { nutrients, basis, official: hit?.official === true };
   });
   return { results, sources: res.sources };
+}
+
+/** 成分表の食品を引く。モデル自身の推定とエネルギーが大きく食い違えば、別の食品に当たったとみなして使わない */
+function matchTable(tableName: unknown, modelKcal: number | null): TableFood | null {
+  if (typeof tableName !== 'string' || !tableName.trim()) return null;
+  const f = findTableFood(tableName);
+  return f && kcalAgrees(modelKcal, f.nutrients['ENERC_KCAL']) ? f : null;
 }
 
 export interface ReceiptLine {
@@ -317,6 +333,8 @@ export interface NutritionResult {
   nutrients: Nutrients;
   /** 公式の栄養表示が見つかった */
   official:  boolean;
+  /** 同梱の成分表の値から求めた（自炊は食材ごとの成分表 × 量の合計）。そのときの出どころ */
+  tableSources?: string[];
 }
 
 const NUTRIENT_LIST = NUTRIENTS.map((n) => `${n.key}（${n.label}・${n.unit}）`).join(', ');
@@ -332,17 +350,18 @@ export async function lookupNutrition(
 ): Promise<{ results: NutritionResult[]; sources: string[] }> {
   if (queries.length === 0) return { results: [], sources: [] };
   const grounded = queries.some((q) => q.kind !== 'home');
+  const hasHome = queries.some((q) => q.kind === 'home');
 
   const list = queries
     .map((q, i) => `${i}: ${q.store ? `店「${q.store}」の` : ''}「${q.name}」（${q.amount ?? (q.kind === 'packaged' ? '商品 1 個' : '一人前')}）`)
     .join('\n');
   const prompt = `次の食事の栄養成分を求め、JSON のみを返してください（説明文は不要）。
 ${grounded ? 'チェーン店のメニューや市販の商品は、Google 検索で**店・メーカーの公式の栄養成分表示**を探して、その値を使ってください。公式の値が見つからなければ一般的な値で推定し、official を false にしてください。' : '家で作った料理なので、写真と料理名から一般的な分量・値で推定し、official は false にしてください。'}
-
+${hasHome ? `家で作った料理は、ingredients に使った食材と調味料（油・砂糖・しょうゆなども）を入れてください。grams と kcal は nutrients と同じ量（上の量）に使った分のグラム数（数値）とエネルギーにします。name は${TABLE_NAME_GUIDE}にします。\n` : ''}
 ${list}
 
 返す形:
-{"results":[{"index":0,"official":true,"nutrients":{"ENERC_KCAL":652,"PROT-":20.1, ...}}]}
+{"results":[{"index":0,"official":true,"nutrients":{"ENERC_KCAL":652,"PROT-":20.1, ...}}${hasHome ? ',{"index":1,"official":false,"nutrients":{...},"ingredients":[{"name":"にわとり 若どり もも 皮つき 生","grams":120,"kcal":228},{"name":"こいくちしょうゆ","grams":9,"kcal":7}]}' : ''}]}
 
 nutrients のキーは次のとおり。値が分からないキーは null にする（0 と書かない）:
 ${NUTRIENT_LIST}`;
@@ -357,12 +376,54 @@ ${NUTRIENT_LIST}`;
   });
   const parsed = parseJson(res.text);
   const arr: any[] = Array.isArray(parsed?.results) ? parsed.results : [];
-  const results = queries.map((_, i): NutritionResult => {
+  const results = queries.map((q, i): NutritionResult => {
     const hit = arr.find((r) => Number(r?.index) === i) ?? arr[i];
-    return {
-      nutrients: sanitizeNutrients(hit?.nutrients),
-      official:  grounded && hit?.official === true,
-    };
+    const nutrients = sanitizeNutrients(hit?.nutrients);
+    const table = q.kind === 'home' ? sumIngredients(hit?.ingredients, nutrients['ENERC_KCAL']) : null;
+    if (table) return { nutrients: table.nutrients, official: false, tableSources: table.sources };
+    return { nutrients, official: grounded && hit?.official === true };
   });
   return { results, sources: res.sources };
+}
+
+/** 少量の調味料（これ未満のグラム数）は成分表に当たらなくても無視する */
+const MINOR_GRAMS = 5;
+
+/**
+ * 自炊の料理を、食材ごとの成分表 × グラム数の合計で求める。次のときは null（モデルの推定を使う）:
+ * グラム数の読めない食材がある・少量の調味料でない食材が当たらない・食材ごとや合計のエネルギーが
+ * モデル自身の推定と大きく食い違う（別の食品に当たった）。
+ * 項目ごとに、少量の調味料でない食材で 1 つでも不明なら null（不明を少なく数えない）。少量の調味料の不明は無視する。
+ */
+function sumIngredients(raw: unknown, modelKcal: number | null): { nutrients: Nutrients; sources: string[] } | null {
+  if (!Array.isArray(raw) || raw.length === 0) return null;
+  const matched: { food: TableFood; grams: number }[] = [];
+  for (const x of raw) {
+    const name = typeof x?.name === 'string' ? x.name.trim() : '';
+    const grams = typeof x?.grams === 'number' ? x.grams : parseFloat(String(x?.grams ?? ''));
+    if (!name) continue;
+    if (!Number.isFinite(grams) || grams < 0) return null;
+    if (grams === 0) continue;
+    const food = findTableFood(name);
+    const kcal = food?.nutrients['ENERC_KCAL'];
+    const modelItemKcal = typeof x?.kcal === 'number' ? x.kcal : null;
+    if (food && kcalAgrees(modelItemKcal, kcal === null || kcal === undefined ? null : kcal * grams / 100)) {
+      matched.push({ food, grams });
+    } else if (grams >= MINOR_GRAMS) {
+      return null;
+    }
+  }
+  if (matched.length === 0) return null;
+  const nutrients: Nutrients = {};
+  for (const key of NUTRIENT_KEYS) {
+    const unknownMain = matched.some((m) => m.food.nutrients[key] === null && m.grams >= MINOR_GRAMS);
+    const known = matched.filter((m) => m.food.nutrients[key] !== null);
+    nutrients[key] = unknownMain || known.length === 0 ? null
+      : Math.round(known.reduce((s, m) => s + m.food.nutrients[key]! * m.grams / 100, 0) * 10_000) / 10_000;
+  }
+  if (!kcalAgrees(modelKcal, nutrients['ENERC_KCAL'])) return null;
+  return {
+    nutrients,
+    sources: matched.filter((m) => m.food.id !== '-').map((m) => `${tableSourceLabel(m.food)} ${Math.round(m.grams)}g`),
+  };
 }

@@ -8,13 +8,12 @@
 
 import { SheetsInternal, ITEMS_RANGE } from './SheetsService';
 import { FoodQuery, FoodNutrition } from '../providers/GeminiMeal';
-import { Food, foodKey, loadFoods, loadMenuIndex, saveResearched } from './FoodService';
+import { Food, foodKey, isStale, loadFoods, loadMenuIndex, saveResearched } from './FoodService';
 import { NUTRIENTS, sanitizeNutrients } from './Nutrients';
 import { readJsonArray, removeFile, writeJson } from './jsonFileStore';
 
 /** 1 回の文面に載せる品目数 */
 const PER_REQUEST = 50;
-const REFRESH_MS = 180 * 24 * 60 * 60 * 1000;
 /**
  * 前回の文面に載せた品名。取り込んだときに、答えに無かったものをしばらく載せないようにする。
  * SecureStore は大きな値を保存できないことがあるのでファイルに置く
@@ -47,7 +46,7 @@ interface Candidate {
 function isDue(f: Food | undefined): boolean {
   if (!f) return true;
   if (f.status === 'pending') return true;
-  return f.status === 'done' && Date.now() - f.fetchedAt > REFRESH_MS;
+  return f.status === 'done' && isStale(f);
 }
 
 /** 月次シートのメモ欄（`品名:価格, …`）と `_items_YYYY-MM` から品目を集める */
