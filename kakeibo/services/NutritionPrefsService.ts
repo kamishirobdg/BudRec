@@ -4,6 +4,7 @@
  *
  * | user | visible（栄養素キーの JSON 配列） | targets（{"ENERC_KCAL": 2000, ...}。任意） |
  * | birth_date（YYYY-MM-DD）| sex（male / female） | activity（auto / I / II / III。身体活動レベル。auto は歩数から決める） |
+ * | meals_per_day（1 日の食事回数。既定 3。今日の途中の判定に使う。§11.4） |
  *
  * 生年・性別・活動レベルから、食事摂取基準の値（年齢区分）を決める（§11）。
  */
@@ -13,7 +14,9 @@ import { DEFAULT_VISIBLE, NUTRIENT_KEYS } from './Nutrients';
 import * as Demo from './DemoService';
 
 const SHEET = '_nutrition_prefs';
-export const NUTRITION_PREFS_HEADER = ['user', 'visible', 'targets', 'birth_date', 'sex', 'activity'];
+export const NUTRITION_PREFS_HEADER = ['user', 'visible', 'targets', 'birth_date', 'sex', 'activity', 'meals_per_day'];
+/** 1 日の食事回数の既定 */
+export const DEFAULT_MEALS_PER_DAY = 3;
 
 export type Sex = 'male' | 'female';
 export type Activity = 'I' | 'II' | 'III';
@@ -31,6 +34,8 @@ export interface NutritionPrefs {
   /** 1 日の目標値。設定していない栄養素は持たない */
   targets: Record<string, number>;
   profile: NutritionProfile;
+  /** 1 日の食事回数（おやつ・飲み物は数えない）。今日の途中は「食べた回数 ÷ この数」の目安で判定する */
+  mealsPerDay: number;
 }
 
 export const DEFAULT_PROFILE: NutritionProfile = { birthDate: null, sex: null, activity: 'auto' };
@@ -57,7 +62,9 @@ export function normalizeBirthDate(input: unknown): string | null {
   if (y < 1900 || date.getTime() > Date.now()) return null;
   return `${y}-${String(mo).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
 }
-export const DEFAULT_PREFS: NutritionPrefs = { visible: [...DEFAULT_VISIBLE], targets: {}, profile: DEFAULT_PROFILE };
+export const DEFAULT_PREFS: NutritionPrefs = {
+  visible: [...DEFAULT_VISIBLE], targets: {}, profile: DEFAULT_PROFILE, mealsPerDay: DEFAULT_MEALS_PER_DAY,
+};
 
 function parseProfile(birthDate: unknown, sex: unknown, activity: unknown): NutritionProfile {
   return {
@@ -67,7 +74,7 @@ function parseProfile(birthDate: unknown, sex: unknown, activity: unknown): Nutr
   };
 }
 
-function parse(visible: unknown, targets: unknown, profile: NutritionProfile = DEFAULT_PROFILE): NutritionPrefs {
+function parse(visible: unknown, targets: unknown, profile: NutritionProfile = DEFAULT_PROFILE, mealsPerDay: unknown = ''): NutritionPrefs {
   let v: string[] = [];
   let t: Record<string, number> = {};
   try {
@@ -86,7 +93,11 @@ function parse(visible: unknown, targets: unknown, profile: NutritionProfile = D
   } catch {
     t = {};
   }
-  return { visible: v.length > 0 ? v : [...DEFAULT_VISIBLE], targets: t, profile };
+  const m = Number(mealsPerDay);
+  return {
+    visible: v.length > 0 ? v : [...DEFAULT_VISIBLE], targets: t, profile,
+    mealsPerDay: Number.isInteger(m) && m >= 1 && m <= 6 ? m : DEFAULT_MEALS_PER_DAY,
+  };
 }
 
 /** 全員の設定（設定の無い人は既定） */
@@ -96,13 +107,13 @@ export async function loadPrefs(): Promise<Map<string, NutritionPrefs>> {
   const client = await SheetsInternal.createClient();
   const names = await SheetsInternal.listSheetNames(client, true);
   if (!names.includes(SHEET)) return out;
-  const res = await client.get(`/values/${encodeURIComponent(SHEET)}!A:F`);
+  const res = await client.get(`/values/${encodeURIComponent(SHEET)}!A:G`);
   const rows = (res.data.values ?? []) as string[][];
   // 前の版（見出しが birth_year）は、活動量を触らなくても「ふつう」を書いていた。自動ができる前の値なので自動に読み替える
   const legacy = rows[0]?.[3] === 'birth_year';
   rows.forEach((c, i) => {
     if (i === 0 || !c[0]) return;
-    out.set(c[0], parse(c[1], c[2], parseProfile(c[3], c[4], legacy && c[5] === 'II' ? 'auto' : c[5])));
+    out.set(c[0], parse(c[1], c[2], parseProfile(c[3], c[4], legacy && c[5] === 'II' ? 'auto' : c[5]), c[6]));
   });
   return out;
 }
@@ -121,23 +132,23 @@ export async function savePrefs(user: string, prefs: NutritionPrefs): Promise<vo
   rows.forEach((c, i) => { if (i > 0 && c[0] === user) index = i; });
   const p = prefs.profile;
   const values = [[
-    user, JSON.stringify(prefs.visible), JSON.stringify(prefs.targets), p.birthDate ?? '', p.sex ?? '', p.activity,
+    user, JSON.stringify(prefs.visible), JSON.stringify(prefs.targets), p.birthDate ?? '', p.sex ?? '', p.activity, prefs.mealsPerDay,
   ]];
   // 見出しを今の列に合わせる（生年 birth_year だった頃のシートも生年月日の見出しにする）
   await client.put(
-    `/values/${encodeURIComponent(SHEET)}!A1:F1`,
+    `/values/${encodeURIComponent(SHEET)}!A1:G1`,
     { values: [NUTRITION_PREFS_HEADER] },
     { params: { valueInputOption: 'RAW' } },
   );
   if (index > 0) {
     await client.put(
-      `/values/${encodeURIComponent(SHEET)}!A${index + 1}:F${index + 1}`,
+      `/values/${encodeURIComponent(SHEET)}!A${index + 1}:G${index + 1}`,
       { values },
       { params: { valueInputOption: 'RAW' } },
     );
   } else {
     await client.post(
-      `/values/${encodeURIComponent(SHEET)}!A:F:append`,
+      `/values/${encodeURIComponent(SHEET)}!A:G:append`,
       { values },
       { params: { valueInputOption: 'RAW', insertDataOption: 'INSERT_ROWS' } },
     );

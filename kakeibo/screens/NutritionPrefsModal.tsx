@@ -26,6 +26,7 @@ export default function NutritionPrefsModal({ user, prefs, onClose, onSaved, aut
   const [birthDate, setBirthDate] = useState('');
   const [sex, setSex]             = useState<Sex | null>(null);
   const [activity, setActivity]   = useState<Activity | 'auto'>('auto');
+  const [mealsPerDay, setMealsPerDay] = useState(3);
   const [saving, setSaving]   = useState(false);
 
   // 開いたときだけ読み込む（開いている間に一覧が読み直されても入力中の値を戻さない）
@@ -36,6 +37,7 @@ export default function NutritionPrefsModal({ user, prefs, onClose, onSaved, aut
     setBirthDate(prefs.profile.birthDate ? prefs.profile.birthDate.replace(/-/g, '/') : '');
     setSex(prefs.profile.sex);
     setActivity(prefs.profile.activity);
+    setMealsPerDay(prefs.mealsPerDay);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user]);
 
@@ -63,6 +65,7 @@ export default function NutritionPrefsModal({ user, prefs, onClose, onSaved, aut
       visible: NUTRIENTS.map((n) => n.key).filter((k) => visible.includes(k)),
       targets: parsed,
       profile: { birthDate: date, sex, activity },
+      mealsPerDay,
     };
     setSaving(true);
     try {
@@ -117,6 +120,15 @@ export default function NutritionPrefsModal({ user, prefs, onClose, onSaved, aut
                         <Text style={[styles.chipText, activity === v && styles.chipTextActive]}>
                           {v === 'auto' ? `自動${autoActivity ? `（${ACTIVITY_LABEL[autoActivity]}）` : ''}` : ACTIVITY_LABEL[v]}
                         </Text>
+                      </TouchableOpacity>
+                    ))}
+                  </View>
+                  {/* 今日の途中は「食べた回数 ÷ 食事回数」の目安で不足を見る（おやつ・飲み物は数えない） */}
+                  <View style={styles.profileRow}>
+                    <Text style={styles.profileLabel}>食事回数</Text>
+                    {([2, 3, 4] as const).map((v) => (
+                      <TouchableOpacity key={v} style={[styles.chip, mealsPerDay === v && styles.chipActive]} onPress={() => setMealsPerDay(v)}>
+                        <Text style={[styles.chipText, mealsPerDay === v && styles.chipTextActive]}>{v} 食</Text>
                       </TouchableOpacity>
                     ))}
                   </View>

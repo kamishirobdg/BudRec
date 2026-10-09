@@ -78,7 +78,12 @@ function driFor(key: string, prefs: NutritionPrefs, now: Date): DriValue | undef
     : table[`${sex}|${group}`];
 }
 
-function judgeOne(key: string, value: number | null, kcal: number | null, prefs: NutritionPrefs, now: Date): NutrientStatus {
+/**
+ * @param pace 今日の途中の判定に使う、1 日のうち食べた割合（食べた回数 ÷ 1 日の食事回数。0〜1）。
+ *   不足の線だけこの割合を掛ける（朝食だけの時点で 1 日分と比べて「不足」にしない）。
+ *   過剰の線・エネルギー比の線引きは 1 日分のまま（途中で超えていれば本当に多い）。過去の日は 1
+ */
+function judgeOne(key: string, value: number | null, kcal: number | null, prefs: NutritionPrefs, now: Date, pace: number): NutrientStatus {
   const def = nutrientDef(key)!;
   const base: NutrientStatus = {
     key, label: def.label, unit: def.unit, value, standard: '', judgement: 'none', ratio: null,
@@ -87,13 +92,13 @@ function judgeOne(key: string, value: number | null, kcal: number | null, prefs:
   if (SKIP.has(key)) return base;
   const dri = driFor(key, prefs, now);
   const target = prefs.targets[key];
-  /** 量で判定する（low 未満で不足・high 超えで過剰。ratio は ratioBase に対する割合） */
+  /** 量で判定する（low 未満で不足・high 超えで過剰。ratio は ratioBase に対する割合。帯と割合は 1 日分） */
   const byAmount = (standard: string, low: number | undefined, high: number | undefined, ratioBase: number,
     opts: { highInclusive?: boolean; bandLow?: number } = {}): NutrientStatus => {
     const band = { bandLow: opts.bandLow ?? low ?? 0, bandHigh: high };
     if (value === null) return { ...base, standard, ...band };
     const over = high !== undefined && (opts.highInclusive ? value >= high : value > high);
-    const judgement: Judgement = low !== undefined && value < low ? 'low' : over ? 'high' : 'ok';
+    const judgement: Judgement = low !== undefined && value < low * pace ? 'low' : over ? 'high' : 'ok';
     return { ...base, standard, judgement, ratio: value / ratioBase, ...band };
   };
   /** エネルギー比で判定する */
@@ -132,7 +137,7 @@ function judgeOne(key: string, value: number | null, kcal: number | null, prefs:
   // たんぱく質・脂質・炭水化物: エネルギー比が目標量の範囲か（たんぱく質は推奨量の 80% 未満も不足）
   const ratioKcal = ENERGY_RATIO[key];
   if (ratioKcal && dri?.dgUnit === '%E' && dri.DG_LOW !== undefined && dri.DG_HIGH !== undefined) {
-    const lowByAmount = value !== null && dri.RDA !== undefined && value < dri.RDA * LOW_RATIO;
+    const lowByAmount = value !== null && dri.RDA !== undefined && value < dri.RDA * LOW_RATIO * pace;
     return byPercent(`エネルギーの ${fmt(dri.DG_LOW)}〜${fmt(dri.DG_HIGH)}%`, dri.DG_LOW, dri.DG_HIGH, ratioKcal, lowByAmount);
   }
 
@@ -147,13 +152,35 @@ function judgeOne(key: string, value: number | null, kcal: number | null, prefs:
   return byAmount(standard, lower !== undefined ? lower * LOW_RATIO : undefined, upper, lower ?? upper!);
 }
 
-/** その日の合計を判定する。表示する栄養素（設定の visible）を先に、ほかを後に並べる */
-export function judgeDay(totals: Record<string, number | null>, prefs: NutritionPrefs, now: Date = new Date()): NutrientStatus[] {
+/**
+ * その日の合計を判定する。表示する栄養素（設定の visible）を先に、ほかを後に並べる。
+ * @param pace 今日の途中なら「食べた回数 ÷ 1 日の食事回数」（`paceOf`）。省略時は 1 日分として判定
+ */
+export function judgeDay(
+  totals: Record<string, number | null>, prefs: NutritionPrefs, now: Date = new Date(), pace = 1,
+): NutrientStatus[] {
   const kcal = totals['ENERC_KCAL'] ?? null;
   const order = [...prefs.visible, ...NUTRIENTS.map((n) => n.key).filter((k) => !prefs.visible.includes(k))];
   return order
     .filter((k) => nutrientDef(k) && !SKIP.has(k))
-    .map((k) => judgeOne(k, totals[k] ?? null, kcal, prefs, now));
+    .map((k) => judgeOne(k, totals[k] ?? null, kcal, prefs, now, Math.max(0, Math.min(1, pace))));
+}
+
+/** 食事として数えるエネルギーの下限（これ未満はおやつ・飲み物として回数に入れない） */
+export const MEAL_KCAL_MIN = 200;
+
+/** 1 回の食事（自分の分の栄養の一覧）を食事回数に数えるか。エネルギーが分からなければ数える */
+export function countsAsMeal(nutrients: { ENERC_KCAL?: number | null }[]): boolean {
+  if (nutrients.length === 0) return false;
+  const known = nutrients.filter((n) => n.ENERC_KCAL !== null && n.ENERC_KCAL !== undefined);
+  if (known.length === 0) return true;
+  return known.reduce((s, n) => s + (n.ENERC_KCAL ?? 0), 0) >= MEAL_KCAL_MIN;
+}
+
+/** 今日の途中の判定に使う割合。食べた回数が食事回数に達したら（または過去の日なら）1 */
+export function paceOf(eatenMeals: number, mealsPerDay: number, isToday: boolean): number {
+  if (!isToday || mealsPerDay <= 0) return 1;
+  return Math.min(eatenMeals, mealsPerDay) / mealsPerDay;
 }
 
 /** プロフィールが入っているか（入っていなければ、自分の目標の分しか判定できない） */

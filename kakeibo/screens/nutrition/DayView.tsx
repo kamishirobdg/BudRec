@@ -2,8 +2,8 @@ import { useMemo, useState } from 'react';
 import { RefreshControl, ScrollView, StyleSheet, Switch, Text, TouchableOpacity, View } from 'react-native';
 import type { MealRow } from '../../services/MealService';
 import { Nutrients, sumNutrients } from '../../services/Nutrients';
-import type { NutritionPrefs } from '../../services/NutritionPrefsService';
-import { Judgement, NutrientStatus, hasProfile, judgeDay } from '../../services/NutritionJudge';
+import { DEFAULT_MEALS_PER_DAY, NutritionPrefs } from '../../services/NutritionPrefsService';
+import { Judgement, NutrientStatus, countsAsMeal, hasProfile, judgeDay, paceOf, today } from '../../services/NutritionJudge';
 import { Supplement } from '../../services/SupplementService';
 
 export interface MealGroup {
@@ -43,9 +43,16 @@ function fmt(v: number | null, unit: string): string {
 /** その日の栄養の表・サプリ・食事の一覧 */
 export default function DayView(props: Props) {
   const {
-    me, meals, prefs, supplements, supplementNutrients, loading, onRefresh, onOpenMeal, onToggleSupplement, supplementSaving,
+    me, day, meals, prefs, supplements, supplementNutrients, loading, onRefresh, onOpenMeal, onToggleSupplement, supplementSaving,
   } = props;
   const [showAll, setShowAll] = useState(false);
+
+  // 今日の途中は、食べた回数（おやつ・飲み物を除く）÷ 1 日の食事回数 の目安で不足を見る（§11.4）
+  const isToday = day === today();
+  const eaten = meals.filter((g) => countsAsMeal(g.rows.filter((r) => r.user === me).map((r) => r.nutrients))).length;
+  // 端末の控え（前の版）には食事回数が無いことがある
+  const perDay = prefs.mealsPerDay || DEFAULT_MEALS_PER_DAY;
+  const pace = paceOf(eaten, perDay, isToday);
 
   const statuses = useMemo(() => {
     const mine = meals.flatMap((g) => g.rows.filter((r) => r.user === me).map((r) => r.nutrients));
@@ -53,8 +60,8 @@ export default function DayView(props: Props) {
     const sums = sumNutrients(list);
     const totals: Record<string, number | null> = {};
     for (const [k, t] of Object.entries(sums)) totals[k] = list.length > 0 && !(t.partial && t.value === 0) ? t.value : null;
-    return judgeDay(totals, prefs);
-  }, [meals, me, prefs, supplementNutrients]);
+    return judgeDay(totals, prefs, new Date(), pace);
+  }, [meals, me, prefs, supplementNutrients, pace]);
 
   const shown = showAll ? statuses : statuses.filter((s) => prefs.visible.includes(s.key));
   const counts = statuses.reduce((c, s) => ({ ...c, [s.judgement]: (c[s.judgement] ?? 0) + 1 }), {} as Record<string, number>);
@@ -67,7 +74,9 @@ export default function DayView(props: Props) {
 
       <View style={styles.card}>
         <View style={styles.tableHead}>
-          <Text style={styles.cardTitle}>栄養</Text>
+          <Text style={styles.cardTitle}>
+            栄養{isToday && pace < 1 && <Text style={styles.pace}>　{eaten}/{perDay} 食のペースで判定</Text>}
+          </Text>
           <Text style={styles.counts}>
             {(counts.low ?? 0) > 0 && <Text style={{ color: JUDGE_COLOR.low }}>不足 {counts.low}　</Text>}
             {(counts.high ?? 0) > 0 && <Text style={{ color: JUDGE_COLOR.high }}>過剰 {counts.high}</Text>}
@@ -163,6 +172,7 @@ const styles = StyleSheet.create({
   notice:    { fontSize: 12, color: '#6b7280', backgroundColor: '#fff', borderRadius: 10, padding: 10 },
   card:      { backgroundColor: '#fff', borderRadius: 16, padding: 14, gap: 6 },
   cardTitle: { fontSize: 14, fontWeight: 'bold', color: '#374151' },
+  pace:      { fontSize: 11, fontWeight: '400', color: '#6b7280' },
   tableHead: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
   counts:    { fontSize: 12, fontWeight: '700' },
   more:      { fontSize: 12, color: '#2563eb', fontWeight: '600', marginTop: 4 },
