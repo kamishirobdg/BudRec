@@ -3,7 +3,7 @@
     "name": "Bud-Rec",
     "slug": "kakeibo",
     "scheme": "com.svnsfy.kakeibo",
-    "version": "2.14.0",
+    "version": "2.15.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",

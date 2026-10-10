@@ -5,12 +5,15 @@ import { sumNutrients } from '../services/Nutrients';
 import { getCurrentUser } from '../services/UserService';
 import * as OcrWorker from '../services/OcrWorker';
 import * as ReceiptQueue from '../services/ReceiptQueueService';
-import { DEFAULT_PREFS, NutritionPrefs, loadPrefs, resolveProfile } from '../services/NutritionPrefsService';
+import { DEFAULT_PREFS, NutritionPrefs, loadPrefs, resolveProfile, savePrefs } from '../services/NutritionPrefsService';
 import { DayActivity, autoActivityLevel, loadActivity } from '../services/ActivityService';
-import { NutrientStatus, dayOf, judgeDay, shiftDay, today } from '../services/NutritionJudge';
+import { dayOf, judgeDay, shiftDay, today } from '../services/NutritionJudge';
 import {
   Supplement, SupplementSkip, loadSupplements, setSkipped, supplementNutrients, supplementsOn,
 } from '../services/SupplementService';
+import {
+  Advice, AdviceInput, DayJudgement, MIN_RECORDED_DAYS, generateAdvice, lastWeek, latestAdvice, loadAdvice,
+} from '../services/AdviceService';
 import { cachedLoad, writeCache } from '../services/LocalCache';
 import MealEditModal, { MealTarget } from './MealEditModal';
 import NutritionPrefsModal from './NutritionPrefsModal';
@@ -30,6 +33,43 @@ function monthOfDay(day: string): string {
 function dayLabel(day: string): string {
   const [y, m, d] = day.split('-').map(Number);
   return `${m}/${d}（${WEEKDAY[new Date(y, m - 1, d).getDay()]}）`;
+}
+
+type Sups = { supplements: Supplement[]; skips: SupplementSkip[] };
+
+/** endDay までの span 日ぶんを、日ごとに判定する（推移のグラフ・提案に使う） */
+function judgeDays(
+  groups: (MealGroup & { day: string })[], me: string, sups: Sups, prefs: NutritionPrefs, endDay: string, span: number,
+): DayJudgement[] {
+  const out: DayJudgement[] = [];
+  for (let i = span - 1; i >= 0; i--) {
+    const d = shiftDay(endDay, -i);
+    const mine = groups.filter((g) => g.day === d).flatMap((g) => g.rows.filter((r) => r.user === me).map((r) => r.nutrients));
+    const supN = supplementNutrients(supplementsOn(me, d, sups.supplements, sups.skips));
+    // 食事の記録が無い日は推移に入れない（サプリだけの日を「食べていない日」として数えない）
+    if (mine.length === 0) {
+      out.push({ day: d, statuses: null });
+      continue;
+    }
+    const list = [...mine, ...supN];
+    const totals: Record<string, number | null> = {};
+    for (const [k, t] of Object.entries(sumNutrients(list))) totals[k] = t.partial && t.value === 0 ? null : t.value;
+    out.push({ day: d, statuses: judgeDay(totals, prefs) });
+  }
+  return out;
+}
+
+/** 期間中に飲んでいたサプリと、飲まなかった日数 */
+function periodSupplements(days: string[], me: string, sups: Sups): AdviceInput['supplements'] {
+  const map = new Map<string, { supplement: Supplement; skippedDays: number }>();
+  for (const d of days) {
+    for (const { supplement, skipped } of supplementsOn(me, d, sups.supplements, sups.skips)) {
+      const e = map.get(supplement.supplementId) ?? { supplement, skippedDays: 0 };
+      if (skipped) e.skippedDays++;
+      map.set(supplement.supplementId, e);
+    }
+  }
+  return [...map.values()];
 }
 
 /**
@@ -57,6 +97,11 @@ export default function MealsScreen() {
   // 保存中のサプリ（続けて切り替えると、前の保存と順番が入れ違って最後の操作が残らないので待たせる）
   const [supSaving, setSupSaving] = useState<string | null>(null);
   const [activity, setActivity] = useState<DayActivity[]>([]);
+  const [advice, setAdvice]     = useState<Advice[]>([]);
+  // 通信で読めるまでは、週の切り替わりの自動作成を走らせない（控えが空のまま二重に作らないため）
+  const [adviceReady, setAdviceReady] = useState(false);
+  const [advising, setAdvising] = useState(false);
+  const autoAdvised = useRef(false);
   const prefs = prefsMap.get(me) ?? DEFAULT_PREFS;
   // 活動レベルが「自動」なら、ヘルスコネクトの歩数から決めた値で判定する
   const autoLevel = useMemo(() => autoActivityLevel(activity, me, today()), [activity, me]);
@@ -101,6 +146,7 @@ export default function MealsScreen() {
           .then((entries) => { setPrefsMap(new Map(entries)); setPrefsReady(true); }),
         cachedLoad('supplements', loadSupplements, setSups).then(setSups),
         cachedLoad('activity', loadActivity, setActivity).then(setActivity).catch(() => {}),
+        cachedLoad('advice', loadAdvice, setAdvice).then((list) => { setAdvice(list); setAdviceReady(true); }).catch(() => {}),
         loadMonths(monthsRef.current),
       ]);
     } catch (e) {
@@ -150,25 +196,67 @@ export default function MealsScreen() {
   const dayMeals = groups.filter((g) => g.day === day);
   const daySups = supplementsOn(me, day, sups.supplements, sups.skips);
 
-  const trendDays = useMemo(() => {
-    if (view !== 'trend') return [];
-    const out: { day: string; statuses: NutrientStatus[] | null }[] = [];
-    for (let i = span - 1; i >= 0; i--) {
-      const d = shiftDay(day, -i);
-      const mine = groups.filter((g) => g.day === d).flatMap((g) => g.rows.filter((r) => r.user === me).map((r) => r.nutrients));
-      const supN = supplementNutrients(supplementsOn(me, d, sups.supplements, sups.skips));
-      // 食事の記録が無い日は推移に入れない（サプリだけの日を「食べていない日」として数えない）
-      if (mine.length === 0) {
-        out.push({ day: d, statuses: null });
-        continue;
-      }
-      const list = [...mine, ...supN];
-      const totals: Record<string, number | null> = {};
-      for (const [k, t] of Object.entries(sumNutrients(list))) totals[k] = t.partial && t.value === 0 ? null : t.value;
-      out.push({ day: d, statuses: judgeDay(totals, judgedPrefs) });
+  const trendDays = useMemo(
+    () => (view === 'trend' ? judgeDays(groups, me, sups, judgedPrefs, day, span) : []),
+    [view, span, day, groups, me, sups, judgedPrefs],
+  );
+
+  /** endDay までの期間の記録から提案を作り、一覧と端末の控えに足す。記録が足りなければ null */
+  const makeAdvice = useCallback(async (endDay: string, s: 7 | 30, auto: boolean): Promise<Advice | null> => {
+    const days = judgeDays(groups, me, sups, judgedPrefs, endDay, s);
+    const input: AdviceInput = { user: me, prefs: judgedPrefs, days, supplements: periodSupplements(days.map((d) => d.day), me, sups) };
+    const a = await generateAdvice(input, s, auto);
+    if (a) {
+      setAdvice((prev) => {
+        const next = [...prev, a];
+        writeCache('advice', next);
+        return next;
+      });
     }
-    return out;
-  }, [view, span, day, groups, me, sups, judgedPrefs]);
+    return a;
+  }, [groups, me, sups, judgedPrefs]);
+
+  const handleAdvise = async () => {
+    if (advising) return;
+    setAdvising(true);
+    try {
+      if (!(await makeAdvice(day, span, false))) Alert.alert(`記録が ${MIN_RECORDED_DAYS} 日分たまったら作れます`);
+    } catch (e) {
+      Alert.alert('提案を作れませんでした', e instanceof Error ? e.message : String(e));
+    } finally {
+      setAdvising(false);
+    }
+  };
+
+  const handleAutoAdvice = async (v: boolean) => {
+    const next = { ...prefs, adviceAuto: v };
+    applyPrefs(new Map(prefsMap).set(me, next));
+    try {
+      await savePrefs(me, next);
+    } catch (e) {
+      Alert.alert('保存失敗', e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  // 週の切り替わり（月曜以降に開いたとき）に、前の週（月〜日）の提案を自動で作る。1 回の起動で 1 度だけ
+  useEffect(() => {
+    if (autoAdvised.current || !prefsReady || !adviceReady || !me || !judgedPrefs.adviceAuto) return;
+    const { start, end } = lastWeek(today());
+    if (advice.some((a) => a.user === me && a.span === 7 && a.periodEnd >= end)) {
+      autoAdvised.current = true;
+      return;
+    }
+    // 前の週の月がまだ読めていなければ読む（読めたらこの効果がもう一度走る）
+    const need = new Set<string>();
+    for (let d = start; d <= shiftDay(end, 1); d = shiftDay(d, 1)) need.add(monthOfDay(d));
+    const missing = [...need].filter((m) => !mealsByMonth[m]);
+    if (missing.length > 0) {
+      loadMonths(missing).catch(() => {});
+      return;
+    }
+    autoAdvised.current = true;
+    makeAdvice(end, 7, true).catch((e) => console.warn('[Advice] 自動で作れなかった:', e instanceof Error ? e.message : e));
+  }, [prefsReady, adviceReady, me, judgedPrefs, advice, mealsByMonth, loadMonths, makeAdvice]);
 
   const reviewCount = new Set(groups.filter((g) => g.rows.some((r) => r.status === 'needs_review')).map((g) => g.mealId)).size;
 
@@ -265,7 +353,19 @@ export default function MealsScreen() {
           supplementSaving={supSaving !== null}
         />
       ) : (
-        <TrendView days={trendDays} prefs={judgedPrefs} span={span} onSpan={setSpan} loading={loading} onRefresh={loadAll} />
+        <TrendView
+          days={trendDays}
+          prefs={judgedPrefs}
+          span={span}
+          onSpan={setSpan}
+          loading={loading}
+          onRefresh={loadAll}
+          advice={latestAdvice(advice, me, span)}
+          advising={advising}
+          onAdvise={handleAdvise}
+          autoAdvice={prefs.adviceAuto}
+          onAutoAdvice={handleAutoAdvice}
+        />
       )}
 
       <NutritionPrefsModal

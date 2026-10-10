@@ -1,9 +1,12 @@
 import { useMemo, useState } from 'react';
-import { RefreshControl, ScrollView, StyleSheet, Text, TouchableOpacity, View, useWindowDimensions } from 'react-native';
+import {
+  ActivityIndicator, RefreshControl, ScrollView, StyleSheet, Switch, Text, TouchableOpacity, View, useWindowDimensions,
+} from 'react-native';
 import Svg, { Circle, Line, Polyline, Rect, Text as SvgText } from 'react-native-svg';
 import { NUTRIENTS, nutrientDef } from '../../services/Nutrients';
 import type { NutritionPrefs } from '../../services/NutritionPrefsService';
 import { Judgement, NutrientStatus } from '../../services/NutritionJudge';
+import { ADVICE_DISCLAIMER, Advice, MIN_RECORDED_DAYS, SupplementAction } from '../../services/AdviceService';
 
 interface Props {
   /** 古い順の日付と、その日の判定（記録の無い日は null） */
@@ -13,9 +16,71 @@ interface Props {
   onSpan:    (span: 7 | 30) => void;
   loading:   boolean;
   onRefresh: () => void;
+  /** この期間（7 / 30）の最新の提案（§11.5） */
+  advice:       Advice | null;
+  advising:     boolean;
+  onAdvise:     () => void;
+  /** 週の切り替わりに自動で作る */
+  autoAdvice:   boolean;
+  onAutoAdvice: (v: boolean) => void;
 }
 
 const COLOR: Record<Judgement, string> = { low: '#d97706', ok: '#2e7d32', high: '#dc2626', none: '#9ca3af' };
+const ACTION_LABEL: Record<SupplementAction, string> = { add: '追加', stop: 'やめる', reduce: '減らす', continue: '続ける' };
+const ACTION_COLOR: Record<SupplementAction, string> = { add: '#2563eb', stop: '#dc2626', reduce: '#d97706', continue: '#2e7d32' };
+
+function mdOf(day: string): string {
+  return day.slice(5).replace('-', '/');
+}
+
+/** 期間の記録から作った、食事の改善とサプリの提案 */
+function AdviceCard({ advice, recordedDays, advising, onAdvise, span, autoAdvice, onAutoAdvice }: {
+  advice: Advice | null; recordedDays: number; advising: boolean; onAdvise: () => void; span: 7 | 30;
+  autoAdvice: boolean; onAutoAdvice: (v: boolean) => void;
+}) {
+  const enough = recordedDays >= MIN_RECORDED_DAYS;
+  return (
+    <View style={styles.card}>
+      <View style={styles.adviceHead}>
+        <Text style={styles.title}>提案</Text>
+        {span === 7 && (
+          <View style={styles.autoRow}>
+            <Text style={styles.autoLabel}>週ごとに自動</Text>
+            <Switch
+              value={autoAdvice}
+              onValueChange={onAutoAdvice}
+              trackColor={{ false: '#ccc', true: '#a5d6a7' }}
+              thumbColor={autoAdvice ? '#2e7d32' : '#f4f3f4'}
+            />
+          </View>
+        )}
+      </View>
+      {advice ? (
+        <>
+          <Text style={styles.summary}>{mdOf(advice.periodStart)}〜{mdOf(advice.periodEnd)}{advice.auto ? '・自動' : ''}</Text>
+          {!!advice.summary && <Text style={styles.adviceText}>{advice.summary}</Text>}
+          {advice.meals.map((m, i) => <Text key={i} style={styles.adviceText}>・{m}</Text>)}
+          {advice.supplements.length > 0 && <Text style={styles.subTitle}>サプリ</Text>}
+          {advice.supplements.map((s, i) => (
+            <Text key={i} style={styles.adviceText}>
+              <Text style={[styles.action, { color: ACTION_COLOR[s.action] }]}>{ACTION_LABEL[s.action]}</Text>　{s.name}
+              {!!s.reason && <Text style={styles.reason}>　{s.reason}</Text>}
+            </Text>
+          ))}
+          {!!advice.caution && <Text style={styles.caution}>{advice.caution}</Text>}
+          <Text style={styles.disclaimer}>{ADVICE_DISCLAIMER}</Text>
+        </>
+      ) : (
+        <Text style={styles.summary}>まだ提案はありません</Text>
+      )}
+      <TouchableOpacity style={[styles.btn, (advising || !enough) && styles.disabled]} onPress={onAdvise} disabled={advising || !enough}>
+        {advising
+          ? <ActivityIndicator color="#1f2937" />
+          : <Text style={styles.btnText}>{!enough ? `記録が ${MIN_RECORDED_DAYS} 日分たまったら` : advice ? '提案を作り直す' : '提案を作る'}</Text>}
+      </TouchableOpacity>
+    </View>
+  );
+}
 const HEIGHT = 200;
 const PAD = { left: 40, right: 12, top: 12, bottom: 22 };
 
@@ -24,7 +89,7 @@ function fmt(v: number): string {
 }
 
 /** 栄養素ごとの推移（折れ線と適正の帯）と、期間の平均 */
-export default function TrendView({ days, prefs, span, onSpan, loading, onRefresh }: Props) {
+export default function TrendView({ days, prefs, span, onSpan, loading, onRefresh, advice, advising, onAdvise, autoAdvice, onAutoAdvice }: Props) {
   const { width: screenWidth } = useWindowDimensions();
   const [key, setKey] = useState(prefs.visible[0] ?? 'ENERC_KCAL');
   const keys = [...prefs.visible, ...NUTRIENTS.map((n) => n.key).filter((k) => !prefs.visible.includes(k))]
@@ -72,6 +137,15 @@ export default function TrendView({ days, prefs, span, onSpan, loading, onRefres
           </TouchableOpacity>
         ))}
       </View>
+      <AdviceCard
+        advice={advice}
+        recordedDays={days.filter((d) => d.statuses).length}
+        advising={advising}
+        onAdvise={onAdvise}
+        span={span}
+        autoAdvice={autoAdvice}
+        onAutoAdvice={onAutoAdvice}
+      />
       <View style={styles.keys}>
         {(showAllKeys ? keys : keys.filter((k) => prefs.visible.includes(k))).map((k) => (
           <TouchableOpacity key={k} style={[styles.chip, key === k && styles.chipActive]} onPress={() => setKey(k)}>
@@ -158,4 +232,19 @@ const styles = StyleSheet.create({
   avgLabel: { flex: 1, fontSize: 13, color: '#1f2937' },
   avgValue: { fontSize: 13, fontWeight: '600', color: '#1f2937' },
   avgOk:    { fontSize: 12, color: '#6b7280', width: 90, textAlign: 'right' },
+  adviceHead: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  autoRow:    { flexDirection: 'row', alignItems: 'center', gap: 4 },
+  autoLabel:  { fontSize: 12, color: '#6b7280' },
+  adviceText: { fontSize: 13, color: '#1f2937', lineHeight: 19 },
+  subTitle:   { fontSize: 12, fontWeight: '700', color: '#6b7280', marginTop: 4 },
+  action:     { fontWeight: '700' },
+  reason:     { color: '#6b7280' },
+  caution:    { fontSize: 13, color: '#b45309', lineHeight: 19 },
+  disclaimer: { fontSize: 11, color: '#9ca3af' },
+  btn: {
+    borderWidth: 1, borderColor: '#d1d5db', borderRadius: 8, paddingVertical: 8, alignItems: 'center',
+    backgroundColor: '#fff', marginTop: 4,
+  },
+  btnText:  { fontSize: 13, fontWeight: '600', color: '#1f2937' },
+  disabled: { opacity: 0.6 },
 });

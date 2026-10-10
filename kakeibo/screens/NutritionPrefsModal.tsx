@@ -66,6 +66,7 @@ export default function NutritionPrefsModal({ user, prefs, onClose, onSaved, aut
       targets: parsed,
       profile: { birthDate: date, sex, activity },
       mealsPerDay,
+      adviceAuto: prefs.adviceAuto,
     };
     setSaving(true);
     try {
