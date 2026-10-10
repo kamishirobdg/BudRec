@@ -1,0 +1,9 @@
+
+# 旧Gaia(=GaiaProjectMapSearch旧名)の残骸。無関係のため除外
+my-next-app/
+
+# 家計のデータから作った調査結果（リポジトリは public なので置かない）
+private/
+
+# ビルド監視スクリプトの一時ファイル
+.build-status.txt

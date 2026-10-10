@@ -1,0 +1,594 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BudRec UIモックアップ</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #1a1a2e; font-family: 'Hiragino Sans', 'Yu Gothic', sans-serif; display: flex; flex-direction: column; align-items: center; padding: 24px 16px; gap: 32px; min-height: 100vh; }
+
+  h1 { color: #fff; font-size: 14px; font-weight: 400; opacity: 0.6; letter-spacing: 2px; text-transform: uppercase; }
+
+  .section-label { color: #aaa; font-size: 12px; letter-spacing: 1px; margin-bottom: 8px; }
+
+  /* Phone frame */
+  .phone { width: 375px; background: #f2f4f7; border-radius: 40px; overflow: hidden; box-shadow: 0 32px 80px rgba(0,0,0,0.5); position: relative; }
+  .phone-notch { height: 32px; background: #f2f4f7; display: flex; align-items: center; justify-content: center; }
+  .phone-notch::after { content: ''; width: 120px; height: 20px; background: #1a1a2e; border-radius: 0 0 16px 16px; }
+
+  /* Tab bar */
+  .tab-bar { display: flex; background: #fff; border-top: 1px solid #e8eaed; padding: 8px 0 16px; }
+  .tab { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 4px; cursor: pointer; }
+  .tab-icon { width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; border-radius: 14px; font-size: 18px; }
+  .tab-icon.active { background: #e8f5e9; }
+  .tab-label { font-size: 11px; color: #999; }
+  .tab-label.active { color: #2e7d32; font-weight: 600; }
+
+  /* Header */
+  .header { background: #fff; padding: 16px 20px 12px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #f0f0f0; }
+  .header-title { font-size: 20px; font-weight: 700; color: #1a1a1a; }
+  .header-actions { display: flex; gap: 8px; align-items: center; }
+  .chip { background: #e8f5e9; color: #2e7d32; font-size: 13px; font-weight: 600; padding: 6px 14px; border-radius: 20px; }
+  .icon-btn { width: 36px; height: 36px; border-radius: 18px; background: #f5f5f5; display: flex; align-items: center; justify-content: center; font-size: 18px; cursor: pointer; }
+
+  /* Summary controls */
+  .controls { background: #fff; padding: 12px 20px; display: flex; gap: 8px; align-items: center; border-bottom: 1px solid #f0f0f0; }
+  .control-label { font-size: 13px; color: #888; }
+  .control-pill { background: #f5f5f5; border: 1px solid #e0e0e0; border-radius: 20px; padding: 6px 12px; font-size: 13px; color: #333; display: flex; align-items: center; gap: 4px; }
+  .control-pill .arrow { font-size: 10px; color: #888; }
+
+  /* Total card */
+  .total-card { margin: 16px 16px 0; background: linear-gradient(135deg, #2e7d32, #43a047); border-radius: 20px; padding: 20px; color: #fff; }
+  .total-label { font-size: 12px; opacity: 0.8; margin-bottom: 4px; }
+  .total-amount { font-size: 32px; font-weight: 700; letter-spacing: -1px; margin-bottom: 16px; }
+  .total-users { display: flex; gap: 12px; }
+  .user-pill { background: rgba(255,255,255,0.2); border-radius: 12px; padding: 8px 14px; flex: 1; }
+  .user-pill-name { font-size: 12px; opacity: 0.85; margin-bottom: 2px; }
+  .user-pill-amount { font-size: 16px; font-weight: 700; }
+
+  /* Category section */
+  .section { margin: 16px 16px 0; background: #fff; border-radius: 16px; overflow: hidden; }
+  .section-header { padding: 14px 16px 10px; font-size: 14px; font-weight: 700; color: #333; border-bottom: 1px solid #f5f5f5; }
+  .category-row { padding: 10px 16px; display: flex; align-items: center; gap: 10px; }
+  .cat-icon { width: 32px; height: 32px; border-radius: 10px; display: flex; align-items: center; justify-content: center; font-size: 16px; flex-shrink: 0; }
+  .cat-info { flex: 1; }
+  .cat-name { font-size: 13px; color: #333; margin-bottom: 4px; }
+  .cat-bar-bg { height: 4px; background: #f0f0f0; border-radius: 2px; }
+  .cat-bar { height: 4px; border-radius: 2px; }
+  .cat-amount { font-size: 14px; font-weight: 600; color: #333; }
+
+  /* Entries section */
+  .entries-header { margin: 16px 16px 0; padding: 12px 16px; background: #fff; border-radius: 16px 16px 0 0; border-bottom: 1px solid #f0f0f0; }
+  .entries-header-text { font-size: 14px; font-weight: 700; color: #333; }
+  .entries-header-name { color: #2e7d32; }
+
+  /* Entry card */
+  .entry-card { background: #fff; margin: 1px 16px 0; padding: 14px 16px; }
+  .entry-card:last-child { border-radius: 0 0 16px 16px; margin-bottom: 16px; }
+  .entry-top { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 6px; }
+  .entry-meta { display: flex; gap: 6px; align-items: center; }
+  .entry-date { font-size: 12px; color: #999; }
+  .source-badge { font-size: 10px; background: #e3f2fd; color: #1565c0; padding: 2px 7px; border-radius: 8px; font-weight: 500; }
+  .source-badge.gmail { background: #fce4ec; color: #c62828; }
+  .source-badge.manual { background: #f3e5f5; color: #6a1b9a; }
+  .entry-amount { font-size: 18px; font-weight: 700; color: #1a1a1a; }
+  .entry-title { font-size: 15px; font-weight: 600; color: #1a1a1a; margin-bottom: 4px; }
+  .entry-user { font-size: 12px; color: #888; margin-bottom: 6px; }
+  .entry-memo { font-size: 12px; color: #aaa; margin-bottom: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .entry-actions { display: flex; gap: 6px; align-items: center; }
+  .toggle-chip { display: flex; align-items: center; gap: 4px; background: #f5f5f5; border-radius: 12px; padding: 5px 10px; font-size: 11px; color: #666; cursor: pointer; }
+  .toggle-chip.on { background: #fff3e0; color: #e65100; }
+  .toggle-chip.fixed { background: #e8eaf6; color: #283593; }
+  .toggle-dot { width: 10px; height: 10px; border-radius: 5px; border: 1.5px solid #ccc; }
+  .toggle-dot.on { background: #ff9800; border-color: #ff9800; }
+  .toggle-dot.fixed-dot { background: #3f51b5; border-color: #3f51b5; }
+  .edit-btn { margin-left: auto; background: #f5f5f5; border: none; border-radius: 10px; padding: 6px 14px; font-size: 12px; color: #555; font-weight: 600; cursor: pointer; }
+  .entry-card.proxy { background: #f0fdf4; }
+  .proxy-badge { font-size: 10px; background: #dcfce7; color: #166534; padding: 2px 7px; border-radius: 8px; font-weight: 500; }
+
+  /* Divider */
+  .entry-divider { height: 1px; background: #f5f5f5; margin: 0 16px; }
+
+  /* Scroll area */
+  .scroll-area { overflow-y: auto; max-height: 600px; }
+  .scroll-area::-webkit-scrollbar { display: none; }
+
+  /* Edit modal */
+  .modal-overlay { background: rgba(0,0,0,0.4); padding-top: 60px; }
+  .modal-sheet { background: #f2f4f7; border-radius: 24px 24px 0 0; overflow: hidden; }
+  .modal-header { background: #fff; padding: 16px 20px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #f0f0f0; }
+  .modal-title { font-size: 17px; font-weight: 700; color: #1a1a1a; }
+  .modal-close { background: #2e7d32; color: #fff; border: none; border-radius: 10px; padding: 8px 16px; font-size: 13px; font-weight: 600; cursor: pointer; }
+  .modal-body { padding: 16px; display: flex; flex-direction: column; gap: 10px; }
+  .form-group { background: #fff; border-radius: 14px; overflow: hidden; }
+  .form-row { padding: 12px 16px; display: flex; align-items: center; border-bottom: 1px solid #f5f5f5; }
+  .form-row:last-child { border-bottom: none; }
+  .form-label { font-size: 13px; color: #888; width: 80px; flex-shrink: 0; }
+  .form-value { font-size: 15px; color: #1a1a1a; flex: 1; }
+  .form-value.editable { color: #1a1a1a; border: none; background: transparent; font-size: 15px; font-family: inherit; width: 100%; outline: none; }
+  .form-readonly { display: flex; align-items: center; gap: 6px; }
+  .readonly-badge { font-size: 10px; background: #f5f5f5; color: #999; padding: 2px 6px; border-radius: 6px; }
+  .form-picker { display: flex; gap: 6px; flex-wrap: wrap; }
+  .picker-opt { font-size: 13px; background: #f5f5f5; color: #555; padding: 6px 14px; border-radius: 20px; cursor: pointer; }
+  .picker-opt.selected { background: #2e7d32; color: #fff; }
+  .save-btn { background: #2e7d32; color: #fff; border: none; border-radius: 14px; padding: 16px; font-size: 16px; font-weight: 700; cursor: pointer; width: 100%; margin-top: 4px; }
+
+  /* Settings screen */
+  .settings-body { padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+  .settings-section { background: #fff; border-radius: 16px; overflow: hidden; }
+  .settings-section-label { padding: 12px 16px 8px; font-size: 12px; font-weight: 600; color: #888; text-transform: uppercase; letter-spacing: 0.5px; }
+  .settings-row { padding: 14px 16px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #f5f5f5; }
+  .settings-row:last-child { border-bottom: none; }
+  .settings-row-left { display: flex; flex-direction: column; gap: 2px; }
+  .settings-row-title { font-size: 15px; color: #1a1a1a; }
+  .settings-row-sub { font-size: 12px; color: #aaa; }
+  .toggle-switch { width: 44px; height: 26px; background: #ccc; border-radius: 13px; position: relative; cursor: pointer; }
+  .toggle-switch.on { background: #2e7d32; }
+  .toggle-switch::after { content: ''; width: 22px; height: 22px; background: #fff; border-radius: 11px; position: absolute; top: 2px; left: 2px; transition: left 0.2s; box-shadow: 0 1px 3px rgba(0,0,0,0.2); }
+  .toggle-switch.on::after { left: 20px; }
+  .settings-arrow { color: #ccc; font-size: 18px; }
+  .gmail-btn { background: linear-gradient(135deg, #ea4335, #d93025); color: #fff; border: none; border-radius: 12px; padding: 14px 16px; font-size: 15px; font-weight: 600; cursor: pointer; width: 100%; display: flex; align-items: center; justify-content: center; gap: 8px; }
+  .signout-btn { background: #fff; color: #e53935; border: none; border-radius: 14px; padding: 16px; font-size: 15px; font-weight: 600; cursor: pointer; width: 100%; margin: 4px 0; }
+  .category-item { padding: 12px 16px; display: flex; align-items: center; gap: 10px; border-bottom: 1px solid #f5f5f5; }
+  .category-item:last-child { border-bottom: none; }
+  .cat-icon-small { width: 28px; height: 28px; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 14px; }
+  .cat-delete { color: #e53935; font-size: 12px; font-weight: 600; margin-left: auto; }
+  .add-category { padding: 12px 16px; display: flex; gap: 8px; align-items: center; background: #f9f9f9; }
+  .add-input { flex: 1; border: 1px solid #e0e0e0; border-radius: 10px; padding: 8px 12px; font-size: 14px; background: #fff; }
+  .add-btn-small { background: #2e7d32; color: #fff; border: none; border-radius: 10px; padding: 8px 16px; font-size: 13px; font-weight: 600; cursor: pointer; }
+
+  /* App icon proposal */
+  .icon-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; padding: 20px; }
+  .icon-option { display: flex; flex-direction: column; align-items: center; gap: 8px; }
+  .icon-preview { width: 80px; height: 80px; border-radius: 20px; display: flex; align-items: center; justify-content: center; font-size: 40px; box-shadow: 0 4px 16px rgba(0,0,0,0.3); }
+  .icon-name { color: #fff; font-size: 11px; opacity: 0.7; text-align: center; }
+  .icon-rec { background: linear-gradient(135deg, #2e7d32, #66bb6a); }
+  .icon-rec2 { background: linear-gradient(135deg, #1565c0, #42a5f5); }
+  .icon-rec3 { background: linear-gradient(135deg, #4a148c, #ab47bc); }
+  .icon-rec4 { background: linear-gradient(135deg, #e65100, #ffa726); }
+  .icon-rec5 { background: linear-gradient(135deg, #00695c, #26a69a); }
+  .icon-rec6 { background: linear-gradient(135deg, #263238, #546e7a); }
+  .recommended-tag { background: #43a047; color: #fff; font-size: 10px; padding: 2px 8px; border-radius: 8px; }
+
+  /* Navigation */
+  .nav { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; padding: 4px; }
+  .nav-btn { background: rgba(255,255,255,0.15); color: #fff; border: 1px solid rgba(255,255,255,0.3); border-radius: 20px; padding: 8px 16px; font-size: 12px; cursor: pointer; transition: all 0.2s; }
+  .nav-btn:hover, .nav-btn.active { background: #2e7d32; border-color: #2e7d32; }
+
+  /* Screens */
+  .screen { display: none; }
+  .screen.active { display: block; }
+</style>
+</head>
+<body>
+
+<h1>BudRec — UIモックアップ</h1>
+
+<div class="nav">
+  <button class="nav-btn active" onclick="show('icon')">アイコン案</button>
+  <button class="nav-btn" onclick="show('summary')">一覧画面</button>
+  <button class="nav-btn" onclick="show('edit')">明細編集</button>
+  <button class="nav-btn" onclick="show('settings')">設定画面</button>
+</div>
+
+<!-- ===== ICON SCREEN ===== -->
+<div id="screen-icon" class="screen active">
+  <div class="section-label" style="color:#aaa;text-align:center">アイコン案（推奨: 緑グラデーション）</div>
+  <div style="background:#2a2a3e;border-radius:24px;overflow:hidden;width:375px">
+    <div class="icon-grid">
+      <div class="icon-option">
+        <div class="icon-preview icon-rec">💰</div>
+        <div class="icon-name">緑 / お金</div>
+        <div class="recommended-tag">推奨</div>
+      </div>
+      <div class="icon-option">
+        <div class="icon-preview icon-rec5">📊</div>
+        <div class="icon-name">グリーン / グラフ</div>
+      </div>
+      <div class="icon-option">
+        <div class="icon-preview icon-rec2">📝</div>
+        <div class="icon-name">ブルー / 帳簿</div>
+      </div>
+      <div class="icon-option">
+        <div class="icon-preview icon-rec4">🏠</div>
+        <div class="icon-name">オレンジ / 家計</div>
+      </div>
+      <div class="icon-option">
+        <div class="icon-preview icon-rec3">💳</div>
+        <div class="icon-name">パープル / カード</div>
+      </div>
+      <div class="icon-option">
+        <div class="icon-preview icon-rec6">🐷</div>
+        <div class="icon-name">グレー / 貯金箱</div>
+      </div>
+    </div>
+    <div style="padding:0 20px 20px;color:#aaa;font-size:12px;line-height:1.7">
+      ✅ アイコンはSVGまたはPNG（1024×1024）で作成し<br>
+      　　assets/icon.png に配置<br>
+      ✅ 緑グラデーション＋「¥」マークがブランドとして最適<br>
+      ✅ adaptive-icon（Android）はforegroundのみ変更でOK
+    </div>
+  </div>
+</div>
+
+<!-- ===== SUMMARY SCREEN ===== -->
+<div id="screen-summary" class="screen">
+<div class="phone">
+  <div class="phone-notch"></div>
+
+  <!-- Header -->
+  <div class="header">
+    <div class="header-title">家計簿</div>
+    <div class="header-actions">
+      <div class="chip">かみしろ</div>
+      <div class="icon-btn">⚙️</div>
+    </div>
+  </div>
+
+  <!-- Controls -->
+  <div class="controls">
+    <div class="control-label">期間</div>
+    <div class="control-pill">2026年5月 <span class="arrow">▼</span></div>
+    <div class="control-label" style="margin-left:8px">並び</div>
+    <div class="control-pill">日付 <span class="arrow">▼</span></div>
+  </div>
+
+  <div class="scroll-area">
+
+    <!-- Total card -->
+    <div class="total-card">
+      <div class="total-label">5月の支出合計</div>
+      <div class="total-amount">¥364,881</div>
+      <div class="total-users">
+        <div class="user-pill">
+          <div class="user-pill-name">かみしろ</div>
+          <div class="user-pill-amount">¥227,574</div>
+        </div>
+        <div class="user-pill">
+          <div class="user-pill-name">あか</div>
+          <div class="user-pill-amount">¥137,307</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Categories -->
+    <div class="section">
+      <div class="section-header">カテゴリ別</div>
+      <div class="category-row">
+        <div class="cat-icon" style="background:#fff3e0">🏠</div>
+        <div class="cat-info">
+          <div class="cat-name">家賃</div>
+          <div class="cat-bar-bg"><div class="cat-bar" style="width:100%;background:#ff9800"></div></div>
+        </div>
+        <div class="cat-amount">¥118,000</div>
+      </div>
+      <div class="category-row">
+        <div class="cat-icon" style="background:#fce4ec">🍽️</div>
+        <div class="cat-info">
+          <div class="cat-name">外食</div>
+          <div class="cat-bar-bg"><div class="cat-bar" style="width:64%;background:#e91e63"></div></div>
+        </div>
+        <div class="cat-amount">¥75,910</div>
+      </div>
+      <div class="category-row">
+        <div class="cat-icon" style="background:#e8f5e9">🛒</div>
+        <div class="cat-info">
+          <div class="cat-name">食費</div>
+          <div class="cat-bar-bg"><div class="cat-bar" style="width:57%;background:#43a047"></div></div>
+        </div>
+        <div class="cat-amount">¥67,229</div>
+      </div>
+      <div class="category-row">
+        <div class="cat-icon" style="background:#e3f2fd">🧴</div>
+        <div class="cat-info">
+          <div class="cat-name">日用品</div>
+          <div class="cat-bar-bg"><div class="cat-bar" style="width:25%;background:#1e88e5"></div></div>
+        </div>
+        <div class="cat-amount">¥29,334</div>
+      </div>
+    </div>
+
+    <!-- Entries -->
+    <div class="entries-header">
+      <div class="entries-header-text">明細 — <span class="entries-header-name">かみしろ</span></div>
+    </div>
+
+    <!-- Entry 1 (normal) -->
+    <div class="entry-card">
+      <div class="entry-top">
+        <div class="entry-meta">
+          <div class="entry-date">05/31 22:26</div>
+          <div class="source-badge">Gmail</div>
+        </div>
+        <div class="entry-amount">¥1,218</div>
+      </div>
+      <div class="entry-title">Amazon / 日用品</div>
+      <div class="entry-user">かみしろ</div>
+      <div class="entry-memo">エレコム WF-1000XM5 SONY ケース カバー TPU...</div>
+      <div class="entry-actions">
+        <div class="toggle-chip">
+          <div class="toggle-dot"></div>除外
+        </div>
+        <div class="toggle-chip">
+          <div class="toggle-dot"></div>一部計上
+        </div>
+        <div class="toggle-chip fixed">
+          <div class="toggle-dot fixed-dot"></div>固定費
+        </div>
+        <button class="edit-btn">編集</button>
+      </div>
+    </div>
+    <div class="entry-divider"></div>
+
+    <!-- Entry 2 (proxy) -->
+    <div class="entry-card proxy">
+      <div class="entry-top">
+        <div class="entry-meta">
+          <div class="entry-date">05/31 19:45</div>
+          <div class="source-badge">カメラ</div>
+          <div class="proxy-badge">あか（代理）</div>
+        </div>
+        <div class="entry-amount">¥1,363</div>
+      </div>
+      <div class="entry-title">生鮮市場TOP / 食費</div>
+      <div class="entry-user">かみしろ が代理入力</div>
+      <div class="entry-memo">ポーションキャラメル:218, デカビタゼロビタミン:98...</div>
+      <div class="entry-actions">
+        <div class="toggle-chip">
+          <div class="toggle-dot"></div>除外
+        </div>
+        <div class="toggle-chip">
+          <div class="toggle-dot"></div>一部計上
+        </div>
+        <div class="toggle-chip">
+          <div class="toggle-dot"></div>固定費
+        </div>
+        <button class="edit-btn">編集</button>
+      </div>
+    </div>
+    <div class="entry-divider"></div>
+
+    <!-- Entry 3 -->
+    <div class="entry-card">
+      <div class="entry-top">
+        <div class="entry-meta">
+          <div class="entry-date">05/31 19:25</div>
+          <div class="source-badge">カメラ</div>
+        </div>
+        <div class="entry-amount">¥1,531</div>
+      </div>
+      <div class="entry-title">くすりの福太郎 / 日用品</div>
+      <div class="entry-user">かみしろ</div>
+      <div class="entry-memo">ホッカイドウコーンチャ:105, ピュアポテト...</div>
+      <div class="entry-actions">
+        <div class="toggle-chip on">
+          <div class="toggle-dot on"></div>除外中
+        </div>
+        <div class="toggle-chip">
+          <div class="toggle-dot"></div>一部計上
+        </div>
+        <div class="toggle-chip">
+          <div class="toggle-dot"></div>固定費
+        </div>
+        <button class="edit-btn">編集</button>
+      </div>
+    </div>
+
+    <div style="height:16px"></div>
+  </div>
+
+  <!-- Tab bar -->
+  <div class="tab-bar">
+    <div class="tab">
+      <div class="tab-icon">📷</div>
+      <div class="tab-label">撮影</div>
+    </div>
+    <div class="tab">
+      <div class="tab-icon active">📋</div>
+      <div class="tab-label active">一覧</div>
+    </div>
+  </div>
+</div>
+</div>
+
+<!-- ===== EDIT MODAL ===== -->
+<div id="screen-edit" class="screen">
+<div class="phone">
+  <div class="phone-notch"></div>
+  <div class="modal-overlay">
+    <div class="modal-sheet">
+      <div class="modal-header">
+        <div class="modal-title">明細を編集</div>
+        <button class="modal-close">閉じる</button>
+      </div>
+      <div class="modal-body">
+
+        <!-- Read-only info -->
+        <div class="form-group">
+          <div class="form-row">
+            <div class="form-label">取込元</div>
+            <div class="form-readonly">
+              <div class="source-badge">カメラ</div>
+              <div class="readonly-badge">変更不可</div>
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-label">ユーザー</div>
+            <div class="form-readonly">
+              <span style="font-size:15px;color:#333">かみしろ</span>
+              <div class="readonly-badge">変更不可</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Editable fields -->
+        <div class="form-group">
+          <div class="form-row">
+            <div class="form-label">日時</div>
+            <input class="form-value editable" value="2026/05/31 19:45" />
+          </div>
+          <div class="form-row">
+            <div class="form-label">店舗</div>
+            <input class="form-value editable" value="生鮮市場TOP" />
+          </div>
+          <div class="form-row">
+            <div class="form-label">カテゴリ</div>
+            <div class="form-picker">
+              <div class="picker-opt">食費</div>
+              <div class="picker-opt selected">外食</div>
+              <div class="picker-opt">日用品</div>
+              <div class="picker-opt">光熱費</div>
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-label">金額</div>
+            <input class="form-value editable" value="1363" style="font-weight:700" />
+          </div>
+          <div class="form-row">
+            <div class="form-label">計上金額</div>
+            <input class="form-value editable" value="1363" />
+          </div>
+        </div>
+
+        <!-- Memo -->
+        <div class="form-group">
+          <div class="form-row" style="align-items:flex-start">
+            <div class="form-label" style="padding-top:2px">メモ</div>
+            <textarea class="form-value editable" style="resize:none;height:72px;line-height:1.5">ポーションキャラメル:218, デカビタゼロビタミン:98, レジ袋:3</textarea>
+          </div>
+        </div>
+
+        <button class="save-btn">保存する</button>
+      </div>
+    </div>
+  </div>
+</div>
+</div>
+
+<!-- ===== SETTINGS SCREEN ===== -->
+<div id="screen-settings" class="screen">
+<div class="phone">
+  <div class="phone-notch"></div>
+
+  <div class="header">
+    <div class="header-title">設定</div>
+    <div class="icon-btn" style="font-size:14px;color:#999">✕</div>
+  </div>
+
+  <div class="scroll-area">
+  <div class="settings-body">
+
+    <!-- User -->
+    <div>
+      <div class="settings-section-label">このデバイスのユーザー</div>
+      <div class="settings-section">
+        <div class="settings-row">
+          <div class="settings-row-left">
+            <div class="settings-row-title">かみしろ</div>
+            <div class="settings-row-sub">タップして変更</div>
+          </div>
+          <div class="settings-arrow">›</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Gmail -->
+    <div>
+      <div class="settings-section-label">Gmail 連携</div>
+      <div class="settings-section">
+        <div class="settings-row">
+          <div class="settings-row-left">
+            <div class="settings-row-title">検索期間</div>
+          </div>
+          <div class="control-pill" style="font-size:13px">過去30日 <span class="arrow">▼</span></div>
+        </div>
+        <div style="padding:12px 16px">
+          <button class="gmail-btn">
+            <span>✉️</span> 今すぐ取り込みを実行
+          </button>
+        </div>
+        <div class="settings-row" style="border-top:1px solid #f5f5f5">
+          <div class="settings-row-title" style="font-size:13px;color:#666">スキップ済みを確認</div>
+          <div class="settings-arrow">›</div>
+        </div>
+        <div class="settings-row">
+          <div class="settings-row-title" style="font-size:13px;color:#e65100">再取り込み（重複注意）</div>
+          <div class="settings-arrow">›</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Categories -->
+    <div>
+      <div class="settings-section-label">カテゴリ</div>
+      <div class="settings-section">
+        <div class="add-category">
+          <input class="add-input" placeholder="新しいカテゴリ名..." />
+          <button class="add-btn-small">追加</button>
+        </div>
+        <div class="category-item">
+          <div class="cat-icon-small" style="background:#e8f5e9">🛒</div>
+          <span style="font-size:14px;color:#333">食費</span>
+          <span class="cat-delete">削除</span>
+        </div>
+        <div class="category-item">
+          <div class="cat-icon-small" style="background:#fce4ec">🍽️</div>
+          <span style="font-size:14px;color:#333">外食</span>
+          <span class="cat-delete">削除</span>
+        </div>
+        <div class="category-item">
+          <div class="cat-icon-small" style="background:#e3f2fd">🧴</div>
+          <span style="font-size:14px;color:#333">日用品</span>
+          <span class="cat-delete">削除</span>
+        </div>
+        <div class="category-item">
+          <div class="cat-icon-small" style="background:#fff3e0">🚃</div>
+          <span style="font-size:14px;color:#333">交通費</span>
+          <span class="cat-delete">削除</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Account -->
+    <div>
+      <div class="settings-section-label">アカウント</div>
+      <div class="settings-section">
+        <div class="settings-row">
+          <div class="settings-row-left">
+            <div class="settings-row-title">svnsfy@gmail.com</div>
+            <div class="settings-row-sub">Google アカウント</div>
+          </div>
+          <div style="width:8px;height:8px;background:#43a047;border-radius:4px"></div>
+        </div>
+      </div>
+      <button class="signout-btn">サインアウト</button>
+    </div>
+
+    <div style="height:8px"></div>
+  </div>
+  </div>
+
+  <div class="tab-bar">
+    <div class="tab">
+      <div class="tab-icon">📷</div>
+      <div class="tab-label">撮影</div>
+    </div>
+    <div class="tab">
+      <div class="tab-icon active">📋</div>
+      <div class="tab-label active">一覧</div>
+    </div>
+  </div>
+</div>
+</div>
+
+<script>
+function show(id) {
+  document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+  document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
+  document.getElementById('screen-' + id).classList.add('active');
+  event.target.classList.add('active');
+}
+</script>
+</body>
+</html>

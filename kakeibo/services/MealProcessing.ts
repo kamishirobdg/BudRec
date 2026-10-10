@@ -1,0 +1,746 @@
+/**
+ * 食事写真 → 料理の判別 → レシートとのひも付け → 栄養の推定 → 誰が食べたか → 記録、までの処理。
+ * 仕様は docs/meal-nutrition-spec.md §5・§6。裏の OCR（OcrWorker）から呼ぶ。
+ *
+ * レシートは「料理を撮ってからレシートを撮る」順が普通なので、両方向で突き合わせる:
+ * - 食事を処理するときに、撮影時刻の前後 3 時間のレシートが既にあればひも付ける
+ * - レシートを登録したときに、前後 3 時間の食事でまだレシートの無いものがあればひも付け直す
+ */
+
+import { SheetsInternal, ExpenseRow, getRowsRaw, getUniqueUsers, newEntryId } from './SheetsService';
+import { AuthError } from './AuthService';
+import axios from 'axios';
+import { QuotaExceededError } from '../providers/AIProvider';
+import type { ReceiptItem } from '../providers/AIProvider';
+import { readJsonArray, removeFile, writeJson } from './jsonFileStore';
+import { getCurrentUser } from './UserService';
+import {
+  analyzePhoto, lookupNutrition, matchReceiptItems,
+  IdentifiedDish, InventoryLine, NutritionQuery, NutritionResult, ReceiptLine, UsedItem,
+} from '../providers/GeminiMeal';
+import { listInventory, remainLabel, consume, InventoryItem } from './InventoryService';
+import {
+  Food, findFood, findMenu, freshNutrition, loadFoods, loadMenuIndex, nutritionOrigin, saveResearched,
+} from './FoodService';
+import { rowsFromReceipts } from './ReceiptProcessing';
+import * as CategoryService from './CategoryService';
+import {
+  MealRow, Confidence, ItemChoice, ItemRef, appendMeal, getMeals, mealRev, mealsSheetName, newMealId,
+  recentCorrections, saveMeal, MealConflictError,
+} from './MealService';
+import { Nutrients, scaleNutrients } from './Nutrients';
+import * as Demo from './DemoService';
+import { ensureMealShared } from './SharedPhotos';
+
+/** 食事写真とレシートを突き合わせる時間幅 */
+const LINK_WINDOW_MS = 3 * 60 * 60 * 1000;
+
+// ─── 時刻 ─────────────────────────────────────────────────────────────────────
+
+function pad(n: number): string {
+  return String(n).padStart(2, '0');
+}
+
+export function epochToTimestamp(ms: number): string {
+  const d = new Date(ms);
+  return `${d.getFullYear()}/${pad(d.getMonth() + 1)}/${pad(d.getDate())} ` +
+         `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
+/** 'YYYY/MM/DD HH:MM:SS' → エポックミリ秒（Hermes の文字列パースに頼らない） */
+export function timestampToEpoch(ts: string): number | null {
+  const m = ts.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?)?/);
+  if (!m) return null;
+  return new Date(+m[1], +m[2] - 1, +m[3], +(m[4] ?? 0), +(m[5] ?? 0), +(m[6] ?? 0)).getTime();
+}
+
+/** この時刻より前に買ったものは昼食として入れる（§5.7） */
+const MORNING_UNTIL = 10;
+const LUNCH_HOUR = 12;
+
+/** レシートから登録する食事の時刻。朝に買ったものは昼食にする */
+export function mealTimeOf(boughtAt: number): number {
+  const d = new Date(boughtAt);
+  if (d.getHours() < MORNING_UNTIL) d.setHours(LUNCH_HOUR, 0, 0, 0);
+  return d.getTime();
+}
+
+/**
+ * レシートと食事の時刻の近さ。朝に買ったレシートは昼食（12:00）として登録されるので、買った時刻と
+ * 食べる時刻のどちらに近いかで見る（朝のレシートと昼の写真を同じ食事にする）
+ */
+function receiptDistance(receiptAt: number, mealAt: number): number {
+  return Math.min(Math.abs(receiptAt - mealAt), Math.abs(mealTimeOf(receiptAt) - mealAt));
+}
+
+/** 前後の月のシート名（境目をまたぐ突き合わせ用） */
+function monthsAround(ms: number): string[] {
+  const d = new Date(ms);
+  const prev = new Date(d.getFullYear(), d.getMonth() - 1, 1);
+  const next = new Date(d.getFullYear(), d.getMonth() + 1, 1);
+  const name = (x: Date) => `${x.getFullYear()}-${pad(x.getMonth() + 1)}`;
+  const set = new Set([name(d)]);
+  if (d.getDate() === 1) set.add(name(prev));
+  if (new Date(ms + LINK_WINDOW_MS).getMonth() !== d.getMonth()) set.add(name(next));
+  return [...set];
+}
+
+// ─── レシートの品目 ───────────────────────────────────────────────────────────
+
+export interface ReceiptCandidate {
+  entryId:   string;
+  store:     string;
+  timestamp: string;
+  at:        number;
+  lines:     ReceiptLine[];
+}
+
+/** 撮影時刻の前後 3 時間で、食品の品目があるレシートのうち最も近いもの */
+async function findReceiptNear(shotAt: number): Promise<ReceiptCandidate | null> {
+  const client = await SheetsInternal.createClient();
+  const names = await SheetsInternal.listSheetNames(client, true);
+  const byEntry = new Map<string, ReceiptCandidate>();
+
+  for (const month of monthsAround(shotAt)) {
+    const sheet = `_items_${month}`;
+    if (!names.includes(sheet)) continue;
+    const res = await client.get(`/values/${encodeURIComponent(sheet)}!A:S`);
+    const values: string[][] = res.data.values ?? [];
+    for (const c of values.slice(1)) {
+      const entryId = c[1] ?? '';
+      const at = timestampToEpoch(c[2] ?? '');
+      if (!entryId || at === null || receiptDistance(at, shotAt) > LINK_WINDOW_MS) continue;
+      if ((c[10] ?? '') === 'non_food') continue;
+      const cand = byEntry.get(entryId) ?? { entryId, store: c[4] ?? '', timestamp: c[2] ?? '', at, lines: [] };
+      cand.lines.push({ index: cand.lines.length, name: c[6] || c[5] || '', price: Number(c[9]) || 0 });
+      byEntry.set(entryId, cand);
+    }
+  }
+  // 削除した支出行の品目は _items に残るので、月次シートで生きている行だけにする
+  const live = new Set<string>();
+  for (const month of monthsAround(shotAt)) {
+    for (const r of await getRowsRaw(month)) if (r.entryId) live.add(r.entryId);
+  }
+  const list = [...byEntry.values()].filter((c) => live.has(c.entryId));
+  if (list.length === 0) return null;
+  list.sort((a, b) => receiptDistance(a.at, shotAt) - receiptDistance(b.at, shotAt));
+  return list[0];
+}
+
+// ─── 割り振り ─────────────────────────────────────────────────────────────────
+
+interface Serving {
+  dishIndex: number;
+  /** 一品を二人で分けるなら 2 行（portion 0.5 ずつ） */
+  eaters:    { user: string; portion: number }[];
+  /** 割り振りに自信が無い */
+  unsure:    boolean;
+}
+
+/**
+ * 料理を人に割り振る。判別に困るときだけ unsure を立てる（確認を挟むのはその場合だけ）。
+ * - 取り分ける料理 → 二人で半分ずつ
+ * - 一人前が 1 つだけ → 撮った人
+ * - 同じ一人前が 2 つ → 一人 1 つずつ
+ * - 一人前が人数分あってどちらの分か分からない → 仮に交互に割り当てて unsure
+ */
+function assign(dishes: IdentifiedDish[], photographer: string, partner: string | null): Serving[] {
+  const servings: Serving[] = [];
+  const singles: { dishIndex: number; eater: IdentifiedDish['eater'] }[] = [];
+
+  dishes.forEach((d, i) => {
+    if (d.shared || d.eater === 'both') {
+      servings.push({
+        dishIndex: i,
+        eaters: partner
+          ? [{ user: photographer, portion: 0.5 }, { user: partner, portion: 0.5 }]
+          : [{ user: photographer, portion: 1 }],
+        unsure: false,
+      });
+      return;
+    }
+    for (let k = 0; k < d.count; k++) singles.push({ dishIndex: i, eater: d.eater });
+  });
+
+  const onlyOne = singles.length === 1;
+  const unknownCount = singles.filter((s) => s.eater === 'unknown').length;
+  // 同じ料理がちょうど 2 つ → 一人 1 つずつ、で迷わない
+  const pairOfSame = partner && singles.length === 2 && singles[0].dishIndex === singles[1].dishIndex;
+
+  let toggle = 0;
+  singles.forEach((s, k) => {
+    let user = photographer;
+    let unsure = false;
+    if (s.eater === 'partner' && partner) user = partner;
+    else if (s.eater === 'photographer') user = photographer;
+    else if (onlyOne) user = photographer;
+    else if (pairOfSame) user = k === 0 ? photographer : partner!;
+    else if (partner) {
+      user = toggle++ % 2 === 0 ? photographer : partner;
+      unsure = unknownCount > 0;
+    }
+    servings.push({ dishIndex: s.dishIndex, eaters: [{ user, portion: 1 }], unsure });
+  });
+  return servings;
+}
+
+
+// ─── 写真の振り分け ───────────────────────────────────────────────────────────
+
+/** 在庫の候補（振り分けの指示文に渡した順。料理の used / choices の index はこの並び） */
+export interface InventoryRef {
+  index:           number;
+  itemId:          string;
+  name:            string;
+  store:           string;
+  bought:          string;
+  pieces:          number | null;
+  remaining:       number;
+  remainingPieces: number | null;
+}
+
+/**
+ * 振り分けの結果。画像の状態ファイルに保存しておき、書き込みの途中でアプリが終了されても
+ * Gemini を呼び直さずに続きから書けるようにする（ID は先に振ってある）。
+ */
+export interface StoredAnalysis {
+  /** ID 付きの支出行（レシートが写っていなければ空） */
+  receiptRows:  ExpenseRow[];
+  dishes:       IdentifiedDish[];
+  inventory:    InventoryRef[];
+  mealId:       string;
+  photographer: string;
+  partner:      string | null;
+}
+
+/** 在庫の候補として振り分けに渡す件数の上限（指示文が長くなりすぎないように） */
+const MAX_INVENTORY = 80;
+
+/**
+ * 撮った写真を 1 回の呼び出しでレシートと料理・食品に振り分けて読む。
+ * QuotaExceededError / CancelledError はそのまま投げる。
+ */
+export async function analyzeCapturedPhoto(
+  base64: string,
+  proxyUser: string | undefined,
+  signal: AbortSignal,
+): Promise<StoredAnalysis> {
+  const photographer = proxyUser ?? await getCurrentUser();
+  const partner = (await getUniqueUsers()).find((u) => u !== photographer) ?? null;
+  const corrections = (await recentCorrections(20))
+    .map((c) => `${c.context}: ${fieldLabel(c.field)}を「${c.before}」→「${c.after}」に修正`);
+
+  let stock: InventoryItem[] = [];
+  try {
+    stock = (await listInventory(false)).slice(0, MAX_INVENTORY);
+  } catch (e) {
+    console.warn('[Meal] 在庫を読めなかった:', e instanceof Error ? e.message : e);
+  }
+  const inventory: InventoryRef[] = stock.map((it, index) => ({
+    index, itemId: it.itemId, name: it.name, store: it.store,
+    bought: `${new Date(it.purchasedMs).getMonth() + 1}/${new Date(it.purchasedMs).getDate()}`,
+    pieces: it.pieces, remaining: it.remaining, remainingPieces: it.remainingPieces,
+  }));
+  const lines: InventoryLine[] = stock.map((it, index) => ({
+    index, name: it.name, store: it.store, bought: inventory[index].bought,
+    storage: it.storage === 'chilled' ? '冷蔵' : it.storage === 'frozen' ? '冷凍' : it.storage === 'ambient' ? '常温' : '',
+    remain: remainLabel(it),
+  }));
+
+  const categories = await CategoryService.getCategories();
+  const res = await analyzePhoto(base64, categories, { photographer, partner, corrections, inventory: lines }, signal);
+  const receiptRows = (await rowsFromReceipts(res.receipts, proxyUser))
+    .map((r) => ({ ...r, entryId: newEntryId() }));
+  return { receiptRows, dishes: res.dishes, inventory, mealId: newMealId(), photographer, partner };
+}
+
+// ─── 食事の記録 ───────────────────────────────────────────────────────────────
+
+export interface MealResult {
+  mealId:      string;
+  sheetName:   string;
+  needsReview: boolean;
+  /** 二人にまたがる食事か（写真を相手と共有する対象） */
+  sharedMeal:  boolean;
+  rows:        MealRow[];
+  /** 未送信に積んだうえで再サインインが要る状態になった（記録は後で届く） */
+  authFailed:  boolean;
+  /** 新しく記録せず、レシートから登録してあった食事（§5.7）に写真を付けただけ */
+  attached?:   boolean;
+}
+
+export interface RecordMealOptions {
+  signal?:      AbortSignal;
+  /** 料理 → レシートの品目の対応が分かっているとき（レシートから登録する場合）。Gemini に対応付けさせない */
+  lineMatches?: (number | null)[];
+  /** 自動で決めた割り振りを確かめてもらう（二人分をレシートから登録したとき） */
+  forceReview?: boolean;
+  assignedBy?:  MealRow['assignedBy'];
+}
+
+/** そのレシートにひも付いた食事（削除済みを除く）。無ければ null */
+export async function mealForReceipt(entryId: string, at: number): Promise<MealRow[] | null> {
+  const rows = (await Promise.all(monthsAround(at).map((m) => getMeals(m)))).flat().filter((r) => r.entryId === entryId);
+  return rows.length > 0 ? rows : null;
+}
+
+/** レシートから登録した食事に、後で撮った写真を付ける。相手が編集中なら付けない */
+async function attachPhoto(rows: MealRow[], photoRef: string, user: string): Promise<MealRow[]> {
+  const next = rows.map((r) => ({ ...r, photoRefs: r.photoRefs.includes(photoRef) ? r.photoRefs : [...r.photoRefs, photoRef] }));
+  const sheetName = rows[0].sheetName ?? mealsSheetName(rows[0].eatenAt);
+  try {
+    return await saveMeal(sheetName, rows[0].mealId, next, mealRev(rows), user);
+  } catch (e) {
+    if (e instanceof MealConflictError) return rows;
+    throw e;
+  }
+}
+
+/**
+ * 使った在庫の量を「1 パック（入り数ぶん）のうちの割合」にする。
+ * 解釈できない（入り数の無い品目に個数が返った・量が無い）ときは null（栄養は検索に回す）。
+ */
+function packageFraction(ref: InventoryRef, used: UsedItem): number | null {
+  if (used.pieces && ref.pieces) return used.pieces / ref.pieces;
+  if (used.ratio && used.ratio > 0) return used.ratio * ref.remaining;
+  return null;
+}
+
+/** 食品データの栄養（単位つき）から、食べた分の栄養を出す。出せなければ null */
+function nutrientsFromFood(food: Food, ref: InventoryRef, used: UsedItem, grams?: number): Nutrients | null {
+  const f = packageFraction(ref, used);
+  // 複数入りの商品の公式表示は 1 個あたりが普通なので、個数を直接掛ける（個数が無ければ入り数 × 使った割合）
+  if (food.basis === 'piece') {
+    const pieces = used.pieces ?? (f !== null && ref.pieces ? f * ref.pieces : null);
+    return pieces ? scaleNutrients(food.nutrients, pieces) : null;
+  }
+  // 100g あたり: 写真から見積もった量、無ければ内容量（g）× 使った割合
+  if (food.basis === 'per100g') {
+    const content = Number(food.content.match(/^(\d+(?:\.\d+)?)\s*g$/i)?.[1]);
+    const g = grams ?? (f !== null && content > 0 ? content * f : null);
+    return g ? scaleNutrients(food.nutrients, g / 100) : null;
+  }
+  if (food.basis !== 'package') return null;
+  return f === null ? null : scaleNutrients(food.nutrients, f);
+}
+
+/**
+ * 振り分けで見つかった料理・食品を食事として記録する。
+ * @param receipt 同じ写真に写っていて登録したレシート（あればそれにひも付ける。無ければ前後 3 時間から探す）
+ */
+export async function recordMeal(
+  a: StoredAnalysis,
+  shotAt: number,
+  photoRef: string | null,
+  receipt: ReceiptCandidate | null,
+  opts: RecordMealOptions = {},
+): Promise<MealResult> {
+  const { signal } = opts;
+  const { inventory, mealId, photographer, partner } = a;
+  let { dishes } = a;
+  /** レシートの品にあたる料理（外食・商品で、在庫の品ではないもの） */
+  const fromReceipt = (d: IdentifiedDish) => d.kind !== 'home' && d.used.length === 0;
+  let linked = receipt ?? (dishes.some(fromReceipt) ? await findReceiptNear(shotAt) : null);
+
+  // レシートから登録した食事（§5.7）が既にあれば、レシートの品にあたる料理は記録せず、その食事に写真を付けるだけ。
+  // 一緒に写った自炊・在庫の品だけを新しく記録する（それも無ければ付けて終わり）
+  if (linked && photoRef && !opts.lineMatches && dishes.some(fromReceipt)) {
+    const existing = await mealForReceipt(linked.entryId, linked.at);
+    if (existing?.some((r) => r.assignedBy === 'receipt')) {
+      const rows = await attachPhoto(existing, photoRef, photographer);
+      dishes = dishes.filter((d) => !fromReceipt(d));
+      if (dishes.length === 0) {
+        return {
+          mealId: existing[0].mealId, sheetName: existing[0].sheetName ?? mealsSheetName(existing[0].eatenAt),
+          needsReview: false, sharedMeal: new Set(existing.map((r) => r.user)).size > 1, rows, authFailed: false, attached: true,
+        };
+      }
+      linked = null;
+    }
+  }
+
+  // 自炊の料理はレシートの品目と突き合わせない（「親子丼」が「鶏もも肉」にならないように）
+  const targets = dishes.map((_, i) => i).filter((i) => dishes[i].kind !== 'home' && dishes[i].used.length === 0);
+  const matches: (number | null)[] = dishes.map(() => null);
+  if (linked && opts.lineMatches) {
+    opts.lineMatches.forEach((m, i) => { matches[i] = m; });
+  } else if (linked && targets.length > 0) {
+    const m = await matchReceiptItems(linked.store, targets.map((i) => dishes[i].name), linked.lines, signal);
+    targets.forEach((i, k) => { matches[i] = m[k]; });
+  }
+  const nameOf = (i: number) => (matches[i] !== null && linked ? linked.lines[matches[i]!].name : dishes[i].name);
+  const storeOf = (i: number) => (dishes[i].kind !== 'home' && linked && matches[i] !== null ? linked.store : '');
+
+  // 栄養: 食品データにあればそれを使い、無いものだけまとめて調べる
+  const foods = await loadFoods();
+  // 外食のメニューは行数が多いので、外食の料理があるときだけ読む（読めなければ調べる側に回す）
+  const menuIndex = dishes.some((d, i) => d.kind === 'eat_out' && storeOf(i))
+    ? await loadMenuIndex().catch(() => null)
+    : null;
+  const whole: (NutritionResult | null)[] = dishes.map((d, i) => {
+    // 家にある商品を食べた（1 品だけ・見分けられている）→ 食品データ × 食べた割合
+    if (d.kind === 'packaged' && d.used.length === 1 && d.choices.length === 0) {
+      const ref = inventory[d.used[0].index];
+      const food = ref && freshNutrition(findFood(foods, ref.name, ref.store));
+      const n = food ? nutrientsFromFood(food, ref, d.used[0], d.grams) : null;
+      if (food && n) return { nutrients: n, ...nutritionOrigin(food) };
+    }
+    if (d.kind !== 'home' && d.used.length === 0) {
+      const food = d.kind === 'eat_out' && storeOf(i)
+        ? (menuIndex ? findMenu(menuIndex, storeOf(i), [nameOf(i), d.name]) : undefined)
+        : freshNutrition(findFood(foods, nameOf(i), linked?.store ?? ''));
+      if (food && food.basis === 'package') {
+        // 包装の表示のエネルギーが読めたら、それに合わせる
+        const kcal = food.nutrients['ENERC_KCAL'];
+        if (d.kind === 'packaged' && d.labelKcal && kcal && kcal > 0) {
+          return { nutrients: scaleNutrients(food.nutrients, d.labelKcal / kcal), official: true };
+        }
+        // 写真から量を見積もった商品は、食品データの内容量（g）が分かれば量の割合を掛ける。分からなければ調べ直す
+        // （食品データの値が袋全体のものだと、1 枚食べただけで袋全部の量になってしまう）
+        if (d.kind === 'packaged' && d.grams) {
+          const g = Number(food.content.match(/^(\d+(?:\.\d+)?)\s*g$/i)?.[1]);
+          return g > 0 ? { nutrients: scaleNutrients(food.nutrients, d.grams / g), ...nutritionOrigin(food) } : null;
+        }
+        return { nutrients: food.nutrients, ...nutritionOrigin(food) };
+      }
+      // 包装の表示から入れた「1 個あたり」「100g あたり」の値（1 つ分 = 1 個。100g あたりは見積もった量を掛ける）
+      if (food && d.kind === 'packaged' && food.basis === 'piece') {
+        return { nutrients: food.nutrients, ...nutritionOrigin(food) };
+      }
+      if (food && d.kind === 'packaged' && food.basis === 'per100g' && d.grams) {
+        return { nutrients: scaleNutrients(food.nutrients, d.grams / 100), ...nutritionOrigin(food) };
+      }
+    }
+    return null;
+  });
+  const todo = dishes.map((_, i) => i).filter((i) => whole[i] === null);
+  let sources: string[] = [];
+  if (todo.length > 0) {
+    const queries: NutritionQuery[] = todo.map((i) => {
+      const d = dishes[i];
+      const used = d.used
+        .filter((u) => inventory[u.index])
+        .map((u) => {
+          const f = packageFraction(inventory[u.index], u);
+          const amount = u.pieces ? `${u.pieces}個` : f !== null ? `1 パックの約${Math.round(f * 100)}%` : '量は不明';
+          return `${inventory[u.index].name} ${amount}`;
+        });
+      // 家にある商品を食べた: その量で。家で作った料理: 使った食材を添える
+      if (d.kind === 'packaged' && used.length === 1) {
+        return { store: '', name: nameOf(i), kind: d.kind, amount: used[0] };
+      }
+      return {
+        store: storeOf(i),
+        name:  used.length > 0 ? `${nameOf(i)}（使った食材: ${used.join('、')}）` : nameOf(i),
+        kind:  d.kind,
+        // 写真から見積もった量があれば渡す（無いと「商品 1 個」が袋全体の量と取り違えられることがある）
+        // 外食はメニューの一人前が決まっているので渡さない
+        amount: d.kind === 'packaged' && used.length === 0 && d.grams ? `約 ${Math.round(d.grams)}g` : undefined,
+      };
+    });
+    const res = await lookupNutrition(queries, { signal });
+    sources = res.sources;
+    todo.forEach((i, k) => {
+      const r = res.results[k];
+      const label = dishes[i].labelKcal;
+      const kcal = r.nutrients['ENERC_KCAL'];
+      // 写っている栄養成分表示のエネルギーが読めたら、それに合わせて全体を直す（推定より包装の表示を信じる）
+      whole[i] = label && kcal && kcal > 0
+        ? { nutrients: scaleNutrients(r.nutrients, label / kcal), official: true }
+        : label
+          ? { nutrients: { ...r.nutrients, ENERC_KCAL: label }, official: true }
+          : r;
+    });
+    // 外食のメニュー・家の外で買った商品は食品データに足す（次からは調べずに済む）。
+    // 写真から量を見積もった・包装の表示を読んだものは、その回の量の値なので足さない
+    await saveResearched(todo
+      .map((i, k) => ({ i, k }))
+      .filter(({ i }) => dishes[i].kind !== 'home' && dishes[i].used.length === 0 &&
+        !(dishes[i].kind === 'packaged' && (dishes[i].grams || dishes[i].labelKcal)))
+      .map(({ i, k }) => ({
+        query: { name: nameOf(i), chain: dishes[i].kind === 'eat_out' ? storeOf(i) : '', kind: dishes[i].kind, content: '' },
+        result: { nutrients: res.results[k].nutrients, basis: 'package' as const, official: res.results[k].official },
+        sources: res.sources,
+      })),
+    ).catch((e) => console.warn('[Meal] 食品データに足せなかった:', e instanceof Error ? e.message : e));
+  }
+
+  const servings = assign(dishes, photographer, partner);
+  const eatenAt = epochToTimestamp(shotAt);
+  const unmatched = linked !== null && dishes.some((d, i) => d.kind !== 'home' && d.used.length === 0 && matches[i] === null);
+  const needsReview =
+    !!opts.forceReview ||
+    servings.some((s) => s.unsure) ||
+    dishes.some((d) => d.confidence === 'low' || d.choices.length > 0) ||
+    unmatched;
+
+  const rows: MealRow[] = [];
+  for (const s of servings) {
+    const d = dishes[s.dishIndex];
+    const dishId = newMealId();
+    const itemRefs: ItemRef[] = d.used
+      .filter((u) => inventory[u.index])
+      .map((u) => ({ itemId: inventory[u.index].itemId, usedPieces: u.pieces, usedRatio: u.ratio }));
+    const choices: ItemChoice[] = d.choices
+      .filter((c) => inventory[c])
+      .map((c) => ({ itemId: inventory[c].itemId, name: inventory[c].name, store: inventory[c].store, bought: inventory[c].bought }));
+    for (const e of s.eaters) {
+      rows.push(buildRow({
+        mealId, dishId, eatenAt, user: e.user, portion: e.portion,
+        dish: nameOf(s.dishIndex), kind: d.kind, store: storeOf(s.dishIndex),
+        result: whole[s.dishIndex]!, dishConfidence: d.confidence,
+        entryId: d.kind !== 'home' && matches[s.dishIndex] !== null && linked ? linked.entryId : '',
+        photoRef, sources, updatedBy: photographer, itemRefs, choices, assignedBy: opts.assignedBy,
+      }));
+    }
+  }
+  if (needsReview) for (const r of rows) r.status = 'needs_review';
+
+  // 未送信に回っただけなら記録は届く。AuthError も未送信に積んでから投げられる
+  let authFailed = false;
+  try {
+    await appendMeal(rows);
+  } catch (e) {
+    if (e instanceof AuthError) authFailed = true;
+    else if (!(e instanceof Error && e.name === 'QueuedWriteError')) throw e;
+  }
+
+  // 在庫の残りを減らす。見分けられなかった候補の品だけは、選んでもらってから減らす
+  await consume(dishes.flatMap((d) => d.used
+    .filter((u) => inventory[u.index] && !d.choices.includes(u.index))
+    .map((u) => ({ itemId: inventory[u.index].itemId, pieces: u.pieces, ratio: u.ratio }))));
+
+  return {
+    mealId,
+    sheetName: mealsSheetName(eatenAt),
+    needsReview,
+    sharedMeal: new Set(rows.map((r) => r.user)).size > 1,
+    rows,
+    authFailed,
+  };
+}
+
+/** 同じ写真に写っていたレシートを、食事のひも付け先の形にする */
+export function receiptCandidateOf(row: ExpenseRow): ReceiptCandidate | null {
+  const food = (row.items ?? []).filter((it) => it.kind !== 'non_food');
+  if (!row.entryId || food.length === 0) return null;
+  return {
+    entryId: row.entryId,
+    store: row.store,
+    timestamp: row.timestamp,
+    at: timestampToEpoch(row.timestamp) ?? 0,
+    lines: food.map((it, index) => ({ index, name: it.normalized ?? it.name, price: it.price })),
+  };
+}
+
+function buildRow(p: {
+  mealId: string; dishId: string; eatenAt: string; user: string; portion: number;
+  dish: string; kind: IdentifiedDish['kind']; store: string;
+  result: NutritionResult; dishConfidence: IdentifiedDish['confidence'];
+  entryId: string; photoRef: string | null; sources: string[]; updatedBy: string;
+  itemRefs: ItemRef[]; choices: ItemChoice[]; assignedBy?: MealRow['assignedBy'];
+}): MealRow {
+  const confidence: Confidence =
+    p.dishConfidence === 'low' ? 'low' :
+    p.result.official ? p.dishConfidence :
+    // 成分表の値でも、食べた量（食材のグラム数）は見積もりなので medium まで
+    p.result.tableSources ? (p.dishConfidence === 'high' ? 'medium' : p.dishConfidence) : 'low';
+  return {
+    mealId: p.mealId, dishId: p.dishId, eatenAt: p.eatenAt, user: p.user,
+    kind: p.kind, store: p.store, dish: p.dish, portion: p.portion,
+    nutrients: scaleNutrients(p.result.nutrients, p.portion),
+    nutrientSource: p.result.official ? 'grounding' : p.result.tableSources ? 'food_table' : 'estimate',
+    confidence,
+    entryId: p.entryId, itemRefs: p.itemRefs, status: 'estimated', assignedBy: p.assignedBy ?? 'auto',
+    photoRefs: p.photoRef ? [p.photoRef] : [],
+    rev: 1, sources: p.result.tableSources ?? p.sources, updatedBy: p.updatedBy, updatedAt: p.eatenAt, choices: p.choices,
+  };
+}
+
+function fieldLabel(f: string): string {
+  return f === 'user' ? '食べた人' : f === 'portion' ? '割合' : f === 'dish' ? '料理名' : '量';
+}
+
+// ─── レシート登録時のひも付け直し ─────────────────────────────────────────────
+
+export interface SavedReceipt {
+  entryId:   string;
+  timestamp: string;
+  store:     string;
+  items:     ReceiptItem[];
+  /** レシートから直後の食事を登録するのに使う（§5.7。前の版の未処理ファイルには無い） */
+  user?:     string;
+  source?:   string;
+  category?: string;
+  servings?: number;
+}
+
+/**
+ * linked = ひも付けた / none = ひも付ける食事が無かった（レシートから食事を登録してよい）/
+ * skipped = 対応しない品があった・相手が編集中・失敗して後でやり直す（食事を登録しない）
+ */
+export type LinkResult = 'linked' | 'none' | 'skipped';
+
+/**
+ * 登録したレシートの前後 3 時間に、まだレシートの無い外食・商品の食事があればひも付け、
+ * レシートの正式な品名で栄養を引き直す。失敗しても投げない（レシートの登録は済んでいる）。
+ * 相手が同じ食事を編集していたら触らない（rev が変わっていれば保存を諦める）。
+ */
+export async function linkReceiptToMeals(receipt: SavedReceipt, signal?: AbortSignal): Promise<LinkResult> {
+  try {
+    if (await Demo.isDemo()) return 'skipped';
+    const food = receipt.items.filter((it) => it.kind !== 'non_food');
+    const at = timestampToEpoch(receipt.timestamp);
+    if (food.length === 0 || at === null) return 'skipped';
+
+    const rows = (await Promise.all(monthsAround(at).map((m) => getMeals(m)))).flat();
+    // 食事単位で見る。時間の近い、外食・商品を含む食事のうち、どの行にもまだレシートが無く、手で直されていないものだけ
+    const byMeal = new Map<string, MealRow[]>();
+    for (const r of rows) byMeal.set(r.mealId, [...(byMeal.get(r.mealId) ?? []), r]);
+    const nearby = [...byMeal.values()]
+      .filter((list) => list.some((r) => r.kind !== 'home'))
+      .filter((list) => {
+        const t = timestampToEpoch(list[0].eatenAt);
+        return t !== null && receiptDistance(at, t) <= LINK_WINDOW_MS;
+      });
+    const candidates = nearby
+      .filter((list) => list.every((r) => !r.entryId && r.status !== 'edited'))
+      .map((list) => list[0]);
+    // 近くに食事はあるが、編集済み・別のレシート付き（このレシートの食事を含む）。同じ食事かもしれないので作らない
+    if (candidates.length === 0) return nearby.length > 0 ? 'skipped' : 'none';
+
+    // いちばん近い食事 1 回分だけにひも付ける
+    const nearest = candidates.reduce((a, b) =>
+      receiptDistance(at, timestampToEpoch(a.eatenAt)!) <= receiptDistance(at, timestampToEpoch(b.eatenAt)!) ? a : b);
+    const mealRows = rows.filter((r) => r.mealId === nearest.mealId);
+    const sheetName = nearest.sheetName ?? mealsSheetName(nearest.eatenAt);
+    const baseRev = mealRev(mealRows);
+
+    const dishIds = [...new Set(mealRows.map((r) => r.dishId))];
+    const dishNames = dishIds.map((id) => mealRows.find((r) => r.dishId === id)!.dish);
+    const lines: ReceiptLine[] = food.map((it, i) => ({ index: i, name: it.normalized ?? it.name, price: it.price }));
+    const matches = await matchReceiptItems(receipt.store, dishNames, lines, signal);
+
+    // 自炊の品はレシートに対応付けない
+    const matchedIdx = dishIds.map((_, i) => i).filter((i) =>
+      matches[i] !== null && mealRows.find((r) => r.dishId === dishIds[i])!.kind !== 'home');
+    // 近くに食事はあるが品目が対応しない。別の食事かもしれないが、二重に登録しないよう作らない
+    if (matchedIdx.length === 0) return 'skipped';
+    const queries: NutritionQuery[] = matchedIdx.map((i) => ({
+      store: receipt.store,
+      name:  lines[matches[i]!].name,
+      kind:  mealRows.find((r) => r.dishId === dishIds[i])!.kind,
+    }));
+    const { results, sources } = await lookupNutrition(queries, { signal });
+
+    const next = mealRows.map((r) => {
+      const di = dishIds.indexOf(r.dishId);
+      const qi = matchedIdx.indexOf(di);
+      // 対応しなかった品は触らない（別のレシートの品かもしれない）
+      if (qi < 0) return r;
+      const res = results[qi];
+      // 栄養が 1 つも取れなかったら、今の値を消さずにひも付けだけする
+      const gotAny = Object.values(res.nutrients).some((v) => v !== null);
+      return {
+        ...r,
+        entryId: receipt.entryId,
+        store:   receipt.store,
+        dish:    queries[qi].name,
+        ...(gotAny ? {
+          nutrients: scaleNutrients(res.nutrients, r.portion),
+          nutrientSource: res.official ? 'grounding' as const : 'estimate' as const,
+          confidence: res.official ? 'high' as const : r.confidence,
+          sources,
+        } : {}),
+      };
+    });
+    const user = await getCurrentUser();
+    const saved = await saveMeal(sheetName, nearest.mealId, next, baseRev, user);
+    // 二人の食事なら、ひも付いたレシートの写真も相手に見せる
+    await ensureMealShared(saved, user);
+    return 'linked';
+  } catch (e) {
+    if (e instanceof MealConflictError) return 'skipped'; // 相手が編集中。そちらを優先する
+    console.warn('[Meal] レシートとのひも付けに失敗:', e instanceof Error ? e.message : e);
+    // 無料枠切れ・通信の失敗なら後でやり直す（食事が推定値のまま残らないように）
+    if (e instanceof QuotaExceededError || (axios.isAxiosError(e) && !e.response)) {
+      deferLink(receipt, e instanceof QuotaExceededError ? e.retryAt : Date.now() + LINK_RETRY_MS);
+    }
+    return 'skipped';
+  }
+}
+
+// ─── ひも付け直しのやり直し ───────────────────────────────────────────────────
+
+/** ひも付け直しを後でやり直すレシート（端末のファイル） */
+const PENDING_LINKS_FILE = 'pending-links.json';
+const LINK_RETRY_MS = 15 * 60 * 1000;
+/** 何度やっても通らないものをいつまでも残さない */
+const LINK_MAX_ATTEMPTS = 5;
+/** やり直し中の印（notBefore に入れる） */
+const IN_PROGRESS = Number.MAX_SAFE_INTEGER;
+
+interface PendingLink {
+  receipt:   SavedReceipt;
+  notBefore: number;
+  attempts:  number;
+}
+
+/**
+ * レシートから直後の食事を登録するのが無料枠切れ・通信の失敗で止まったときに、ひも付け直しと同じ仕組みで後でやり直す
+ * （やり直しでまた 'none' なら登録する）
+ */
+export function deferReceiptMeal(receipt: SavedReceipt, e: unknown): boolean {
+  if (!(e instanceof QuotaExceededError || (axios.isAxiosError(e) && !e.response))) return false;
+  deferLink(receipt, e instanceof QuotaExceededError ? e.retryAt : Date.now() + LINK_RETRY_MS);
+  return true;
+}
+
+function deferLink(receipt: SavedReceipt, notBefore: number): void {
+  const list = readJsonArray<PendingLink>(PENDING_LINKS_FILE);
+  const prev = list.find((p) => p.receipt.entryId === receipt.entryId);
+  const attempts = (prev?.attempts ?? 0) + 1;
+  const rest = list.filter((p) => p.receipt.entryId !== receipt.entryId);
+  writeJson(PENDING_LINKS_FILE, attempts > LINK_MAX_ATTEMPTS ? rest : [...rest, { receipt, notBefore, attempts }]);
+}
+
+let retrying: Promise<void> | null = null;
+
+/**
+ * 時刻を過ぎたひも付け直しをやり直す（アプリが前面に来たとき・定期実行で呼ぶ）。失敗しても投げない
+ * @param onUnlinked ひも付ける食事が無かったときに呼ぶ（レシートから直後の食事を登録する。§5.7）
+ */
+export function retryPendingLinks(onUnlinked?: (receipt: SavedReceipt) => Promise<void>, now: number = Date.now()): Promise<void> {
+  if (retrying) return retrying;
+  // 対象が無いと await を通らずに終わるので、`??=` で代入すると終わった後の Promise が残り続ける。
+  // 代入してから、終わったら外す
+  const task = (async () => {
+    try {
+      const list = readJsonArray<PendingLink>(PENDING_LINKS_FILE);
+      // やり直し中（番兵）のまま残っているのは、前回のやり直しの途中で終了されたもの。もう一度やる
+      const due = list.filter((p) => p.notBefore <= now || p.notBefore === IN_PROGRESS);
+      if (due.length === 0) return;
+      for (const p of due) {
+        // やり直し中の印を付けておく（回数を引き継ぐため消さない）。また失敗したら linkReceiptToMeals が
+        // 回数を増やして積み直す
+        const rest = readJsonArray<PendingLink>(PENDING_LINKS_FILE).filter((x) => x.receipt.entryId !== p.receipt.entryId);
+        writeJson(PENDING_LINKS_FILE, [...rest, { ...p, notBefore: IN_PROGRESS }]);
+        const result = await linkReceiptToMeals(p.receipt);
+        if (result === 'none' && onUnlinked) await onUnlinked(p.receipt).catch(() => {});
+        const after = readJsonArray<PendingLink>(PENDING_LINKS_FILE);
+        const mine = after.find((x) => x.receipt.entryId === p.receipt.entryId);
+        // 積み直されていなければ（成功・対象なし）外す
+        if (mine && mine.notBefore === IN_PROGRESS) {
+          const remaining = after.filter((x) => x.receipt.entryId !== p.receipt.entryId);
+          if (remaining.length > 0) writeJson(PENDING_LINKS_FILE, remaining);
+          else removeFile(PENDING_LINKS_FILE);
+        }
+      }
+    } catch (e) {
+      console.warn('[Meal] ひも付け直しのやり直しに失敗:', e instanceof Error ? e.message : e);
+    }
+  })();
+  retrying = task;
+  task.finally(() => { if (retrying === task) retrying = null; });
+  return task;
+}
