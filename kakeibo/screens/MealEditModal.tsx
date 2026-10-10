@@ -250,7 +250,9 @@ export default function MealEditModal({ target, onClose, onSaved }: Props) {
         dish: d.dish.trim(), portion: e.portion, nutrients: scaleNutrients(d.whole, e.portion),
         nutrientSource: d.nutrientSource, confidence: d.confidence, entryId: d.entryId, itemRefs: resolved.itemRefs,
         // 見分けられなかった在庫を選ぶまでは確認待ちのまま
-        status: resolved.choices.length > 0 ? 'needs_review' : 'edited', assignedBy: manual ? 'manual' : d.assignedBy,
+        // レシートから登録した印は、食べた人を直しても残す（「食べていない（在庫に戻す）」を出し続けるため）
+        status: resolved.choices.length > 0 ? 'needs_review' : 'edited',
+        assignedBy: d.assignedBy === 'receipt' ? 'receipt' : manual ? 'manual' : d.assignedBy,
         photoRefs: photoRef ? [photoRef] : photoRefs, rev: 0, sources: d.sources, updatedBy: me, updatedAt: '',
         choices: resolved.choices,
         // 触っていなければ前の値のまま（未設定なら食べた人の数で決まる）
@@ -482,7 +484,9 @@ export default function MealEditModal({ target, onClose, onSaved }: Props) {
           try {
             await deleteMeal(sheetName, mealId, baseRev, me);
             if (fromReceipt && loaded[0].entryId) {
-              await restoreEntryItems(loaded[0].entryId, loaded[0].eatenAt.slice(0, 7).replace('/', '-')).catch((e) =>
+              await restoreEntryItems(
+                loaded[0].entryId, loaded[0].eatenAt.slice(0, 7).replace('/', '-'), [...new Set(loaded.map((r) => r.dish))],
+              ).catch((e) =>
                 console.warn('[Meal] 在庫に戻せなかった:', e instanceof Error ? e.message : e));
             }
             onSaved();

@@ -25,8 +25,8 @@ import { CancelledError, QuotaExceededError } from '../providers/AIProvider';
 import * as ReceiptQueue from './ReceiptQueueService';
 import { saveReceiptRows } from './ReceiptProcessing';
 import {
-  MealResult, SavedReceipt, StoredAnalysis, analyzeCapturedPhoto, epochToTimestamp, linkReceiptToMeals, receiptCandidateOf,
-  recordMeal, retryPendingLinks,
+  MealResult, SavedReceipt, StoredAnalysis, analyzeCapturedPhoto, deferReceiptMeal, epochToTimestamp, linkReceiptToMeals,
+  receiptCandidateOf, recordMeal, retryPendingLinks,
 } from './MealProcessing';
 import { mealFromReceipt } from './ReceiptMeal';
 import { archiveMealPhoto, mealPhotoRef } from './PhotoStore';
@@ -343,9 +343,15 @@ export async function linkSavedReceipts(saved: ExpenseRow[]): Promise<void> {
   }
 }
 
-/** レシートから直後の食事を登録し、登録できたらトーストで知らせる */
+/** レシートから直後の食事を登録し、登録できたらトーストで知らせる。無料枠切れ・通信の失敗なら後でやり直す */
 async function registerReceiptMeal(receipt: SavedReceipt): Promise<void> {
-  const meal = await mealFromReceipt(receipt);
+  let meal: MealResult | null;
+  try {
+    meal = await mealFromReceipt(receipt);
+  } catch (e) {
+    if (!deferReceiptMeal(receipt, e)) console.warn('[OcrWorker] レシートから食事を登録できなかった:', e instanceof Error ? e.message : e);
+    return;
+  }
   if (!meal) return;
   emit({ type: 'saved', message: mealMessage(meal, 'レシートから食事を記録しました') });
   if (meal.sharedMeal) await ensureMealShared(meal.rows, meal.rows[0]?.updatedBy ?? '');

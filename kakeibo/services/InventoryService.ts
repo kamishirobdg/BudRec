@@ -195,6 +195,8 @@ export async function consume(list: Consumption[]): Promise<void> {
  */
 export async function consumeEntryItems(entryId: string, names: string[]): Promise<void> {
   try {
+    // レシートの登録の直前に作った使い回し（在庫の候補）には、この品目がまだ無いので読み直す
+    cache = null;
     const items = (await listInventory(true)).filter((i) => i.entryId === entryId && names.includes(i.name));
     for (const item of items) await writeState(item, 0, item.remainingPieces === null ? null : 0, 'used_up');
   } catch (e) {
@@ -203,11 +205,12 @@ export async function consumeEntryItems(entryId: string, names: string[]): Promi
 }
 
 /**
- * レシートから登録した食事を「食べていない」にしたとき、そのレシートの品目を買ったときの量に戻す
- * （食べきった扱いにしたものも含める）。
+ * レシートから登録した食事を「食べていない」にしたとき、その食事に入れた品目を買ったときの量に戻す
+ * （食べきった扱いにしたものも含める。同じレシートのほかの品目には触らない）。
  * @param month 'YYYY-MM'（レシートの月。食事の eaten_at はレシートと同じ日なので、その月）
+ * @param names 食事に入れた品名（食事の行の dish）
  */
-export async function restoreEntryItems(entryId: string, month: string): Promise<void> {
+export async function restoreEntryItems(entryId: string, month: string, names: string[]): Promise<void> {
   const client = await SheetsInternal.createClient();
   const sheet = `_items_${month}`;
   if (!(await SheetsInternal.listSheetNames(client, true)).includes(sheet)) return;
@@ -216,7 +219,7 @@ export async function restoreEntryItems(entryId: string, month: string): Promise
   });
   const items = ((res.data.values ?? []) as any[][])
     .map((c, i) => (i === 0 ? null : parseItem(c, i + 1, sheet)))
-    .filter((it): it is InventoryItem => it !== null && it.entryId === entryId);
+    .filter((it): it is InventoryItem => it !== null && it.entryId === entryId && names.includes(it.name));
   for (const item of items) await writeState(item, 1, item.pieces, 'in_stock');
 }
 

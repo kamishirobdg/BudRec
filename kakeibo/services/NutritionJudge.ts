@@ -183,6 +183,11 @@ export function paceOf(eatenMeals: number, mealsPerDay: number, isToday: boolean
   return Math.min(eatenMeals, mealsPerDay) / mealsPerDay;
 }
 
+/** 耐容上限量（食事摂取基準の UL）。無い栄養素・プロフィール未入力なら undefined */
+export function upperLimitOf(key: string, prefs: NutritionPrefs, now: Date = new Date()): number | undefined {
+  return driFor(key, prefs, now)?.UL;
+}
+
 /** プロフィールが入っているか（入っていなければ、自分の目標の分しか判定できない） */
 export function hasProfile(prefs: NutritionPrefs): boolean {
   return !!prefs.profile.birthDate && !!prefs.profile.sex;

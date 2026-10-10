@@ -84,29 +84,34 @@ function norm(s: string): string {
   return s.normalize('NFKC').toLowerCase().replace(/[\s　・･\-_/]/g, '');
 }
 
-/** 見出しの括弧書き（「ビタミンC(mg)」の (mg)）を外す。単位は別に返す */
+/** 見出しの括弧書き（「ビタミンC(mg)」の (mg)）を外す。単位は別に返す（全角の括弧・英字も受ける） */
 function splitHeader(h: string): { label: string; unit: string } {
-  const m = h.match(/^(.*?)\s*[（(]\s*([a-zA-Zµμ]+)\s*[)）]\s*$/);
-  return m ? { label: m[1].trim(), unit: m[2] } : { label: h.trim(), unit: '' };
+  const s = h.normalize('NFKC').trim();
+  const m = s.match(/^(.*?)\s*\(\s*([a-zA-Zμµ]+)\s*\)\s*$/);
+  return m ? { label: m[1].trim(), unit: m[2] } : { label: s, unit: '' };
 }
+
+const COLUMN_ORDER: Column[] = ['name', 'nutrient', 'unit', 'perUnit', 'perDay', 'note', 'amount'];
 
 function findColumns(header: string[]): Partial<Record<Column, number>> {
   const out: Partial<Record<Column, number>> = {};
-  (Object.keys(COLUMN_ALIASES) as Column[]).forEach((col) => {
-    const aliases = COLUMN_ALIASES[col].map(norm);
-    // 完全一致を先に、無ければ含むもの（「表示含有量」は amount の別名にあるので「含有量」より先に当たる）
-    let idx = header.findIndex((h) => aliases.includes(norm(h)));
-    if (idx < 0) idx = header.findIndex((h) => aliases.some((a) => norm(h).includes(a)));
-    if (idx >= 0) out[col] = idx;
-  });
-  // 「量」のような短い別名が成分名の列に当たらないよう、同じ列を 2 役にしない
   const used = new Set<number>();
-  for (const col of ['name', 'nutrient', 'unit', 'perUnit', 'perDay', 'note', 'amount'] as Column[]) {
-    const i = out[col];
-    if (i === undefined) continue;
-    if (used.has(i)) delete out[col];
-    else used.add(i);
+  const take = (col: Column, idx: number) => { out[col] = idx; used.add(idx); };
+  // 完全一致を先に（まだ決まっていない列から）
+  for (const col of COLUMN_ORDER) {
+    const aliases = COLUMN_ALIASES[col].map(norm);
+    const idx = header.findIndex((h, i) => !used.has(i) && aliases.includes(norm(h)));
+    if (idx >= 0) take(col, idx);
   }
+  // 無ければ含むもの（「含有量(mg)」）。「量」「値」のような 1 文字の別名は完全一致だけ（「表示の基準量」「食塩相当量」に当たる）
+  for (const col of COLUMN_ORDER) {
+    if (out[col] !== undefined) continue;
+    const aliases = COLUMN_ALIASES[col].map(norm).filter((a) => a.length >= 2);
+    const idx = header.findIndex((h, i) => !used.has(i) && aliases.some((a) => norm(h).includes(a)));
+    if (idx >= 0) take(col, idx);
+  }
+  // 横長（成分名の列が無い）なら含有量の列も無い。「摂取量」を含む栄養素の見出しを含有量と取り違えない
+  if (out.nutrient === undefined) delete out.amount;
   return out;
 }
 
@@ -163,6 +168,8 @@ const SALT_FACTORS: { key: string; words: string[]; factor: number }[] = [
   { key: 'THIA',   words: ['チアミン硝化物', '硝酸チアミン', 'チアミン塩化物塩酸塩', 'チアミン塩酸塩'], factor: 265.35 / 327.36 },
   { key: 'VITB6A', words: ['ピリドキシン塩酸塩'], factor: 169.18 / 205.64 },
   { key: 'VITC',   words: ['アスコルビン酸ナトリウム', 'アスコルビン酸na', 'アスコルビン酸カルシウム', 'アスコルビン酸ca'], factor: 176.12 / 198.11 },
+  // β-カロテンはレチノール活性当量で 1/12
+  { key: 'VITA_RAE', words: ['βカロテン', 'ベータカロテン', 'betacarotene'], factor: 1 / 12 },
 ];
 
 export interface MappedNutrient {
@@ -216,9 +223,12 @@ function findKey(n: string): string | null {
   return candidates[0].key;
 }
 
-/** 単位の表記を揃える（NFKC でマイクロ記号 µ はギリシャ文字の μ になる。mcg・ug も μg） */
+/**
+ * 単位の表記を揃える（NFKC でマイクロ記号 µ はギリシャ文字の μ になる。mcg・ug も μg）。
+ * ナイアシンの mgNE・ビタミン A の μgRAE / μgRE はアプリの単位と同じ意味なので、末尾を落とす
+ */
 function normUnit(u: string): string {
-  return u.normalize('NFKC').toLowerCase().replace(/\s/g, '').replace(/^(u|mc)g$/, 'μg');
+  return u.normalize('NFKC').toLowerCase().replace(/\s/g, '').replace(/(ne|rae|re)$/, '').replace(/^(u|mc)g$/, 'μg');
 }
 
 /** 単位を直す。直せなければ null */
@@ -241,9 +251,10 @@ function convertUnit(v: number, from: string, to: string, key: string): number |
 
 // ─── 商品ごとにまとめる ──────────────────────────────────────────────────────
 
-/** 「3粒」「4粒（半量）」「9錠（成人1回3錠×1日3回）」→ { count: 3, unit: '粒' } */
+/** 「3粒」「4粒（半量）」「9錠（成人1回3錠×1日3回）」「1日2粒」→ { count: 3, unit: '粒' }（単位付きの数を先に探す） */
 export function parseServing(s: string): { count: number; unit: string } | null {
-  const m = s.normalize('NFKC').match(/(\d+(?:\.\d+)?)\s*(粒|錠|包|本|カプセル|cap|カプセル|袋|g|ml|回分|個|枚|スティック)?/i);
+  const t = s.normalize('NFKC');
+  const m = t.match(/(\d+(?:\.\d+)?)\s*(粒|錠|包|本|カプセル|cap|袋|g|ml|回分|個|枚|スティック)/i) ?? t.match(/(\d+(?:\.\d+)?)/);
   if (!m) return null;
   return { count: Number(m[1]), unit: m[2] ? m[2].replace(/^cap$/i, 'カプセル') : '' };
 }
@@ -331,11 +342,13 @@ function fromWide(header: string[], rows: string[][], cols: Partial<Record<Colum
     .map((h, i) => ({ i, ...splitHeader(h) }))
     .filter((c) => !fixed.has(c.i) && c.label);
   let skipped = 0;
-  const supplements: ImportedSupplement[] = [];
+  // 同じ商品が 2 行あれば 1 つにまとめる（栄養は足す）
+  const accs = new Map<string, Acc>();
   for (const r of rows) {
     const name = cols.name !== undefined ? r[cols.name] ?? '' : '';
     if (!name) { skipped++; continue; }
-    const acc = newAcc(name);
+    const acc = accs.get(name) ?? newAcc(name);
+    accs.set(name, acc);
     const serving = cols.perUnit !== undefined ? parseServing(r[cols.perUnit] ?? '') : null;
     const daily = cols.perDay !== undefined ? parseServing(r[cols.perDay] ?? '') : null;
     const unitCol = cols.unit !== undefined ? r[cols.unit] ?? '' : '';
@@ -355,9 +368,8 @@ function fromWide(header: string[], rows: string[][], cols: Partial<Record<Colum
       if (mapped) acc.nutrients[mapped.key] = (acc.nutrients[mapped.key] ?? 0) + mapped.value;
       else addOther(acc, c.label, amount, m?.[2] ?? c.unit);
     }
-    supplements.push(finish(acc));
   }
-  return { supplements, skipped };
+  return { supplements: [...accs.values()].map(finish), skipped };
 }
 
 function trimNumber(v: number): string {

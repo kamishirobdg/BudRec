@@ -6,7 +6,7 @@ import Svg, { Circle, Line, Polyline, Rect, Text as SvgText } from 'react-native
 import { NUTRIENTS, nutrientDef } from '../../services/Nutrients';
 import type { NutritionPrefs } from '../../services/NutritionPrefsService';
 import { Judgement, NutrientStatus } from '../../services/NutritionJudge';
-import { ADVICE_DISCLAIMER, Advice, MIN_RECORDED_DAYS, SupplementAction } from '../../services/AdviceService';
+import { ADVICE_DISCLAIMER, Advice, SupplementAction, minRecordedDays } from '../../services/AdviceService';
 
 interface Props {
   /** 古い順の日付と、その日の判定（記録の無い日は null） */
@@ -38,7 +38,8 @@ function AdviceCard({ advice, recordedDays, advising, onAdvise, span, autoAdvice
   advice: Advice | null; recordedDays: number; advising: boolean; onAdvise: () => void; span: 7 | 30;
   autoAdvice: boolean; onAutoAdvice: (v: boolean) => void;
 }) {
-  const enough = recordedDays >= MIN_RECORDED_DAYS;
+  const need = minRecordedDays(span);
+  const enough = recordedDays >= need;
   return (
     <View style={styles.card}>
       <View style={styles.adviceHead}>
@@ -76,7 +77,7 @@ function AdviceCard({ advice, recordedDays, advising, onAdvise, span, autoAdvice
       <TouchableOpacity style={[styles.btn, (advising || !enough) && styles.disabled]} onPress={onAdvise} disabled={advising || !enough}>
         {advising
           ? <ActivityIndicator color="#1f2937" />
-          : <Text style={styles.btnText}>{!enough ? `記録が ${MIN_RECORDED_DAYS} 日分たまったら` : advice ? '提案を作り直す' : '提案を作る'}</Text>}
+          : <Text style={styles.btnText}>{!enough ? `記録が ${need} 日分たまったら` : advice ? '提案を作り直す' : '提案を作る'}</Text>}
       </TouchableOpacity>
     </View>
   );

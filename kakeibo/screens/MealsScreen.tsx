@@ -12,7 +12,7 @@ import {
   Supplement, SupplementSkip, loadSupplements, setSkipped, supplementNutrients, supplementsOn,
 } from '../services/SupplementService';
 import {
-  Advice, AdviceInput, DayJudgement, MIN_RECORDED_DAYS, generateAdvice, lastWeek, latestAdvice, loadAdvice,
+  Advice, AdviceInput, DayJudgement, generateAdvice, lastWeek, latestAdvice, loadAdvice, minRecordedDays,
 } from '../services/AdviceService';
 import { cachedLoad, writeCache } from '../services/LocalCache';
 import MealEditModal, { MealTarget } from './MealEditModal';
@@ -37,15 +37,16 @@ function dayLabel(day: string): string {
 
 type Sups = { supplements: Supplement[]; skips: SupplementSkip[] };
 
-/** endDay までの span 日ぶんを、日ごとに判定する（推移のグラフ・提案に使う） */
+/** endDay までの span 日ぶんを、日ごとに判定する（推移のグラフ・提案に使う）。withSupplements = false なら食事だけ */
 function judgeDays(
   groups: (MealGroup & { day: string })[], me: string, sups: Sups, prefs: NutritionPrefs, endDay: string, span: number,
+  withSupplements = true,
 ): DayJudgement[] {
   const out: DayJudgement[] = [];
   for (let i = span - 1; i >= 0; i--) {
     const d = shiftDay(endDay, -i);
     const mine = groups.filter((g) => g.day === d).flatMap((g) => g.rows.filter((r) => r.user === me).map((r) => r.nutrients));
-    const supN = supplementNutrients(supplementsOn(me, d, sups.supplements, sups.skips));
+    const supN = withSupplements ? supplementNutrients(supplementsOn(me, d, sups.supplements, sups.skips)) : [];
     // 食事の記録が無い日は推移に入れない（サプリだけの日を「食べていない日」として数えない）
     if (mine.length === 0) {
       out.push({ day: d, statuses: null });
@@ -146,7 +147,9 @@ export default function MealsScreen() {
           .then((entries) => { setPrefsMap(new Map(entries)); setPrefsReady(true); }),
         cachedLoad('supplements', loadSupplements, setSups).then(setSups),
         cachedLoad('activity', loadActivity, setActivity).then(setActivity).catch(() => {}),
-        cachedLoad('advice', loadAdvice, setAdvice).then((list) => { setAdvice(list); setAdviceReady(true); }).catch(() => {}),
+        // 控えを返しただけ（通信に失敗）では ready にしない（cachedLoad は失敗時に控えを返す）
+        cachedLoad('advice', async () => { const list = await loadAdvice(); setAdviceReady(true); return list; }, setAdvice)
+          .then(setAdvice).catch(() => {}),
         loadMonths(monthsRef.current),
       ]);
     } catch (e) {
@@ -204,7 +207,10 @@ export default function MealsScreen() {
   /** endDay までの期間の記録から提案を作り、一覧と端末の控えに足す。記録が足りなければ null */
   const makeAdvice = useCallback(async (endDay: string, s: 7 | 30, auto: boolean): Promise<Advice | null> => {
     const days = judgeDays(groups, me, sups, judgedPrefs, endDay, s);
-    const input: AdviceInput = { user: me, prefs: judgedPrefs, days, supplements: periodSupplements(days.map((d) => d.day), me, sups) };
+    const foodOnly = judgeDays(groups, me, sups, judgedPrefs, endDay, s, false);
+    const input: AdviceInput = {
+      user: me, prefs: judgedPrefs, days, foodOnly, supplements: periodSupplements(days.map((d) => d.day), me, sups),
+    };
     const a = await generateAdvice(input, s, auto);
     if (a) {
       setAdvice((prev) => {
@@ -220,7 +226,7 @@ export default function MealsScreen() {
     if (advising) return;
     setAdvising(true);
     try {
-      if (!(await makeAdvice(day, span, false))) Alert.alert(`記録が ${MIN_RECORDED_DAYS} 日分たまったら作れます`);
+      if (!(await makeAdvice(day, span, false))) Alert.alert(`記録が ${minRecordedDays(span)} 日分たまったら作れます`);
     } catch (e) {
       Alert.alert('提案を作れませんでした', e instanceof Error ? e.message : String(e));
     } finally {

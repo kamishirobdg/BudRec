@@ -54,6 +54,25 @@ export function timestampToEpoch(ts: string): number | null {
   return new Date(+m[1], +m[2] - 1, +m[3], +(m[4] ?? 0), +(m[5] ?? 0), +(m[6] ?? 0)).getTime();
 }
 
+/** この時刻より前に買ったものは昼食として入れる（§5.7） */
+const MORNING_UNTIL = 10;
+const LUNCH_HOUR = 12;
+
+/** レシートから登録する食事の時刻。朝に買ったものは昼食にする */
+export function mealTimeOf(boughtAt: number): number {
+  const d = new Date(boughtAt);
+  if (d.getHours() < MORNING_UNTIL) d.setHours(LUNCH_HOUR, 0, 0, 0);
+  return d.getTime();
+}
+
+/**
+ * レシートと食事の時刻の近さ。朝に買ったレシートは昼食（12:00）として登録されるので、買った時刻と
+ * 食べる時刻のどちらに近いかで見る（朝のレシートと昼の写真を同じ食事にする）
+ */
+function receiptDistance(receiptAt: number, mealAt: number): number {
+  return Math.min(Math.abs(receiptAt - mealAt), Math.abs(mealTimeOf(receiptAt) - mealAt));
+}
+
 /** 前後の月のシート名（境目をまたぐ突き合わせ用） */
 function monthsAround(ms: number): string[] {
   const d = new Date(ms);
@@ -90,7 +109,7 @@ async function findReceiptNear(shotAt: number): Promise<ReceiptCandidate | null>
     for (const c of values.slice(1)) {
       const entryId = c[1] ?? '';
       const at = timestampToEpoch(c[2] ?? '');
-      if (!entryId || at === null || Math.abs(at - shotAt) > LINK_WINDOW_MS) continue;
+      if (!entryId || at === null || receiptDistance(at, shotAt) > LINK_WINDOW_MS) continue;
       if ((c[10] ?? '') === 'non_food') continue;
       const cand = byEntry.get(entryId) ?? { entryId, store: c[4] ?? '', timestamp: c[2] ?? '', at, lines: [] };
       cand.lines.push({ index: cand.lines.length, name: c[6] || c[5] || '', price: Number(c[9]) || 0 });
@@ -104,7 +123,7 @@ async function findReceiptNear(shotAt: number): Promise<ReceiptCandidate | null>
   }
   const list = [...byEntry.values()].filter((c) => live.has(c.entryId));
   if (list.length === 0) return null;
-  list.sort((a, b) => Math.abs(a.at - shotAt) - Math.abs(b.at - shotAt));
+  list.sort((a, b) => receiptDistance(a.at, shotAt) - receiptDistance(b.at, shotAt));
   return list[0];
 }
 
@@ -317,18 +336,26 @@ export async function recordMeal(
   opts: RecordMealOptions = {},
 ): Promise<MealResult> {
   const { signal } = opts;
-  const { dishes, inventory, mealId, photographer, partner } = a;
-  const linked = receipt ?? (dishes.some((d) => d.kind !== 'home' && d.used.length === 0) ? await findReceiptNear(shotAt) : null);
+  const { inventory, mealId, photographer, partner } = a;
+  let { dishes } = a;
+  /** レシートの品にあたる料理（外食・商品で、在庫の品ではないもの） */
+  const fromReceipt = (d: IdentifiedDish) => d.kind !== 'home' && d.used.length === 0;
+  let linked = receipt ?? (dishes.some(fromReceipt) ? await findReceiptNear(shotAt) : null);
 
-  // レシートから登録した食事（§5.7）が既にあれば、この写真はその食事のものとして付けるだけ（二重に記録しない）
-  if (linked && photoRef && !opts.lineMatches && dishes.every((d) => d.kind !== 'home')) {
+  // レシートから登録した食事（§5.7）が既にあれば、レシートの品にあたる料理は記録せず、その食事に写真を付けるだけ。
+  // 一緒に写った自炊・在庫の品だけを新しく記録する（それも無ければ付けて終わり）
+  if (linked && photoRef && !opts.lineMatches && dishes.some(fromReceipt)) {
     const existing = await mealForReceipt(linked.entryId, linked.at);
     if (existing?.some((r) => r.assignedBy === 'receipt')) {
       const rows = await attachPhoto(existing, photoRef, photographer);
-      return {
-        mealId: existing[0].mealId, sheetName: existing[0].sheetName ?? mealsSheetName(existing[0].eatenAt),
-        needsReview: false, sharedMeal: new Set(existing.map((r) => r.user)).size > 1, rows, authFailed: false, attached: true,
-      };
+      dishes = dishes.filter((d) => !fromReceipt(d));
+      if (dishes.length === 0) {
+        return {
+          mealId: existing[0].mealId, sheetName: existing[0].sheetName ?? mealsSheetName(existing[0].eatenAt),
+          needsReview: false, sharedMeal: new Set(existing.map((r) => r.user)).size > 1, rows, authFailed: false, attached: true,
+        };
+      }
+      linked = null;
     }
   }
 
@@ -567,23 +594,24 @@ export async function linkReceiptToMeals(receipt: SavedReceipt, signal?: AbortSi
     if (food.length === 0 || at === null) return 'skipped';
 
     const rows = (await Promise.all(monthsAround(at).map((m) => getMeals(m)))).flat();
-    // 食事単位で見る。どの行にもまだレシートが無く、手で直されていない、外食・商品を含む食事だけ
+    // 食事単位で見る。時間の近い、外食・商品を含む食事のうち、どの行にもまだレシートが無く、手で直されていないものだけ
     const byMeal = new Map<string, MealRow[]>();
     for (const r of rows) byMeal.set(r.mealId, [...(byMeal.get(r.mealId) ?? []), r]);
-    const candidates = [...byMeal.values()]
-      .filter((list) =>
-        list.every((r) => !r.entryId && r.status !== 'edited') &&
-        list.some((r) => r.kind !== 'home'))
-      .map((list) => list[0])
-      .filter((r) => {
-        const t = timestampToEpoch(r.eatenAt);
-        return t !== null && Math.abs(t - at) <= LINK_WINDOW_MS;
+    const nearby = [...byMeal.values()]
+      .filter((list) => list.some((r) => r.kind !== 'home'))
+      .filter((list) => {
+        const t = timestampToEpoch(list[0].eatenAt);
+        return t !== null && receiptDistance(at, t) <= LINK_WINDOW_MS;
       });
-    if (candidates.length === 0) return 'none';
+    const candidates = nearby
+      .filter((list) => list.every((r) => !r.entryId && r.status !== 'edited'))
+      .map((list) => list[0]);
+    // 近くに食事はあるが、編集済み・別のレシート付き（このレシートの食事を含む）。同じ食事かもしれないので作らない
+    if (candidates.length === 0) return nearby.length > 0 ? 'skipped' : 'none';
 
     // いちばん近い食事 1 回分だけにひも付ける
     const nearest = candidates.reduce((a, b) =>
-      Math.abs(timestampToEpoch(a.eatenAt)! - at) <= Math.abs(timestampToEpoch(b.eatenAt)! - at) ? a : b);
+      receiptDistance(at, timestampToEpoch(a.eatenAt)!) <= receiptDistance(at, timestampToEpoch(b.eatenAt)!) ? a : b);
     const mealRows = rows.filter((r) => r.mealId === nearest.mealId);
     const sheetName = nearest.sheetName ?? mealsSheetName(nearest.eatenAt);
     const baseRev = mealRev(mealRows);
@@ -656,6 +684,16 @@ interface PendingLink {
   receipt:   SavedReceipt;
   notBefore: number;
   attempts:  number;
+}
+
+/**
+ * レシートから直後の食事を登録するのが無料枠切れ・通信の失敗で止まったときに、ひも付け直しと同じ仕組みで後でやり直す
+ * （やり直しでまた 'none' なら登録する）
+ */
+export function deferReceiptMeal(receipt: SavedReceipt, e: unknown): boolean {
+  if (!(e instanceof QuotaExceededError || (axios.isAxiosError(e) && !e.response))) return false;
+  deferLink(receipt, e instanceof QuotaExceededError ? e.retryAt : Date.now() + LINK_RETRY_MS);
+  return true;
 }
 
 function deferLink(receipt: SavedReceipt, notBefore: number): void {
