@@ -41,6 +41,7 @@ import { clearCache } from '../services/LocalCache';
 import * as LastBatch from '../services/LastBatchService';
 import * as Demo from '../services/DemoService';
 import { FOOD_TABLE_CREDIT } from '../services/FoodTable';
+import * as Application from 'expo-application';
 import { runGmailImport, getSkippedMessageSummaries, SkippedMessageSummary } from '../services/GmailService';
 import { useGmailProgress } from '../services/GmailProgressService';
 import FoodResearchCard from '../components/FoodResearchCard';
@@ -709,6 +710,7 @@ export default function SettingsScreen({ onSignedOut }: Props) {
               <Text style={styles.signOutBtnText}>サインアウト</Text>
             </TouchableOpacity>
             <Text style={styles.credit}>食品の栄養の一部は「{FOOD_TABLE_CREDIT}」</Text>
+            <Text style={styles.version}>v{Application.nativeApplicationVersion ?? '?'}</Text>
           </View>
         }
       />
@@ -884,6 +886,7 @@ const styles = StyleSheet.create({
   signOutBtn:     { borderRadius: 14, paddingVertical: 14, alignItems: 'center', backgroundColor: '#fff' },
   signOutBtnText: { color: '#e53935', fontSize: 15, fontWeight: '600' },
   credit:         { marginTop: 16, color: '#9e9e9e', fontSize: 11, textAlign: 'center' },
+  version:        { marginTop: 4, color: '#9e9e9e', fontSize: 11, textAlign: 'center' },
 
   skippedModalContainer: {
     flex: 1,
