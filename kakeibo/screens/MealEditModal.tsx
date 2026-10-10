@@ -30,7 +30,7 @@ import { findFood, loadFoods, researchNow, saveResearched } from '../services/Fo
 import { NutritionLabel, readNutritionLabel } from '../services/LabelReader';
 import NutrientEditModal from '../components/NutrientEditModal';
 import * as ImagePicker from 'expo-image-picker';
-import { consume, listInventory } from '../services/InventoryService';
+import { consume, listInventory, restoreEntryItems } from '../services/InventoryService';
 import FoodThumb from '../components/FoodThumb';
 
 export type MealTarget =
@@ -467,17 +467,24 @@ export default function MealEditModal({ target, onClose, onSaved }: Props) {
     }
   };
 
+  /** レシートから直後の食事として登録したもの（§5.7）。外すときは買った品を在庫に戻す */
+  const fromReceipt = loaded.length > 0 && loaded.every((r) => r.assignedBy === 'receipt');
+
   const handleDelete = () => {
-    Alert.alert('この食事を削除しますか？', undefined, [
+    Alert.alert(fromReceipt ? '食べていない食事として外しますか？' : 'この食事を削除しますか？', fromReceipt ? '買った品は在庫に戻ります' : undefined, [
       { text: 'キャンセル', style: 'cancel' },
       {
-        text: '削除する',
+        text: fromReceipt ? '外す' : '削除する',
         style: 'destructive',
         onPress: async () => {
           if (!sheetName) { onSaved(); return; }
           setSaving(true);
           try {
             await deleteMeal(sheetName, mealId, baseRev, me);
+            if (fromReceipt && loaded[0].entryId) {
+              await restoreEntryItems(loaded[0].entryId, loaded[0].eatenAt.slice(0, 7).replace('/', '-')).catch((e) =>
+                console.warn('[Meal] 在庫に戻せなかった:', e instanceof Error ? e.message : e));
+            }
             onSaved();
           } catch (e) {
             if (e instanceof MealConflictError) {
@@ -718,7 +725,7 @@ export default function MealEditModal({ target, onClose, onSaved }: Props) {
                     <Text style={styles.link}>以前の内容に戻す</Text>
                   </TouchableOpacity>
                   <TouchableOpacity onPress={handleDelete}>
-                    <Text style={styles.danger}>この食事を削除</Text>
+                    <Text style={styles.danger}>{fromReceipt ? '食べていない（在庫に戻す）' : 'この食事を削除'}</Text>
                   </TouchableOpacity>
                 </View>
               )}

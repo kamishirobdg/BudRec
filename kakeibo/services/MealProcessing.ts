@@ -246,6 +246,35 @@ export interface MealResult {
   rows:        MealRow[];
   /** 未送信に積んだうえで再サインインが要る状態になった（記録は後で届く） */
   authFailed:  boolean;
+  /** 新しく記録せず、レシートから登録してあった食事（§5.7）に写真を付けただけ */
+  attached?:   boolean;
+}
+
+export interface RecordMealOptions {
+  signal?:      AbortSignal;
+  /** 料理 → レシートの品目の対応が分かっているとき（レシートから登録する場合）。Gemini に対応付けさせない */
+  lineMatches?: (number | null)[];
+  /** 自動で決めた割り振りを確かめてもらう（二人分をレシートから登録したとき） */
+  forceReview?: boolean;
+  assignedBy?:  MealRow['assignedBy'];
+}
+
+/** そのレシートにひも付いた食事（削除済みを除く）。無ければ null */
+export async function mealForReceipt(entryId: string, at: number): Promise<MealRow[] | null> {
+  const rows = (await Promise.all(monthsAround(at).map((m) => getMeals(m)))).flat().filter((r) => r.entryId === entryId);
+  return rows.length > 0 ? rows : null;
+}
+
+/** レシートから登録した食事に、後で撮った写真を付ける。相手が編集中なら付けない */
+async function attachPhoto(rows: MealRow[], photoRef: string, user: string): Promise<MealRow[]> {
+  const next = rows.map((r) => ({ ...r, photoRefs: r.photoRefs.includes(photoRef) ? r.photoRefs : [...r.photoRefs, photoRef] }));
+  const sheetName = rows[0].sheetName ?? mealsSheetName(rows[0].eatenAt);
+  try {
+    return await saveMeal(sheetName, rows[0].mealId, next, mealRev(rows), user);
+  } catch (e) {
+    if (e instanceof MealConflictError) return rows;
+    throw e;
+  }
 }
 
 /**
@@ -285,14 +314,30 @@ export async function recordMeal(
   shotAt: number,
   photoRef: string | null,
   receipt: ReceiptCandidate | null,
-  signal?: AbortSignal,
+  opts: RecordMealOptions = {},
 ): Promise<MealResult> {
+  const { signal } = opts;
   const { dishes, inventory, mealId, photographer, partner } = a;
   const linked = receipt ?? (dishes.some((d) => d.kind !== 'home' && d.used.length === 0) ? await findReceiptNear(shotAt) : null);
+
+  // レシートから登録した食事（§5.7）が既にあれば、この写真はその食事のものとして付けるだけ（二重に記録しない）
+  if (linked && photoRef && !opts.lineMatches && dishes.every((d) => d.kind !== 'home')) {
+    const existing = await mealForReceipt(linked.entryId, linked.at);
+    if (existing?.some((r) => r.assignedBy === 'receipt')) {
+      const rows = await attachPhoto(existing, photoRef, photographer);
+      return {
+        mealId: existing[0].mealId, sheetName: existing[0].sheetName ?? mealsSheetName(existing[0].eatenAt),
+        needsReview: false, sharedMeal: new Set(existing.map((r) => r.user)).size > 1, rows, authFailed: false, attached: true,
+      };
+    }
+  }
+
   // 自炊の料理はレシートの品目と突き合わせない（「親子丼」が「鶏もも肉」にならないように）
   const targets = dishes.map((_, i) => i).filter((i) => dishes[i].kind !== 'home' && dishes[i].used.length === 0);
   const matches: (number | null)[] = dishes.map(() => null);
-  if (linked && targets.length > 0) {
+  if (linked && opts.lineMatches) {
+    opts.lineMatches.forEach((m, i) => { matches[i] = m; });
+  } else if (linked && targets.length > 0) {
     const m = await matchReceiptItems(linked.store, targets.map((i) => dishes[i].name), linked.lines, signal);
     targets.forEach((i, k) => { matches[i] = m[k]; });
   }
@@ -397,6 +442,7 @@ export async function recordMeal(
   const eatenAt = epochToTimestamp(shotAt);
   const unmatched = linked !== null && dishes.some((d, i) => d.kind !== 'home' && d.used.length === 0 && matches[i] === null);
   const needsReview =
+    !!opts.forceReview ||
     servings.some((s) => s.unsure) ||
     dishes.some((d) => d.confidence === 'low' || d.choices.length > 0) ||
     unmatched;
@@ -417,7 +463,7 @@ export async function recordMeal(
         dish: nameOf(s.dishIndex), kind: d.kind, store: storeOf(s.dishIndex),
         result: whole[s.dishIndex]!, dishConfidence: d.confidence,
         entryId: d.kind !== 'home' && matches[s.dishIndex] !== null && linked ? linked.entryId : '',
-        photoRef, sources, updatedBy: photographer, itemRefs, choices,
+        photoRef, sources, updatedBy: photographer, itemRefs, choices, assignedBy: opts.assignedBy,
       }));
     }
   }
@@ -465,7 +511,7 @@ function buildRow(p: {
   dish: string; kind: IdentifiedDish['kind']; store: string;
   result: NutritionResult; dishConfidence: IdentifiedDish['confidence'];
   entryId: string; photoRef: string | null; sources: string[]; updatedBy: string;
-  itemRefs: ItemRef[]; choices: ItemChoice[];
+  itemRefs: ItemRef[]; choices: ItemChoice[]; assignedBy?: MealRow['assignedBy'];
 }): MealRow {
   const confidence: Confidence =
     p.dishConfidence === 'low' ? 'low' :
@@ -478,7 +524,7 @@ function buildRow(p: {
     nutrients: scaleNutrients(p.result.nutrients, p.portion),
     nutrientSource: p.result.official ? 'grounding' : p.result.tableSources ? 'food_table' : 'estimate',
     confidence,
-    entryId: p.entryId, itemRefs: p.itemRefs, status: 'estimated', assignedBy: 'auto',
+    entryId: p.entryId, itemRefs: p.itemRefs, status: 'estimated', assignedBy: p.assignedBy ?? 'auto',
     photoRefs: p.photoRef ? [p.photoRef] : [],
     rev: 1, sources: p.result.tableSources ?? p.sources, updatedBy: p.updatedBy, updatedAt: p.eatenAt, choices: p.choices,
   };
@@ -495,19 +541,30 @@ export interface SavedReceipt {
   timestamp: string;
   store:     string;
   items:     ReceiptItem[];
+  /** レシートから直後の食事を登録するのに使う（§5.7。前の版の未処理ファイルには無い） */
+  user?:     string;
+  source?:   string;
+  category?: string;
+  servings?: number;
 }
+
+/**
+ * linked = ひも付けた / none = ひも付ける食事が無かった（レシートから食事を登録してよい）/
+ * skipped = 対応しない品があった・相手が編集中・失敗して後でやり直す（食事を登録しない）
+ */
+export type LinkResult = 'linked' | 'none' | 'skipped';
 
 /**
  * 登録したレシートの前後 3 時間に、まだレシートの無い外食・商品の食事があればひも付け、
  * レシートの正式な品名で栄養を引き直す。失敗しても投げない（レシートの登録は済んでいる）。
  * 相手が同じ食事を編集していたら触らない（rev が変わっていれば保存を諦める）。
  */
-export async function linkReceiptToMeals(receipt: SavedReceipt, signal?: AbortSignal): Promise<void> {
+export async function linkReceiptToMeals(receipt: SavedReceipt, signal?: AbortSignal): Promise<LinkResult> {
   try {
-    if (await Demo.isDemo()) return;
+    if (await Demo.isDemo()) return 'skipped';
     const food = receipt.items.filter((it) => it.kind !== 'non_food');
     const at = timestampToEpoch(receipt.timestamp);
-    if (food.length === 0 || at === null) return;
+    if (food.length === 0 || at === null) return 'skipped';
 
     const rows = (await Promise.all(monthsAround(at).map((m) => getMeals(m)))).flat();
     // 食事単位で見る。どの行にもまだレシートが無く、手で直されていない、外食・商品を含む食事だけ
@@ -522,7 +579,7 @@ export async function linkReceiptToMeals(receipt: SavedReceipt, signal?: AbortSi
         const t = timestampToEpoch(r.eatenAt);
         return t !== null && Math.abs(t - at) <= LINK_WINDOW_MS;
       });
-    if (candidates.length === 0) return;
+    if (candidates.length === 0) return 'none';
 
     // いちばん近い食事 1 回分だけにひも付ける
     const nearest = candidates.reduce((a, b) =>
@@ -539,7 +596,8 @@ export async function linkReceiptToMeals(receipt: SavedReceipt, signal?: AbortSi
     // 自炊の品はレシートに対応付けない
     const matchedIdx = dishIds.map((_, i) => i).filter((i) =>
       matches[i] !== null && mealRows.find((r) => r.dishId === dishIds[i])!.kind !== 'home');
-    if (matchedIdx.length === 0) return;
+    // 近くに食事はあるが品目が対応しない。別の食事かもしれないが、二重に登録しないよう作らない
+    if (matchedIdx.length === 0) return 'skipped';
     const queries: NutritionQuery[] = matchedIdx.map((i) => ({
       store: receipt.store,
       name:  lines[matches[i]!].name,
@@ -572,13 +630,15 @@ export async function linkReceiptToMeals(receipt: SavedReceipt, signal?: AbortSi
     const saved = await saveMeal(sheetName, nearest.mealId, next, baseRev, user);
     // 二人の食事なら、ひも付いたレシートの写真も相手に見せる
     await ensureMealShared(saved, user);
+    return 'linked';
   } catch (e) {
-    if (e instanceof MealConflictError) return; // 相手が編集中。そちらを優先する
+    if (e instanceof MealConflictError) return 'skipped'; // 相手が編集中。そちらを優先する
     console.warn('[Meal] レシートとのひも付けに失敗:', e instanceof Error ? e.message : e);
     // 無料枠切れ・通信の失敗なら後でやり直す（食事が推定値のまま残らないように）
     if (e instanceof QuotaExceededError || (axios.isAxiosError(e) && !e.response)) {
       deferLink(receipt, e instanceof QuotaExceededError ? e.retryAt : Date.now() + LINK_RETRY_MS);
     }
+    return 'skipped';
   }
 }
 
@@ -608,8 +668,11 @@ function deferLink(receipt: SavedReceipt, notBefore: number): void {
 
 let retrying: Promise<void> | null = null;
 
-/** 時刻を過ぎたひも付け直しをやり直す（アプリが前面に来たとき・定期実行で呼ぶ）。失敗しても投げない */
-export function retryPendingLinks(now: number = Date.now()): Promise<void> {
+/**
+ * 時刻を過ぎたひも付け直しをやり直す（アプリが前面に来たとき・定期実行で呼ぶ）。失敗しても投げない
+ * @param onUnlinked ひも付ける食事が無かったときに呼ぶ（レシートから直後の食事を登録する。§5.7）
+ */
+export function retryPendingLinks(onUnlinked?: (receipt: SavedReceipt) => Promise<void>, now: number = Date.now()): Promise<void> {
   if (retrying) return retrying;
   // 対象が無いと await を通らずに終わるので、`??=` で代入すると終わった後の Promise が残り続ける。
   // 代入してから、終わったら外す
@@ -624,7 +687,8 @@ export function retryPendingLinks(now: number = Date.now()): Promise<void> {
         // 回数を増やして積み直す
         const rest = readJsonArray<PendingLink>(PENDING_LINKS_FILE).filter((x) => x.receipt.entryId !== p.receipt.entryId);
         writeJson(PENDING_LINKS_FILE, [...rest, { ...p, notBefore: IN_PROGRESS }]);
-        await linkReceiptToMeals(p.receipt);
+        const result = await linkReceiptToMeals(p.receipt);
+        if (result === 'none' && onUnlinked) await onUnlinked(p.receipt).catch(() => {});
         const after = readJsonArray<PendingLink>(PENDING_LINKS_FILE);
         const mine = after.find((x) => x.receipt.entryId === p.receipt.entryId);
         // 積み直されていなければ（成功・対象なし）外す

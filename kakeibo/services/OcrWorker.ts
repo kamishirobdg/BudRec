@@ -25,9 +25,10 @@ import { CancelledError, QuotaExceededError } from '../providers/AIProvider';
 import * as ReceiptQueue from './ReceiptQueueService';
 import { saveReceiptRows } from './ReceiptProcessing';
 import {
-  MealResult, StoredAnalysis, analyzeCapturedPhoto, epochToTimestamp, linkReceiptToMeals, receiptCandidateOf, recordMeal,
-  retryPendingLinks,
+  MealResult, SavedReceipt, StoredAnalysis, analyzeCapturedPhoto, epochToTimestamp, linkReceiptToMeals, receiptCandidateOf,
+  recordMeal, retryPendingLinks,
 } from './MealProcessing';
+import { mealFromReceipt } from './ReceiptMeal';
 import { archiveMealPhoto, mealPhotoRef } from './PhotoStore';
 import { mealExists, mealsSheetName } from './MealService';
 import { existingEntryIds } from './SheetsService';
@@ -112,7 +113,7 @@ export function cancel(): void {
 export function kick(): void {
   if (ReceiptQueue.promoteDeferred() > 0) emit({ type: 'changed' });
   // 無料枠切れ・圏外でできなかったレシートのひも付け直し（時刻を過ぎたものだけ）
-  void retryPendingLinks();
+  void retryPendingLinks(registerReceiptMeal);
   if (running || queuedCount() === 0) return;
   loopPromise = runLoop();
 }
@@ -120,7 +121,7 @@ export function kick(): void {
 /** 定期実行から呼ぶ。処理が終わるまで待つ（定期実行はこの Promise が終わると打ち切られる） */
 export async function runPending(): Promise<void> {
   kick();
-  await retryPendingLinks();
+  await retryPendingLinks(registerReceiptMeal);
   while (loopPromise) {
     const p = loopPromise;
     await p;
@@ -297,11 +298,7 @@ async function writeAnalysis(item: ReceiptQueue.ReceiptItem, a: StoredAnalysis):
   if (a.dishes.length > 0) archiveMealPhoto(item.uri, true);
   if (a.dishes.length > 0 && !(await mealExists(mealsSheetName(epochToTimestamp(shotAt)), a.mealId))) {
     meal = await recordMeal(a, shotAt, mealPhotoRef(item.uri), saved[0] ? receiptCandidateOf(saved[0]) : null);
-    const dishes = [...new Set(meal.rows.map((x) => x.dish))];
-    messages.push([
-      meal.needsReview ? '食事を記録しました（要確認）' : '食事を記録しました',
-      dishes.slice(0, 3).join('・') + (dishes.length > 3 ? ` ほか ${dishes.length - 3} 品` : ''),
-    ].join('\n'));
+    messages.push(mealMessage(meal, meal.attached ? 'レシートから登録した食事に写真を付けました' : '食事を記録しました'));
   }
 
   if (a.receiptRows.length > 1) {
@@ -323,12 +320,35 @@ async function writeAnalysis(item: ReceiptQueue.ReceiptItem, a: StoredAnalysis):
   return 'done';
 }
 
-/** 登録したレシートを、前後の時間の食事にひも付け直す（品目のあるものだけ） */
+function mealMessage(meal: MealResult, title: string): string {
+  const dishes = [...new Set(meal.rows.map((x) => x.dish))];
+  return [
+    meal.needsReview && !meal.attached ? `${title}（要確認）` : title,
+    dishes.slice(0, 3).join('・') + (dishes.length > 3 ? ` ほか ${dishes.length - 3} 品` : ''),
+  ].join('\n');
+}
+
+/**
+ * 登録したレシートを、前後の時間の食事にひも付け直す（品目のあるものだけ）。
+ * ひも付ける食事が無く、買ってすぐ食べる買い物なら、レシートから直後の食事を登録する（§5.7）
+ */
 export async function linkSavedReceipts(saved: ExpenseRow[]): Promise<void> {
   for (const row of saved) {
     if (!row.entryId || !row.items || row.items.length === 0) continue;
-    await linkReceiptToMeals({ entryId: row.entryId, timestamp: row.timestamp, store: row.store, items: row.items });
+    const receipt: SavedReceipt = {
+      entryId: row.entryId, timestamp: row.timestamp, store: row.store, items: row.items,
+      user: row.user, source: row.source, category: row.category, servings: row.servings,
+    };
+    if ((await linkReceiptToMeals(receipt)) === 'none') await registerReceiptMeal(receipt);
   }
+}
+
+/** レシートから直後の食事を登録し、登録できたらトーストで知らせる */
+async function registerReceiptMeal(receipt: SavedReceipt): Promise<void> {
+  const meal = await mealFromReceipt(receipt);
+  if (!meal) return;
+  emit({ type: 'saved', message: mealMessage(meal, 'レシートから食事を記録しました') });
+  if (meal.sharedMeal) await ensureMealShared(meal.rows, meal.rows[0]?.updatedBy ?? '');
 }
 
 // ─── フォアグラウンドサービス ─────────────────────────────────────────────────

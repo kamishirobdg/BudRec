@@ -189,6 +189,37 @@ export async function consume(list: Consumption[]): Promise<void> {
   }
 }
 
+/**
+ * レシートから食事に登録した品目（§5.7）を食べきった扱いにする（在庫に残さない）。
+ * 品目の追記が未送信のままなら見つからず、在庫に残る（在庫の画面の「食べきった」で消せる）。失敗しても投げない
+ */
+export async function consumeEntryItems(entryId: string, names: string[]): Promise<void> {
+  try {
+    const items = (await listInventory(true)).filter((i) => i.entryId === entryId && names.includes(i.name));
+    for (const item of items) await writeState(item, 0, item.remainingPieces === null ? null : 0, 'used_up');
+  } catch (e) {
+    console.warn('[Inventory] 食べた品を在庫から外せなかった:', e instanceof Error ? e.message : e);
+  }
+}
+
+/**
+ * レシートから登録した食事を「食べていない」にしたとき、そのレシートの品目を買ったときの量に戻す
+ * （食べきった扱いにしたものも含める）。
+ * @param month 'YYYY-MM'（レシートの月。食事の eaten_at はレシートと同じ日なので、その月）
+ */
+export async function restoreEntryItems(entryId: string, month: string): Promise<void> {
+  const client = await SheetsInternal.createClient();
+  const sheet = `_items_${month}`;
+  if (!(await SheetsInternal.listSheetNames(client, true)).includes(sheet)) return;
+  const res = await client.get(`/values/${encodeURIComponent(sheet)}!${ITEMS_RANGE}`, {
+    params: { valueRenderOption: 'UNFORMATTED_VALUE' },
+  });
+  const items = ((res.data.values ?? []) as any[][])
+    .map((c, i) => (i === 0 ? null : parseItem(c, i + 1, sheet)))
+    .filter((it): it is InventoryItem => it !== null && it.entryId === entryId);
+  for (const item of items) await writeState(item, 1, item.pieces, 'in_stock');
+}
+
 /** 「食べきった」 */
 export async function markUsedUp(item: InventoryItem): Promise<void> {
   await writeState(item, 0, item.remainingPieces === null ? null : 0, 'used_up');

@@ -109,6 +109,7 @@ function toExpenseRow(data: ReceiptData, user: string, source: string): ExpenseR
     confirmed:     false,
     recurring:     false,
     items:         data.items,
+    servings:      data.servings,
   };
 }
 

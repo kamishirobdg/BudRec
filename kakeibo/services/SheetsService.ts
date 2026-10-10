@@ -43,6 +43,8 @@ export interface ExpenseRow {
   rev?:          number;
   /** 購入品目。追加時だけ使い、月次シートには書かず `_items_YYYY-MM` に書く */
   items?:        ReceiptItem[];
+  /** 買ってすぐ食べる食事なら何人分か（追加時だけ。レシートから食事を登録するのに使う。仕様書 §5.7） */
+  servings?:     number;
   rowIndex?:     number;  // シート上の行番号（1-based、ヘッダー=1）。getRows で付与
   sheetName?:    string;  // 取得元シート名（YYYY-MM）。getRows で付与
 }

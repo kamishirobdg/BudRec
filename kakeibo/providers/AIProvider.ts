@@ -25,7 +25,15 @@ export interface ReceiptItem {
   pieces?:   number;
   /** 店のオリジナル商品（コンビニ・スーパーの PB、店内調理の弁当・総菜・パン）。食品データの鍵を店ごとに分ける */
   ownBrand?: boolean;
+  /**
+   * 買ってすぐ食べる食事での役割（レシートから直後の食事を登録するのに使う。仕様書 §5.7）。
+   * main = 主食・主菜（弁当・おにぎり・丼・麺・サンドイッチ・定食）/ side = 総菜・サラダ・汁物 / drink / sweet = 菓子・デザート /
+   * none = 食材・買い置き・食品以外
+   */
+  mealRole?: MealRole;
 }
+
+export type MealRole = 'main' | 'side' | 'drink' | 'sweet' | 'none';
 
 /**
  * ユーザーが OCR を中断したときに投げる。
@@ -56,6 +64,8 @@ export interface ReceiptData {
   date:     string;       // YYYY-MM-DD に正規化済み（読み取れなければ空文字）
   time?:    string;       // HH:MM（取得できなければ undefined / 空文字）
   items?:   ReceiptItem[];
+  /** 買ってすぐ食べる食事なら何人分か（1 か 2）。食材・買い置き・食事でない買い物は 0 / 省略 */
+  servings?: number;
   raw:      string;       // モデルの生レスポンス（デバッグ用）
 }
 
@@ -129,13 +139,15 @@ function receiptRules(categories: string[]): string {
   - どこにも日付が無ければ空文字
 - time: レシートに印字された**購入時刻**を HH:MM 形式（24時間表記）で。無ければ空文字。推測しない。
 - category: 以下のリストから最も適切な1つを選ぶ。該当が無ければ「その他」。
+- servings: この買い物が**買ってすぐ食べる食事**（コンビニ・スーパーの弁当・おにぎり・サンドイッチ・総菜、テイクアウト、店内飲食）なら何人分か（1 か 2）。
+  おにぎり 2 個とお茶は 1 人分、弁当 2 つとお茶 2 本は 2 人分。食材の買い物・買い置き（複数入り・冷凍食品・箱菓子）・食事でない買い物は 0
 - items: 購入品の配列（任意）。${ITEM_FIELDS_GUIDE}
 
 カテゴリ候補:
 ${list}
 
 出力例（レシート 2 枚が写っている画像）:
-{"receipts":[{"store":"セブンイレブン","amount":1280,"date":"2026-04-07","time":"18:42","category":"食費","items":[{"name":"ﾂﾅﾏﾖｵﾆｷﾞﾘ","price":150,"normalized":"ツナマヨおにぎり","quantity":1,"unit":"個","kind":"packaged","storage":"chilled","shelfDays":1,"pieces":1,"ownBrand":true}]},{"store":"マツモトキヨシ","amount":3480,"date":"2026-04-07","time":"19:05","category":"日用品","items":[]}]}`;
+{"receipts":[{"store":"セブンイレブン","amount":1280,"date":"2026-04-07","time":"18:42","category":"食費","servings":1,"items":[{"name":"ﾂﾅﾏﾖｵﾆｷﾞﾘ","price":150,"normalized":"ツナマヨおにぎり","quantity":1,"unit":"個","kind":"packaged","storage":"chilled","shelfDays":1,"pieces":1,"ownBrand":true,"mealRole":"main"}]},{"store":"マツモトキヨシ","amount":3480,"date":"2026-04-07","time":"19:05","category":"日用品","servings":0,"items":[]}]}`;
 }
 
 /** 品目の各項目の説明（レシート・メール共通） */
@@ -150,7 +162,9 @@ const ITEM_FIELDS_GUIDE = `各品目の項目:
   - shelfDays: 買ってから食べきるまでの目安の日数（例: 肉・魚 3、卵 14、牛乳 7、冷凍食品 60、米 60）。食品以外は省略
   - pieces: 個数で数えられる商品の入り数（アイス 6 本入りなら 6、ヨーグルト 4 個パックなら 4、1 個売りなら 1）。数えられないもの（肉 300g など）は省略
   - ownBrand: その店（チェーン）でしか売っていない商品なら true。コンビニ・スーパーのプライベートブランド（セブンプレミアム、ファミマル、トップバリュなど）、
-    店で作った弁当・おにぎり・サンドイッチ・総菜・パン、店の名前が付いた商品（ファミチキ、からあげクンなど）。メーカーの商品・生鮮食材・食品以外は false`;
+    店で作った弁当・おにぎり・サンドイッチ・総菜・パン、店の名前が付いた商品（ファミチキ、からあげクンなど）。メーカーの商品・生鮮食材・食品以外は false
+  - mealRole: 買ってすぐ食べる食事での役割。main（弁当・おにぎり・丼・麺・サンドイッチ・ハンバーガー・調理パン・定食や主菜）/
+    side（サラダ・総菜・汁物・おかず）/ drink（飲み物）/ sweet（菓子・デザート・アイス）/ none（食材・買い置き・食品以外）。servings が 0 なら全部 none`;
 
 /** メール本文用プロンプト（取引でない場合は amount=0 を返させる） */
 export function buildEmailPrompt(categories: string[]): string {
@@ -204,6 +218,7 @@ const RECEIPT_PROPERTIES = {
   date:     { type: 'STRING' },
   time:     { type: 'STRING' },
   category: { type: 'STRING' },
+  servings: { type: 'NUMBER' },
   items: {
     type: 'ARRAY',
     items: {
@@ -219,9 +234,10 @@ const RECEIPT_PROPERTIES = {
         shelfDays:  { type: 'NUMBER' },
         pieces:     { type: 'NUMBER' },
         ownBrand:   { type: 'BOOLEAN' },
+        mealRole:   { type: 'STRING', enum: ['main', 'side', 'drink', 'sweet', 'none'] },
       },
       required: ['name', 'price'],
-      propertyOrdering: ['name', 'price', 'normalized', 'quantity', 'unit', 'kind', 'storage', 'shelfDays', 'pieces', 'ownBrand'],
+      propertyOrdering: ['name', 'price', 'normalized', 'quantity', 'unit', 'kind', 'storage', 'shelfDays', 'pieces', 'ownBrand', 'mealRole'],
     },
   },
 } as const;
@@ -376,11 +392,13 @@ function toReceiptData(parsed: any, raw: string, fallbackCategory: string, categ
     date,
     time:     parsed?.time ? String(parsed.time) : undefined,
     items:    Array.isArray(parsed?.items) ? parsed.items.map(toReceiptItem).filter(Boolean) as ReceiptItem[] : undefined,
+    servings: Number.isInteger(Number(parsed?.servings)) && Number(parsed.servings) > 0 ? Number(parsed.servings) : undefined,
     raw,
   };
 }
 
 const ITEM_KINDS: readonly string[] = ['ingredient', 'packaged', 'non_food'];
+const MEAL_ROLES: readonly string[] = ['main', 'side', 'drink', 'sweet', 'none'];
 
 /** モデルが返した品目を整える。品名の無いものは捨てる */
 function toReceiptItem(raw: any): ReceiptItem | null {
@@ -405,6 +423,7 @@ function toReceiptItem(raw: any): ReceiptItem | null {
     shelfDays:  Number.isFinite(shelfDays) && shelfDays > 0 ? Math.round(shelfDays) : undefined,
     pieces:     Number.isFinite(pieces) && pieces >= 1 ? Math.round(pieces) : undefined,
     ownBrand:   raw?.ownBrand === true ? true : undefined,
+    mealRole:   MEAL_ROLES.includes(String(raw?.mealRole ?? '')) ? (raw.mealRole as MealRole) : undefined,
   };
 }
 

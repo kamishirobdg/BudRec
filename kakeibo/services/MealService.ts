@@ -56,7 +56,8 @@ export interface MealRow {
   entryId:        string;
   itemRefs:       ItemRef[];
   status:         MealStatus;
-  assignedBy:     'auto' | 'manual';
+  /** auto = 写真から / manual = 手で直した / receipt = レシートから直後の食事として登録（§5.7） */
+  assignedBy:     'auto' | 'manual' | 'receipt';
   /** 写真の参照（`local:...` / `shared:<photo_id>`）。1 回の食事に複数枚付けられる */
   photoRefs:      string[];
   rev:            number;
@@ -142,7 +143,7 @@ function fromCells(c: string[], rowIndex: number, sheetName: string): MealRow {
     entryId:        c[11] ?? '',
     itemRefs:       parseJsonCell<ItemRef[]>(c[12], []),
     status:         (c[13] as MealStatus) || 'estimated',
-    assignedBy:     c[14] === 'manual' ? 'manual' : 'auto',
+    assignedBy:     c[14] === 'manual' || c[14] === 'receipt' ? c[14] : 'auto',
     photoRefs:      parseJsonCell<string[]>(c[15], []),
     rev:            Number(c[16]) || 0,
     sources:        parseJsonCell<string[]>(c[17], []),
