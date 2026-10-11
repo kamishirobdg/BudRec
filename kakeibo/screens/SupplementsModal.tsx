@@ -210,6 +210,8 @@ export default function SupplementsModal({ visible, user, supplements, onClose, 
                 <View key={s.supplementId} style={styles.card}>
                   <Text style={styles.name}>{s.name}</Text>
                   <Text style={styles.meta}>1 日 {s.perDay} {s.unit}　{summary(s.nutrients)}</Text>
+                  {/* 栄養素に当たらない成分（乳酸菌・クエン酸など）はメモに残っているので、それも見せる */}
+                  {!!s.note && <Text style={styles.meta} numberOfLines={2}>{s.note.split('\n')[0]}</Text>}
                   <View style={styles.actions}>
                     <TouchableOpacity style={styles.btn} onPress={() => setDraft(toDraft(s))}>
                       <Text style={styles.btnText}>編集</Text>
