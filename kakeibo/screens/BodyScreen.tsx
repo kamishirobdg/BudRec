@@ -7,7 +7,7 @@ import {
   DayActivity, HealthStatus, SLEEP_GOAL_MIN, connectHealth, healthStatus, loadActivity, openHealthSettings, stepGoal,
   syncActivity,
 } from '../services/ActivityService';
-import { getMeals, MealRow } from '../services/MealService';
+import { getMeals, isMealShared, MealRow } from '../services/MealService';
 import { DEFAULT_PREFS, NutritionPrefs, loadPrefs } from '../services/NutritionPrefsService';
 import { ageOf, dayOf, shiftDay, toDay } from '../services/NutritionJudge';
 
@@ -32,13 +32,18 @@ function hm(min: number): string {
 /**
  * 「からだ」タブ。ヘルスコネクト（b.ring・スマホの歩数・体重計のアプリなど）から歩数・睡眠・活動・体重を読み、
  * 目安と比べる。食事の記録と合わせて「寝不足の日に食べ過ぎていないか」も見る。仕様は docs/meal-nutrition-spec.md §12。
+ *
+ * 相手の記録（相手の端末が `_activity` に写したもの）も「自分 / 相手の名前」で切り替えて見られる（§12.3）。
+ * 相手の摂取カロリーは、自分に共有された食事の分だけ（食事タブと同じ見え方）。寝不足と食事の比較は自分の分だけ出す。
  */
 export default function BodyScreen() {
   const { width } = useWindowDimensions();
   const [me, setMe]             = useState('');
+  /** 見ている人（'' = 自分） */
+  const [who, setWho]           = useState('');
   const [status, setStatus]     = useState<HealthStatus | null>(null);
   const [activity, setActivity] = useState<DayActivity[]>([]);
-  const [prefs, setPrefs]       = useState<NutritionPrefs>(DEFAULT_PREFS);
+  const [prefsAll, setPrefsAll] = useState<Map<string, NutritionPrefs>>(new Map());
   const [meals, setMeals]       = useState<MealRow[]>([]);
   const [day, setDay]           = useState(today());
   const [metric, setMetric]     = useState<Metric>('steps');
@@ -55,8 +60,8 @@ export default function BodyScreen() {
       // 食事は直近 30 日ぶん（寝不足の日の食べ方を見る）
       const months = [...new Set([0, 31].map((back) => shiftDay(today(), -back).slice(0, 7)))];
       await Promise.all([
-        cachedLoad('nutrition_prefs', async () => [...(await loadPrefs()).entries()], (e) => setPrefs(new Map(e).get(user) ?? DEFAULT_PREFS))
-          .then((e) => setPrefs(new Map(e).get(user) ?? DEFAULT_PREFS)).catch(() => {}),
+        cachedLoad('nutrition_prefs', async () => [...(await loadPrefs()).entries()], (e) => setPrefsAll(new Map(e)))
+          .then((e) => setPrefsAll(new Map(e))).catch(() => {}),
         Promise.all(months.map((m) => cachedLoad(`meals_${m}`, () => getMeals(m)).catch(() => [] as MealRow[])))
           .then((list) => setMeals(list.flat())),
         (async () => {
@@ -86,27 +91,45 @@ export default function BodyScreen() {
     }
   };
 
-  const mine = useMemo(() => activity.filter((a) => a.user === me), [activity, me]);
-  const byDay = useMemo(() => new Map(mine.map((a) => [a.date, a])), [mine]);
+  // 切り替えられる人: `_activity` に記録のある自分以外の人（相手の端末が写したもの）
+  const others = useMemo(
+    () => [...new Set(activity.map((a) => a.user))].filter((u) => u && u !== me).sort(),
+    [activity, me],
+  );
+  const viewing = who && others.includes(who) ? who : me;
+  const isMe = viewing === me;
+  const shown = useMemo(() => activity.filter((a) => a.user === viewing), [activity, viewing]);
+  const byDay = useMemo(() => new Map(shown.map((a) => [a.date, a])), [shown]);
+  const prefs = prefsAll.get(viewing) ?? DEFAULT_PREFS;
   const age = prefs.profile.birthDate ? ageOf(prefs.profile.birthDate) : null;
   const goal = stepGoal(age);
   const today_ = byDay.get(day);
 
-  // 日ごとの摂取カロリー（自分の分）
+  // 日ごとの摂取カロリー（見ている人の分。相手なら、自分に共有された食事だけ。食事タブと同じ見え方）
   const kcalByDay = useMemo(() => {
-    const map = new Map<string, number>();
+    const byMeal = new Map<string, MealRow[]>();
     for (const r of meals) {
-      if (r.user !== me || r.deleted) continue;
-      const v = r.nutrients['ENERC_KCAL'];
-      if (v === null || v === undefined) continue;
-      const d = dayOf(r.eatenAt);
-      map.set(d, (map.get(d) ?? 0) + v);
+      if (r.deleted) continue;
+      byMeal.set(r.mealId, [...(byMeal.get(r.mealId) ?? []), r]);
+    }
+    const map = new Map<string, number>();
+    for (const rows of byMeal.values()) {
+      if (!isMe && !isMealShared(rows)) continue;
+      for (const r of rows) {
+        if (r.user !== viewing) continue;
+        const v = r.nutrients['ENERC_KCAL'];
+        if (v === null || v === undefined) continue;
+        const d = dayOf(r.eatenAt);
+        map.set(d, (map.get(d) ?? 0) + v);
+      }
     }
     return map;
-  }, [meals, me]);
+  }, [meals, viewing, isMe]);
 
-  // 寝不足の日と、そうでない日の摂取カロリーの平均（直近 30 日。どちらも 3 日以上あるとき）
+  // 寝不足の日と、そうでない日の摂取カロリーの平均（直近 30 日。どちらも 3 日以上あるとき）。
+  // 相手の食事は共有された分しか見えず合計にならないので、自分の分だけ出す
   const insight = useMemo(() => {
+    if (!isMe) return null;
     const short: number[] = [];
     const enough: number[] = [];
     for (let i = 1; i <= 30; i++) {
@@ -119,7 +142,7 @@ export default function BodyScreen() {
     if (short.length < 3 || enough.length < 3) return null;
     const avg = (l: number[]) => Math.round(l.reduce((x, y) => x + y, 0) / l.length);
     return { short: avg(short), enough: avg(enough), shortDays: short.length, enoughDays: enough.length };
-  }, [byDay, kcalByDay]);
+  }, [byDay, kcalByDay, isMe]);
 
   const series = useMemo(() => {
     const days: string[] = [];
@@ -152,8 +175,21 @@ export default function BodyScreen() {
         </TouchableOpacity>
       </View>
 
+      {others.length > 0 && (
+        <View style={styles.people}>
+          {['', ...others].map((u) => (
+            <TouchableOpacity key={u || '__me'} style={[styles.chip, (u === '' ? isMe : viewing === u) && styles.chipActive]} onPress={() => setWho(u)}>
+              <Text style={[styles.chipText, (u === '' ? isMe : viewing === u) && styles.chipTextActive]}>{u === '' ? '自分' : u}</Text>
+            </TouchableOpacity>
+          ))}
+        </View>
+      )}
+
       <ScrollView contentContainerStyle={styles.body} refreshControl={<RefreshControl refreshing={loading} onRefresh={() => load(true)} />}>
-        {status !== null && status !== 'connected' && (
+        {!isMe && (
+          <Text style={styles.note}>{viewing} の端末がヘルスコネクトから写した記録です。引き下げても相手の分は読み直せません</Text>
+        )}
+        {isMe && status !== null && status !== 'connected' && (
           <View style={styles.card}>
             <Text style={styles.cardTitle}>ヘルスコネクト</Text>
             {status === 'not_connected' && (
@@ -196,7 +232,7 @@ export default function BodyScreen() {
             ratio={null}
           />
           <Tile
-            label="摂取カロリー"
+            label={isMe ? '摂取カロリー' : '摂取カロリー（共有された食事の分）'}
             value={kcalByDay.has(day) ? `${Math.round(kcalByDay.get(day)!).toLocaleString('ja-JP')} kcal` : '—'}
             sub={today_?.weightKg != null ? `体重 ${today_.weightKg} kg` : ''}
             ratio={null}
@@ -273,6 +309,10 @@ const styles = StyleSheet.create({
   arrow:         { fontSize: 24, color: '#2e7d32', paddingHorizontal: 4 },
   arrowDisabled: { color: '#d1d5db' },
   date:          { fontSize: 15, fontWeight: 'bold', color: '#222' },
+  people:    {
+    flexDirection: 'row', flexWrap: 'wrap', gap: 6, paddingHorizontal: 16, paddingVertical: 8,
+    backgroundColor: '#fff', borderBottomWidth: 1, borderBottomColor: '#eee',
+  },
   body:      { padding: 16, paddingBottom: 40, gap: 10 },
   card:      { backgroundColor: '#fff', borderRadius: 16, padding: 14, gap: 8 },
   cardTitle: { fontSize: 14, fontWeight: 'bold', color: '#374151' },
