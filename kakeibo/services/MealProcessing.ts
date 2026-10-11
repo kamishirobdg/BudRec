@@ -433,9 +433,12 @@ export async function recordMeal(
         store: storeOf(i),
         name:  used.length > 0 ? `${nameOf(i)}（使った食材: ${used.join('、')}）` : nameOf(i),
         kind:  d.kind,
-        // 写真から見積もった量があれば渡す（無いと「商品 1 個」が袋全体の量と取り違えられることがある）
-        // 外食はメニューの一人前が決まっているので渡さない
-        amount: d.kind === 'packaged' && used.length === 0 && d.grams ? `約 ${Math.round(d.grams)}g` : undefined,
+        // 写真から見積もった量があれば渡す（無いと「商品 1 個」が袋全体の量と取り違えられることがある）。
+        // 外食は一人前が基本だが、器の大きさからの見積もりを添えると大盛・小盛が反映される
+        amount: used.length > 0 || !d.grams ? undefined
+          : d.kind === 'packaged' ? `約 ${Math.round(d.grams)}g`
+            : d.kind === 'eat_out' ? `一人前（器の大きさからの見積もりで約 ${Math.round(d.grams)}g）` : undefined,
+        details: d.details,
       };
     });
     const res = await lookupNutrition(queries, { signal });

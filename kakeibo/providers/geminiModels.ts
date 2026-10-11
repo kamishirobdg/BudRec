@@ -29,6 +29,27 @@ export const PREFERRED_MODELS: readonly string[] = [
   'gemini-2.5-flash',
 ];
 
+/**
+ * 精度を優先するとき（料理の写真の判別。具材・サイズの見分けは flash のほうが明らかに得意）の優先順。
+ * 枠切れなら lite に逃げる
+ */
+export const QUALITY_MODELS: readonly string[] = [
+  'gemini-flash-latest',
+  'gemini-2.5-flash',
+  'gemini-flash-lite-latest',
+  'gemini-2.5-flash-lite',
+];
+
+export type ModelPreference = 'cost' | 'quality';
+
+function preferredList(prefer: ModelPreference): readonly string[] {
+  return prefer === 'quality' ? QUALITY_MODELS : PREFERRED_MODELS;
+}
+
+function cacheKey(prefer: ModelPreference): string {
+  return prefer === 'quality' ? `${CACHE_KEY}_quality` : CACHE_KEY;
+}
+
 /** 最後の頼み。一覧が引けないときだけ使う */
 const LAST_RESORT_MODEL = PREFERRED_MODELS[0];
 
@@ -51,9 +72,9 @@ interface ModelCache {
   at:    number;
 }
 
-async function readCache(): Promise<ModelCache | null> {
+async function readCache(prefer: ModelPreference = 'cost'): Promise<ModelCache | null> {
   try {
-    const raw = await getItem(CACHE_KEY);
+    const raw = await getItem(cacheKey(prefer));
     if (!raw) return null;
     const parsed = JSON.parse(raw) as ModelCache;
     if (typeof parsed?.model !== 'string' || typeof parsed?.at !== 'number') return null;
@@ -63,9 +84,9 @@ async function readCache(): Promise<ModelCache | null> {
   }
 }
 
-async function writeCache(model: string): Promise<void> {
+async function writeCache(model: string, prefer: ModelPreference = 'cost'): Promise<void> {
   try {
-    await setItem(CACHE_KEY, JSON.stringify({ model, at: Date.now() } satisfies ModelCache));
+    await setItem(cacheKey(prefer), JSON.stringify({ model, at: Date.now() } satisfies ModelCache));
   } catch {
     // キャッシュできなくても動作には影響しない
   }
@@ -74,6 +95,7 @@ async function writeCache(model: string): Promise<void> {
 export async function invalidateModelCache(): Promise<void> {
   try {
     await setItem(CACHE_KEY, '');
+    await setItem(cacheKey('quality'), '');
   } catch {
     // ignore
   }
@@ -97,15 +119,18 @@ export async function listAvailableModels(apiKey: string): Promise<string[]> {
  * 今使うべきモデル名を返す。
  * @param exclude 直前に失敗したモデル（429 など）。候補から外す
  * @param force   true ならキャッシュを無視して一覧を引き直す
+ * @param prefer  quality なら上位モデル（flash）を先に試す（既定は安い lite）
  */
 export async function resolveModel(
   apiKey: string,
-  opts: { exclude?: string[]; force?: boolean } = {},
+  opts: { exclude?: string[]; force?: boolean; prefer?: ModelPreference } = {},
 ): Promise<string> {
   const exclude = new Set(opts.exclude ?? []);
+  const prefer = opts.prefer ?? 'cost';
+  const list = preferredList(prefer);
 
   if (!opts.force) {
-    const cached = await readCache();
+    const cached = await readCache(prefer);
     if (
       cached &&
       cached.model &&
@@ -127,18 +152,18 @@ export async function resolveModel(
       '[Gemini] モデル一覧の取得に失敗、既定値にフォールバック:',
       e instanceof Error ? e.message : String(e),
     );
-    const cached = await readCache();
+    const cached = await readCache(prefer);
     if (cached?.model && !exclude.has(cached.model)) return cached.model;
-    const fallback = PREFERRED_MODELS.find((m) => !exclude.has(m));
+    const fallback = list.find((m) => !exclude.has(m));
     return fallback ?? LAST_RESORT_MODEL;
   }
 
   const availableSet = new Set(available);
 
   // 1) 優先リストのうち、実際に使えるもの
-  const preferred = PREFERRED_MODELS.find((m) => availableSet.has(m) && !exclude.has(m));
+  const preferred = list.find((m) => availableSet.has(m) && !exclude.has(m));
   if (preferred) {
-    await writeCache(preferred);
+    await writeCache(preferred, prefer);
     return preferred;
   }
 
@@ -150,7 +175,7 @@ export async function resolveModel(
 
   if (picked) {
     console.log('[Gemini] 優先モデルが使えないため自動選択:', picked);
-    await writeCache(picked);
+    await writeCache(picked, prefer);
     return picked;
   }
 

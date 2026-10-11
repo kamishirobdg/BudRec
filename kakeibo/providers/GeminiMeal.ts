@@ -45,6 +45,8 @@ export interface IdentifiedDish {
   grams?:     number;
   /** 写っている栄養成分表示から読んだ、食べた分のエネルギー（kcal）。読めなければ undefined */
   labelKcal?: number;
+  /** 見えている具材・トッピング・サイズのメモ（栄養の推定に添える）。無ければ undefined */
+  details?:   string;
 }
 
 /** 在庫の 1 品（写真の料理・食品と突き合わせる候補） */
@@ -92,9 +94,10 @@ const DISH_ITEM_SCHEMA = {
     choices: { type: 'ARRAY', items: { type: 'NUMBER' } },
     grams:     { type: 'NUMBER' },
     labelKcal: { type: 'NUMBER' },
+    details:   { type: 'STRING' },
   },
   required: ['name', 'kind', 'shared', 'count', 'eater', 'confidence'],
-  propertyOrdering: ['name', 'kind', 'shared', 'count', 'eater', 'confidence', 'used', 'choices', 'grams', 'labelKcal'],
+  propertyOrdering: ['name', 'kind', 'shared', 'count', 'eater', 'confidence', 'used', 'choices', 'grams', 'labelKcal', 'details'],
 };
 
 /** 料理の各項目の説明（写真の振り分けのプロンプトに入れる） */
@@ -113,7 +116,9 @@ export function buildDishGuide(ctx: DishContext): string {
 ${corrections}${inventory}
 写真に写っている料理・食品ごとに 1 つ:
 - name: 料理名。日本語で書く（外国の商品はパッケージのカタカナ表記か、日本語の一般名。例: Butter waffles → バターワッフル）。
-  チェーン店のメニューと分かる場合は公式のメニュー名に近い名前（例: 牛丼 並盛）。家にある商品と分かれば、その品名
+  **見えているトッピング・具材・サイズを名前に含める**（「ラーメン」ではなく「チャーシュー麺 大盛」「味玉ねぎラーメン」、「カレー」ではなく「カツカレー」）。
+  一般名に丸めるのは具材が見えないときだけ。チェーン店のメニューと分かる場合は公式のメニュー名に近い名前（例: 牛丼 並盛）。家にある商品と分かれば、その品名
+- details: 栄養の推定に役立つ見た目のメモ（具材の種類と量、麺・ご飯の量の多さ、スープの濃さ、揚げ物か、器の大きさなど）を 1〜2 文。無ければ省略
 - kind: eat_out（飲食店の料理）/ packaged（コンビニ・スーパーの弁当・パン・菓子・飲料・アイスなどの商品）/ home（家で作った料理）
 - shared: 焼肉・寿司の盛り合わせ・鍋・大皿料理など、一品で完結せず取り分けて食べるものは true。一人前の料理は false
 - count: 同じ一人前の料理がいくつ写っているか（取り分ける料理は 1）
@@ -171,6 +176,7 @@ export function dishesFromParsed(parsed: any, inventorySize: number): Identified
       choices: [...new Set<number>((Array.isArray(d?.choices) ? d.choices : []).filter(validIndex).map(Number))],
       grams:     Number(d?.grams) > 0 ? Number(d.grams) : undefined,
       labelKcal: Number(d?.labelKcal) > 0 ? Number(d.labelKcal) : undefined,
+      details:   String(d?.details ?? '').trim() || undefined,
     }))
     .map((d) => ({ ...d, choices: d.choices.length >= 2 ? d.choices : [] }))
     .filter((d) => d.name.length > 0);
@@ -196,7 +202,8 @@ export async function analyzePhoto(
       { text: buildPhotoPrompt(categories, buildDishGuide(ctx)) },
       { inline_data: { mime_type: 'image/jpeg', data: imageBase64 } },
     ],
-    { schema: photoSchema(RECEIPT_ITEM_SCHEMA), highRes: true, signal },
+    // 具材・サイズの見分けは上位モデルのほうが得意なので、写真の判別だけ精度を優先する（枠切れなら lite に逃げる）
+    { schema: photoSchema(RECEIPT_ITEM_SCHEMA), highRes: true, signal, quality: true },
   );
   const parsed = parseJson(raw);
   return {
@@ -326,6 +333,8 @@ export interface NutritionQuery {
   kind:  DishKind;
   /** 食べた量（「1 個」「1 パックの約 30%」など）。省略時は商品 1 個・一人前 */
   amount?: string;
+  /** 写真から読んだ具材・サイズのメモ（推定の手がかり） */
+  details?: string;
 }
 
 export interface NutritionResult {
@@ -353,7 +362,7 @@ export async function lookupNutrition(
   const hasHome = queries.some((q) => q.kind === 'home');
 
   const list = queries
-    .map((q, i) => `${i}: ${q.store ? `店「${q.store}」の` : ''}「${q.name}」（${q.amount ?? (q.kind === 'packaged' ? '商品 1 個' : '一人前')}）`)
+    .map((q, i) => `${i}: ${q.store ? `店「${q.store}」の` : ''}「${q.name}」（${q.amount ?? (q.kind === 'packaged' ? '商品 1 個' : '一人前')}）${q.details ? ` 見た目: ${q.details}` : ''}`)
     .join('\n');
   const prompt = `次の食事の栄養成分を求め、JSON のみを返してください（説明文は不要）。
 ${grounded ? 'チェーン店のメニューや市販の商品は、Google 検索で**店・メーカーの公式の栄養成分表示**を探して、その値を使ってください。公式の値が見つからなければ一般的な値で推定し、official を false にしてください。' : '家で作った料理なので、写真と料理名から一般的な分量・値で推定し、official は false にしてください。'}

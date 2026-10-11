@@ -62,6 +62,8 @@ export interface CallOptions {
   signal?:  AbortSignal;
   /** Google 検索 grounding（`[{ google_search: {} }]`）。構造化出力と併用できないモデルがあるので schema は付けない */
   tools?:   object[];
+  /** 精度を優先して上位モデル（flash）を先に使う（料理の写真の判別）。枠切れなら lite に逃げる */
+  quality?: boolean;
 }
 
 /**
@@ -130,7 +132,7 @@ export async function callGeminiDetailed(parts: object[], opts: CallOptions): Pr
 
     let model: string;
     try {
-      model = await resolveModel(GEMINI_API_KEY, { exclude: tried, force: attempt > 0 });
+      model = await resolveModel(GEMINI_API_KEY, { exclude: tried, force: attempt > 0, prefer: opts.quality ? 'quality' : 'cost' });
     } catch (e) {
       throw toReadableError(lastError ?? e);
     }
