@@ -1171,19 +1171,19 @@ export default function SummaryScreen({ onSignedOut }: Props) {
 
       <View style={styles.scrollFloatTop} pointerEvents="box-none">
         <TouchableOpacity style={styles.scrollFloatBtn} onPress={scrollToTop} activeOpacity={0.7}>
-          <Text style={styles.scrollFloatBtnText}>⤒</Text>
+          <Text style={styles.scrollFloatBtnText} allowFontScaling={false}>⤒</Text>
         </TouchableOpacity>
         <TouchableOpacity style={styles.scrollFloatBtn} onPress={() => scrollByPercent(-1)} activeOpacity={0.7}>
-          <Text style={styles.scrollFloatBtnText}>↑</Text>
+          <Text style={styles.scrollFloatBtnText} allowFontScaling={false}>↑</Text>
         </TouchableOpacity>
       </View>
 
       <View style={styles.scrollFloatBottom} pointerEvents="box-none">
         <TouchableOpacity style={styles.scrollFloatBtn} onPress={() => scrollByPercent(1)} activeOpacity={0.7}>
-          <Text style={styles.scrollFloatBtnText}>↓</Text>
+          <Text style={styles.scrollFloatBtnText} allowFontScaling={false}>↓</Text>
         </TouchableOpacity>
         <TouchableOpacity style={styles.scrollFloatBtn} onPress={handleJumpToEnd} activeOpacity={0.7}>
-          <Text style={styles.scrollFloatBtnText}>⤓</Text>
+          <Text style={styles.scrollFloatBtnText} allowFontScaling={false}>⤓</Text>
         </TouchableOpacity>
       </View>
 
@@ -1264,7 +1264,7 @@ function Checkbox({
   return (
     <TouchableOpacity style={styles.checkbox} onPress={onPress}>
       <View style={[styles.box, checked && styles.boxChecked]}>
-        {checked && <Text style={styles.boxMark}>✓</Text>}
+        {checked && <Text style={styles.boxMark} allowFontScaling={false}>✓</Text>}
       </View>
       <Text style={styles.checkboxLabel}>{label}</Text>
     </TouchableOpacity>
@@ -1535,7 +1535,7 @@ function EditEntryModal({
               onPress={() => setExcluded((v) => !v)}
             >
               <View style={[styles.box, excluded && styles.boxChecked]}>
-                {excluded && <Text style={styles.boxMark}>✓</Text>}
+                {excluded && <Text style={styles.boxMark} allowFontScaling={false}>✓</Text>}
               </View>
               <Text style={styles.checkboxLabel}>集計から除外</Text>
             </TouchableOpacity>
@@ -1943,7 +1943,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
   },
   searchIcon: { fontSize: 14, color: '#999', marginRight: 6 },
-  searchInput: { flex: 1, height: 40, fontSize: 14, color: '#333' },
+  searchInput: { flex: 1, minHeight: 40, fontSize: 14, color: '#333' },
   searchClearBtn: { paddingHorizontal: 6, paddingVertical: 6 },
   searchClearBtnText: { fontSize: 14, color: '#999', fontWeight: 'bold' },
 

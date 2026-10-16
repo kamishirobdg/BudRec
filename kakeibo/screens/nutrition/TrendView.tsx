@@ -232,7 +232,7 @@ const styles = StyleSheet.create({
   avgRow:  { flexDirection: 'row', alignItems: 'center', gap: 8, borderTopWidth: 1, borderTopColor: '#f3f4f6', paddingVertical: 4 },
   avgLabel: { flex: 1, fontSize: 13, color: '#1f2937' },
   avgValue: { fontSize: 13, fontWeight: '600', color: '#1f2937' },
-  avgOk:    { fontSize: 12, color: '#6b7280', width: 90, textAlign: 'right' },
+  avgOk:    { fontSize: 12, color: '#6b7280', minWidth: 90, textAlign: 'right' },
   adviceHead: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
   autoRow:    { flexDirection: 'row', alignItems: 'center', gap: 4 },
   autoLabel:  { fontSize: 12, color: '#6b7280' },

@@ -310,10 +310,10 @@ const styles = StyleSheet.create({
   nutRow:   { flexDirection: 'row', alignItems: 'center', gap: 8, backgroundColor: '#fff', borderRadius: 8, paddingHorizontal: 10, paddingVertical: 4 },
   nutLabel: { flex: 1, fontSize: 13, color: '#1f2937' },
   nutInput: {
-    width: 90, textAlign: 'right', fontSize: 13, borderWidth: 1, borderColor: '#e5e7eb', borderRadius: 6,
+    minWidth: 90, textAlign: 'right', fontSize: 13, borderWidth: 1, borderColor: '#e5e7eb', borderRadius: 6,
     paddingHorizontal: 6, paddingVertical: 3, color: '#1f2937',
   },
-  nutUnit:  { width: 32, fontSize: 11, color: '#6b7280' },
+  nutUnit:  { minWidth: 32, fontSize: 11, color: '#6b7280' },
   primary:     { backgroundColor: '#2e7d32', borderRadius: 12, paddingVertical: 13, alignItems: 'center', marginTop: 12 },
   primaryText: { color: '#fff', fontSize: 14, fontWeight: 'bold' },
   disabled:    { opacity: 0.6 },

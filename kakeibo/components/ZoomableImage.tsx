@@ -58,14 +58,14 @@ export default function ZoomableImage({ uri, height }: Props) {
           onPress={() => setZoomIndex((i) => Math.max(0, i - 1))}
           disabled={zoomIndex === 0}
         >
-          <Text style={styles.zoomBtnText}>−</Text>
+          <Text style={styles.zoomBtnText} allowFontScaling={false}>−</Text>
         </TouchableOpacity>
         <TouchableOpacity
           style={[styles.zoomBtn, zoomIndex === ZOOM_LEVELS.length - 1 && styles.zoomBtnDisabled]}
           onPress={() => setZoomIndex((i) => Math.min(ZOOM_LEVELS.length - 1, i + 1))}
           disabled={zoomIndex === ZOOM_LEVELS.length - 1}
         >
-          <Text style={styles.zoomBtnText}>＋</Text>
+          <Text style={styles.zoomBtnText} allowFontScaling={false}>＋</Text>
         </TouchableOpacity>
       </View>
     </View>

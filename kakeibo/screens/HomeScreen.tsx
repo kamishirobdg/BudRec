@@ -28,7 +28,7 @@ export default function HomeScreen({ onSignedIn }: Props) {
   return (
     <View style={styles.container}>
       <View style={styles.logo}>
-        <Text style={styles.logoEmoji}>💰</Text>
+        <Text style={styles.logoEmoji} allowFontScaling={false}>💰</Text>
       </View>
       <Text style={styles.title}>Bud-Rec</Text>
       <Text style={styles.subtitle}>夫婦の家計簿</Text>
