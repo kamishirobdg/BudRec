@@ -225,6 +225,12 @@ const ADVICE_SCHEMA = {
 export async function generateAdvice(input: AdviceInput, span: 7 | 30, auto: boolean): Promise<Advice | null> {
   const recorded = input.days.filter((d) => d.statuses).length;
   if (recorded < minRecordedDays(span) || input.days.length === 0) return null;
+  const periodEnd = input.days[input.days.length - 1].day;
+  // 自動の提案は、同じ人がもう 1 台で先に作っていればそれを使う（端末の控えが古いと 2 台とも作ってしまうため、シートを読み直す）
+  if (auto) {
+    const existing = await findAutoAdvice(input.user, span, periodEnd);
+    if (existing) return existing;
+  }
   const facts = buildFacts(input);
   const prompt = `あなたは栄養管理アプリのアシスタントです。次の${span === 7 ? '1 週間' : '1 か月'}の記録から、食事の改善とサプリの提案を日本語で書き、JSON のみを返してください。
 - summary: 期間の傾向を 2 文以内で（よかった点と直したい点）
@@ -247,10 +253,15 @@ ${facts}`;
       reason: String(s?.reason ?? '').trim(),
     }))
     .filter((s: SupplementAdvice) => s.name);
+  // Gemini を待つ間（数秒）にもう 1 台が書いていれば、そちらを使う
+  if (auto) {
+    const existing = await findAutoAdvice(input.user, span, periodEnd);
+    if (existing) return existing;
+  }
   return saveAdvice({
     user: input.user,
     periodStart: input.days[0].day,
-    periodEnd: input.days[input.days.length - 1].day,
+    periodEnd,
     span,
     auto,
     summary: String(parsed.summary ?? '').trim(),
@@ -258,6 +269,16 @@ ${facts}`;
     supplements,
     caution: String(parsed.caution ?? '').trim(),
   });
+}
+
+/** シートにある、その人のその期間の自動の提案（いちばん先に作られたもの）。読めなければ null（作る側に進む） */
+async function findAutoAdvice(user: string, span: 7 | 30, periodEnd: string): Promise<Advice | null> {
+  try {
+    const found = (await loadAdvice()).filter((a) => a.auto && a.user === user && a.span === span && a.periodEnd === periodEnd);
+    return found.length > 0 ? found[0] : null;
+  } catch {
+    return null;
+  }
 }
 
 /** 直前の週（月曜〜日曜）。週の切り替わりの自動作成に使う */

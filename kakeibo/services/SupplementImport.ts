@@ -157,7 +157,7 @@ const NUTRIENT_ALIASES: Record<string, string[]> = {
   FOL:        ['葉酸', 'folate', 'folicacid', 'ビタミンb9'],
   PANTAC:     ['パントテン酸', 'pantothenicacid', 'ビタミンb5', 'パントテン酸ca', 'パントテン酸カルシウム'],
   BIOT:       ['ビオチン', 'biotin', 'ビタミンb7', 'ビタミンh'],
-  VITC:       ['ビタミンc', 'v.c', 'vc', 'vitaminc', 'アスコルビン酸', 'ascorbicacid', 'laスコルビン酸'],
+  VITC:       ['ビタミンc', 'v.c', 'vc', 'vitaminc', 'アスコルビン酸', 'ascorbicacid', 'lアスコルビン酸'],
 };
 
 /**
@@ -170,7 +170,28 @@ const SALT_FACTORS: { key: string; words: string[]; factor: number }[] = [
   { key: 'VITC',   words: ['アスコルビン酸ナトリウム', 'アスコルビン酸na', 'アスコルビン酸カルシウム', 'アスコルビン酸ca'], factor: 176.12 / 198.11 },
   // β-カロテンはレチノール活性当量で 1/12
   { key: 'VITA_RAE', words: ['βカロテン', 'ベータカロテン', 'betacarotene'], factor: 1 / 12 },
+  // ミネラルの塩（元素の重さ ÷ 化合物の重さ。水和物はサプリでよく使われる形）
+  { key: 'NA', words: ['塩化ナトリウム'], factor: 22.99 / 58.44 },
+  { key: 'K',  words: ['クエン酸カリウム'], factor: 117.29 / 324.41 },   // 一水和物
+  { key: 'K',  words: ['塩化カリウム'], factor: 39.10 / 74.55 },
+  { key: 'K',  words: ['グルコン酸カリウム'], factor: 39.10 / 234.25 },
+  { key: 'CA', words: ['炭酸カルシウム'], factor: 40.08 / 100.09 },
+  { key: 'CA', words: ['クエン酸カルシウム'], factor: 120.23 / 570.49 }, // 四水和物
+  { key: 'CA', words: ['乳酸カルシウム'], factor: 40.08 / 308.30 },     // 五水和物
+  { key: 'CA', words: ['グルコン酸カルシウム'], factor: 40.08 / 430.37 },
+  { key: 'MG', words: ['酸化マグネシウム'], factor: 24.31 / 40.30 },
+  { key: 'MG', words: ['炭酸マグネシウム'], factor: 24.31 / 84.31 },
+  { key: 'MG', words: ['クエン酸マグネシウム'], factor: 72.92 / 451.11 },
+  { key: 'MG', words: ['グリシン酸マグネシウム'], factor: 24.31 / 172.42 }, // ビスグリシン酸
+  { key: 'MG', words: ['塩化マグネシウム'], factor: 24.31 / 95.21 },
+  { key: 'MG', words: ['硫酸マグネシウム'], factor: 24.31 / 120.37 },
 ];
+
+/**
+ * 末尾一致で当たるミネラル。「クエン酸カリウム」「卵殻カルシウム」のように前に語が付いたものは化合物や原料の重さなので、
+ * SALT_FACTORS に無ければ栄養素に足さない（その他の成分に回す。そのまま足すと数倍に数えてしまう）
+ */
+const SALT_MINERALS = new Set(['NA', 'K', 'CA', 'MG', 'MN', 'MO']);
 
 export interface MappedNutrient {
   key:    string;
@@ -196,6 +217,7 @@ export function mapNutrient(rawName: string, value: number, rawUnit: string): Ma
   if (!asMatch) {
     const salt = SALT_FACTORS.find((s) => s.key === key && s.words.some((w) => norm(nfkc).includes(norm(w))));
     if (salt) v *= salt.factor;
+    else if (SALT_MINERALS.has(key) && !isExactAlias(key, n)) return null;
   }
   const target = nutrientDef(key)!.unit;
   const converted = convertUnit(v, rawUnit, target, key);
@@ -203,17 +225,25 @@ export function mapNutrient(rawName: string, value: number, rawUnit: string): Ma
   return { key, value: Math.round(converted * 10_000) / 10_000 };
 }
 
+function aliasesOf(key: string): string[] {
+  return [norm(nutrientDef(key)!.label), ...(NUTRIENT_ALIASES[key] ?? []).map(norm)];
+}
+
+/** 前後に余分な語が無い（「カリウム」）か、後ろに語が付いただけ（「カリウム量」）。前に語が付いたもの（「クエン酸カリウム」）は false */
+function isExactAlias(key: string, n: string): boolean {
+  return aliasesOf(key).some((a) => n === a || n.startsWith(a));
+}
+
 function findKey(n: string): string | null {
   // 完全一致を先に（「ビタミンb12」が「ビタミンb1」に含まれるため）
   for (const key of NUTRIENT_KEYS) {
-    const aliases = [norm(nutrientDef(key)!.label), ...(NUTRIENT_ALIASES[key] ?? []).map(norm)];
-    if (aliases.includes(n)) return key;
+    if (aliasesOf(key).includes(n)) return key;
   }
   // 「総ビタミンa」「ナイアシン当量」のように余分な語が付いたもの: 長い別名から順に、先頭か末尾に一致。
   // 短い別名では比べない（「リン」が「バリン」「プロリン」の末尾に当たる）
   const candidates: { key: string; alias: string }[] = [];
   for (const key of NUTRIENT_KEYS) {
-    for (const a of [norm(nutrientDef(key)!.label), ...(NUTRIENT_ALIASES[key] ?? []).map(norm)]) {
+    for (const a of aliasesOf(key)) {
       if (a.length >= 4 && (n.startsWith(a) || n.endsWith(a))) candidates.push({ key, alias: a });
     }
   }

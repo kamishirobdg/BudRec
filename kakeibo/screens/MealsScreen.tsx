@@ -214,6 +214,8 @@ export default function MealsScreen() {
     const a = await generateAdvice(input, s, auto);
     if (a) {
       setAdvice((prev) => {
+        // もう 1 台が作った提案を受け取ったときは、読み込み済みの一覧に既にあることがある
+        if (prev.some((x) => x.adviceId === a.adviceId)) return prev;
         const next = [...prev, a];
         writeCache('advice', next);
         return next;
