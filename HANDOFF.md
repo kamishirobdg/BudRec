@@ -7,18 +7,22 @@
 > - Windows ローカル: `C:\work\BudRec`（`kakeibo/node_modules` あり → `npx tsc --noEmit` が通る）
 > - クラウドコンテナ: `/home/user/BudRec`（node_modules 無し）
 
-最終更新: 2026-10-11 / ブランチ `claude/reduce-google-relogin-MCMj8`（2026-10-11 のクラウドセッションは `ccr-fee171e2-4jcph6` に積んだ。
-`reduce-google-relogin-MCMj8` の先に 1 コミット足しただけなので `git merge --ff-only` で取り込める）。
-**push 済みは v2.16.0 まで**（v2.17.0 は `ccr-fee171e2-4jcph6` にある）。push はユーザーの指示があるときだけ（このセッションでは「適宜 push・ビルドしてよい」と許可を得て進めた）。
+最終更新: 2026-10-16 / ブランチ `claude/reduce-google-relogin-MCMj8`（2026-10-11〜16 のクラウドセッションは `ccr-fee171e2-4jcph6` に積んだ。
+`reduce-google-relogin-MCMj8` の先にコミットを足しただけなので `git merge --ff-only origin/ccr-fee171e2-4jcph6` で取り込める）。
+**`reduce-google-relogin-MCMj8` に push 済みは v2.16.0 まで**（v2.17.0・v2.17.1 は `ccr-fee171e2-4jcph6` にある。EAS ビルドは未起動）。push はユーザーの指示があるときだけ（このセッションでは「適宜 push・ビルドしてよい」と許可を得て進めた）。
 最新の EAS ビルドは v2.15.0 `e97a1a62`（成功。APK: https://expo.dev/artifacts/eas/zrMLQCB-DWCFB0Roj7j2zcd4T4-Nc3ZgYZJVJK6C02Q.apk）。v2.15.1 `4aa285d0` も成功（APK: https://expo.dev/artifacts/eas/azj5dStGuv8aDCM4bp7dso1K3yFaFjsLdpLGSCaK3qY.apk）。v2.15.2 `84ee9f34`・v2.16.0 のビルドは `.build-status.txt` を見る。
 **端末には EAS のビルドだけを入れる**（GitHub Actions の APK は署名が毎回変わり、上書きできない）。
 
-## 0. 現在地（2026-10-09 時点）
+## 0. 現在地（2026-10-16 時点）
 
 ### 状態
-- アプリは v2.17.0（サプリの CSV 取り込みは実機確認済み、ほかの v2.11〜2.17 は未確認）。設定画面のいちばん下に `v2.17.0` のように表示される。
-- v2.17.0: からだタブで相手の記録を見られるようにした（`_activity` に相手の行があれば「自分 / 相手の名前」の切り替えが出る。
-  相手の摂取カロリーは共有された食事の分だけ。仕様書 §12.3）。残タスク 5 を消化
+- アプリは v2.17.1（サプリの CSV 取り込みは実機確認済み、ほかの v2.11〜2.17 は未確認）。設定画面のいちばん下に `v2.17.1` のように表示される。
+- v2.17.0: からだタブで相手の記録を見られるようにした（`_activity` に相手の行があれば「自分 / 相手の名前」の切り替えが出る）。
+- v2.17.1: **v2.17.0 の相手の記録の表示を保留にした**（2026-10-16 ユーザー判断。本人の許可なく相手の身体情報を全部見られるのは望ましくない）。
+  `ActivityService.PARTNER_BODY_VIEW_AVAILABLE = false` で切り替えを出さない。コードは残してある。
+  再開するときは本人のオプトイン（`_nutrition_prefs` の `body_share` 列、既定 OFF）を先に実装する。手順は仕様書 §12.3「再開時の方針」
+- **Google スプレッドシートの連携（`mcp__Google_Sheets__*`）がクラウドセッションで使えるようになった**（2026-10-16）。
+  `get_values` でシートの中身を読める（7 章。ID の見つけ方も 7 章）
 - v2.16.0: 料理の写真の判別の精度上げ（料理名にトッピング・サイズを含める、見た目のメモを栄養の推定に添える、外食にも量の見積もりを渡す、
   写真の判別だけ `gemini-flash-latest` を先に使う）。きっかけは「チャーシュー麺がラーメンと判定されてカロリーが低い」タブは 撮影 / 食事 / からだ / 一覧（設定の「タブ」で表示・並び順を変えられる。⚙ はどのタブからも開ける）
 - スプレッドシートの食品データは差し替え済み（`_foods` 427 品目・`_menus` チェーン店 23 社 6,047 メニュー・`_chains`）。
@@ -50,10 +54,10 @@
 2. **要確認事項（2026-10-08 朝）を順番に確認**（8 章）: ~~成分表の同梱~~（v2.11.0 で実装）・アクセシビリティ・Play ストア・SuicaCSV・GPS
 3. `_chains` で「調査待ち」（requested）になったチェーンがあれば、Claude Code が公式の栄養表を調べて `_menus` に足す表を作る
    （`private/food-research/work/` の FORMAT.md・finalize.py の流れ。ユーザーが PC でインポート）。
-   クラウドの Google ドライブ連携ではシートの要約（先頭行）しか読めず、2026-10-11 時点で requested の有無は確認できていない。
-   ユーザーが `_chains` の status 列を見て伝えるか、Windows ローカルで確認する
+   **2026-10-16 にスプレッドシート連携で確認: requested は 0 件**（collected 23・none 10・candidate 33）。
+   次に確認するときは `get_values` で `_chains!A1:G200` を読み、C 列が `requested` の行を探す
 4. Anker の体重計（Eufy）をヘルスコネクトにつないだら、体脂肪率の表示と体重の推移・摂取カロリーの比較を足す（仕様書 §12.4）
-5. ~~相手のからだの記録の表示~~ → v2.17.0 で実装（実機確認待ち。8 章「v2.17 の実機確認」）
+5. 相手のからだの記録の表示 → v2.17.0 で実装、v2.17.1 で**保留**。再開はユーザーの指示があってから（仕様書 §12.3「再開時の方針」）
 
 ### 環境の注意
 - 型チェック: `cd C:\work\BudRec\kakeibo; npx tsc --noEmit`（エラー 0 件が正常）
@@ -663,6 +667,8 @@ APK には `EXPO_PUBLIC_GEMINI_API_KEY` が埋め込まれており、誰でも�
 - コンテナ側とズレるので、作業開始前に `git fetch origin` して差分を確認する。
 
 ### クラウドコンテナ（`/home/user/BudRec`）
+- **`cd kakeibo && npm ci --no-audit --no-fund --ignore-scripts` を入れれば `npx tsc --noEmit` が通る**（2026-10-11 確認。数分かかる。
+  エラー 0 件が正常）。以下は入れていないときの話。
 - **`node_modules` が未インストール**。そのため `npx tsc --noEmit` は
   `TS2307 Cannot find module 'react'` / `TS17004 JSX` / `TS2591 process` などで数百件エラーになる。
   これらは既存の環境起因であり、コードの問題ではない。自分の変更だけ確認するには:
@@ -680,6 +686,14 @@ APK には `EXPO_PUBLIC_GEMINI_API_KEY` が埋め込まれており、誰でも�
   絵文字は `/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf` を `embedded_color=True` で描画。
   グリフが固定 109px なので、**ラスタライズ後に getbbox → crop → LANCZOS で拡大**する。
 - 外向き HTTPS はプロキシ経由。TLS 検証を無効化したり `HTTPS_PROXY` を外したりしない。
+- **スプレッドシートは Google スプレッドシートの連携（`mcp__Google_Sheets__*`）で読める**（2026-10-16 接続）。
+  スプレッドシート ID は**リポジトリに書かない**（public。`.env` の `EXPO_PUBLIC_SPREADSHEET_ID` に移した経緯がある）。
+  Google ドライブの連携 `search_files` で `title = 'Bud-Rec' and mimeType = 'application/vnd.google-apps.spreadsheet'` を検索して得る。
+  ツールは遅延読み込みなので、先に ToolSearch で
+  `select:mcp__Google_Sheets__get_values` を読み込む。Google ドライブの連携（`read_file_content`）はシートごとの先頭行の要約しか返さない。
+  - 家計・食事・からだのデータが入っている。**読むのは作業に必要な範囲だけ**にし、中身をリポジトリ（public）に書かない
+  - **書き込み（`update_values` / `append_values` / `batch_clear_values` / `update_spreadsheet`）はユーザーの明示の指示があるときだけ**。
+    アプリの書き込みと競合しうる（行番号・rev の前提が崩れる）ので、原則はアプリ経由かユーザーが PC で行う
 
 ## 8. 未対応・次にやること
 
@@ -944,11 +958,11 @@ critic エージェント3体（services層／画面層／カメラ・OCR・基�
 4. **SuicaCSV のインポート**: CSV の入手方法と形式が決まっていない
 5. **GPS で店を特定**: 課金が要るため保留のまま
 
-### v2.17 の実機確認（2026-10-11。Discord の一覧には未記載）
-- からだタブ: 相手の端末がヘルスコネクトを連携して `_activity` に相手の行ができると、日付の下に「自分 / 相手の名前」が出ること
-  （相手の行が無いうちは何も出ない。`_users` には 2026-10-11 時点で「かみしろ」しか無い）
-- 相手を選ぶと歩数・睡眠・活動カロリー・体重と推移が相手の分になり、摂取カロリーは共有された食事の分だけになること。
-  「連携する」と「睡眠と食事」の比較は相手のときは出ないこと。「自分」に戻ると元どおりになること
+### v2.17 の実機確認（2026-10-16。Discord の一覧には未記載）
+- v2.17.1 では相手の記録の切り替えは保留中なので、**からだタブが v2.16.0 と同じ見え方であること**だけ確認する
+  （`_activity` に相手の行があっても「自分 / 相手の名前」が出ないこと）
+- 再開したときの確認項目（参考）: 本人が「見せる」を ON にした人だけ切り替えに出ること。相手を選ぶと歩数・睡眠・活動カロリー・体重と
+  推移が相手の分になり、摂取カロリーは共有された食事の分だけになること。「連携する」と「睡眠と食事」の比較は相手のときは出ないこと
 
 ### v2.11〜2.15 の実機確認（2026-10-10。Discord の一覧には未記載）
 - 自炊の料理・量り売りの食材で「成分表」の出どころが付くこと（Gemini が成分表の食品名を返すか）。設定画面の下に出典が出ること

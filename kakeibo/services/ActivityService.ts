@@ -20,6 +20,15 @@ import { shiftDay, toDay } from './NutritionJudge';
 import * as Demo from './DemoService';
 
 const SHEET = '_activity';
+
+/**
+ * からだタブで相手の記録を見る切り替え（v2.17.0 で実装）を出すか。**現在は保留（false）。**
+ * 本人の許可なく相手の身体情報を全部見られるのは望ましくないため、2026-10-11 に畳んだ。
+ * 再開するときは、本人が「〇〇にからだの記録を見せる」を ON にした人だけ出す作りにしてから true に戻す
+ * （`_nutrition_prefs` に `body_share` 列。既定 OFF。仕様書 §12.3・HANDOFF「再開時の方針」）。
+ * 型を `boolean` にしているのは、DEMO_MODE_AVAILABLE と同じく参照側が到達不能コード扱いされないようにするため。
+ */
+export const PARTNER_BODY_VIEW_AVAILABLE: boolean = false;
 export const ACTIVITY_HEADER = ['user', 'date', 'steps', 'sleep_min', 'active_kcal', 'exercise_min', 'weight_kg', 'updated_at'];
 /** 起動時・からだタブで読み直す日数 */
 const SYNC_DAYS = 14;

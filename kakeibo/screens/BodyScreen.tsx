@@ -4,8 +4,8 @@ import {
 } from 'react-native';
 import LineChart from '../components/LineChart';
 import {
-  DayActivity, HealthStatus, SLEEP_GOAL_MIN, connectHealth, healthStatus, loadActivity, openHealthSettings, stepGoal,
-  syncActivity,
+  DayActivity, HealthStatus, PARTNER_BODY_VIEW_AVAILABLE, SLEEP_GOAL_MIN, connectHealth, healthStatus, loadActivity,
+  openHealthSettings, stepGoal, syncActivity,
 } from '../services/ActivityService';
 import { getMeals, isMealShared, MealRow } from '../services/MealService';
 import { DEFAULT_PREFS, NutritionPrefs, loadPrefs } from '../services/NutritionPrefsService';
@@ -35,6 +35,7 @@ function hm(min: number): string {
  *
  * 相手の記録（相手の端末が `_activity` に写したもの）も「自分 / 相手の名前」で切り替えて見られる（§12.3）。
  * 相手の摂取カロリーは、自分に共有された食事の分だけ（食事タブと同じ見え方）。寝不足と食事の比較は自分の分だけ出す。
+ * **この切り替えは保留中**（`PARTNER_BODY_VIEW_AVAILABLE = false` の間は自分の記録だけ）。
  */
 export default function BodyScreen() {
   const { width } = useWindowDimensions();
@@ -91,9 +92,9 @@ export default function BodyScreen() {
     }
   };
 
-  // 切り替えられる人: `_activity` に記録のある自分以外の人（相手の端末が写したもの）
+  // 切り替えられる人: `_activity` に記録のある自分以外の人（相手の端末が写したもの）。保留中は誰も出さない
   const others = useMemo(
-    () => [...new Set(activity.map((a) => a.user))].filter((u) => u && u !== me).sort(),
+    () => (PARTNER_BODY_VIEW_AVAILABLE ? [...new Set(activity.map((a) => a.user))].filter((u) => u && u !== me).sort() : []),
     [activity, me],
   );
   const viewing = who && others.includes(who) ? who : me;
