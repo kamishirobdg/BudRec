@@ -1064,11 +1064,15 @@ critic エージェント3体（services層／画面層／カメラ・OCR・基�
 | ブランチ | 状態 |
 |---|---|
 | `claude/reduce-google-relogin-MCMj8` | **開発の本線**。v2.17.3 |
-| `main`（GitHub の既定ブランチ） | 最初のコミットのまま（本線より 139 件古い）。本線の祖先なので、本線に進めても失うものは無い |
-| `ccr-fee171e2-4jcph6` | 2026-10-11〜16 のクラウドセッションの作業ブランチ。中身はすべて本線に取り込み済み |
-| `claude/competent-bose`・`demo-mode-navigation-removal-8yy5bc`・`elated-mendel`・`gallant-elgamal`・`intelligent-moser`・`jolly-meninsky`・`jovial-germain`・`sleepy-antonelli` | 中身はすべて本線に取り込み済み（本線の祖先） |
-| `claude/nice-bardeen` | 本線に無いコミットが 1 件（2026-04-13 SquatCounter。別アプリ、38 ファイル） |
-| `claude/serene-moser` | 本線に無いコミットが 1 件（2026-04-07「カウンタ」Android アプリ。別アプリ、62 ファイル） |
+| `main`（GitHub の既定ブランチ） | 2026-10-16 夜に本線の最新へ fast-forward した（ユーザー判断）。push すると CI のビルドが走る（`build-apk.yml`）。今後も本線と揃えるときは fast-forward で |
+| 下の 11 本 | **ユーザーが削除すると決定（2026-10-16 夜）。クラウドセッションからの削除は 403 で拒否された**ので、GitHub の Web（Branches）か Windows から削除する |
+
+削除する 11 本:
+- 本線に取り込み済み（失うものは無い）: `ccr-fee171e2-4jcph6`・`claude/competent-bose`・`claude/demo-mode-navigation-removal-8yy5bc`・`claude/elated-mendel`・
+  `claude/gallant-elgamal`・`claude/intelligent-moser`・`claude/jolly-meninsky`・`claude/jovial-germain`・`claude/sleepy-antonelli`
+- 別アプリ（本線に無いコミットが 1 件ずつ。削除するとコードは消える。ユーザーが削除で了承）:
+  `claude/nice-bardeen`（SquatCounter `a104c1b`）・`claude/serene-moser`（カウンタ `2c23806`）
+- `build-apk.yml` の push 対象に `claude/competent-bose` が残っている。ブランチを消せば害は無い（ワークフローの編集は PAT の制約で 7 章）
 
 ## 10. コミット履歴（直近）
 
