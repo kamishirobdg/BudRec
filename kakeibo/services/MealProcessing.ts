@@ -455,11 +455,13 @@ export async function recordMeal(
           : r;
     });
     // 外食のメニュー・家の外で買った商品は食品データに足す（次からは調べずに済む）。
-    // 写真から量を見積もった・包装の表示を読んだものは、その回の量の値なので足さない
+    // 写真から量を見積もった・包装の表示を読んだものは、その回の量の値なので足さない。
+    // 外食も器の大きさからの見積もりを渡したときは、公式の値（メニューの一人前）が取れたときだけ足す
     await saveResearched(todo
       .map((i, k) => ({ i, k }))
-      .filter(({ i }) => dishes[i].kind !== 'home' && dishes[i].used.length === 0 &&
-        !(dishes[i].kind === 'packaged' && (dishes[i].grams || dishes[i].labelKcal)))
+      .filter(({ i, k }) => dishes[i].kind !== 'home' && dishes[i].used.length === 0 &&
+        !(dishes[i].kind === 'packaged' && (dishes[i].grams || dishes[i].labelKcal)) &&
+        !(dishes[i].kind === 'eat_out' && dishes[i].grams && !res.results[k].official))
       .map(({ i, k }) => ({
         query: { name: nameOf(i), chain: dishes[i].kind === 'eat_out' ? storeOf(i) : '', kind: dishes[i].kind, content: '' },
         result: { nutrients: res.results[k].nutrients, basis: 'package' as const, official: res.results[k].official },
