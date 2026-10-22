@@ -9,7 +9,7 @@
  */
 
 import {
-  RECEIPT_ITEM_SCHEMA, ReceiptData, buildPhotoPrompt, parseJson, receiptsFromParsed,
+  CancelledError, RECEIPT_ITEM_SCHEMA, ReceiptData, buildPhotoPrompt, parseJson, receiptsFromParsed,
 } from './AIProvider';
 import { callGemini, callGeminiDetailed } from './GeminiProvider';
 import { NUTRIENTS, NUTRIENT_KEYS, Nutrients, sanitizeNutrients } from '../services/Nutrients';
@@ -188,8 +188,10 @@ export interface PhotoAnalysis {
 }
 
 /**
- * 撮った写真を 1 回の呼び出しでレシートと料理・食品に振り分けて読む（両方写っていれば両方）。
- * レシートの小さい文字のために高解像度で送る。
+ * 撮った写真をレシートと料理・食品に振り分けて読む（両方写っていれば両方）。
+ * 1 回目は軽いモデルで全部を読む（レシートの小さい文字のために高解像度）。料理・食品が写っていたときだけ、
+ * 上位モデルで料理を読み直す（具材・サイズの見分けは上位モデルが得意）。読み直せなければ 1 回目の料理を使う。
+ * v2.16.0 は 1 回目から上位モデルにしていて、返事の遅さ・混み合いでレシートの読み取りまで失敗していた。
  */
 export async function analyzePhoto(
   imageBase64: string,
@@ -202,15 +204,46 @@ export async function analyzePhoto(
       { text: buildPhotoPrompt(categories, buildDishGuide(ctx)) },
       { inline_data: { mime_type: 'image/jpeg', data: imageBase64 } },
     ],
-    // 具材・サイズの見分けは上位モデルのほうが得意なので、写真の判別だけ精度を優先する（枠切れなら lite に逃げる）
-    { schema: photoSchema(RECEIPT_ITEM_SCHEMA), highRes: true, signal, quality: true },
+    { schema: photoSchema(RECEIPT_ITEM_SCHEMA), highRes: true, signal },
   );
   const parsed = parseJson(raw);
+  const dishes = dishesFromParsed(parsed, ctx.inventory.length);
   return {
     receipts: receiptsFromParsed({ receipts: Array.isArray(parsed?.receipts) ? parsed.receipts : [] }, raw, categories),
-    dishes:   dishesFromParsed(parsed, ctx.inventory.length),
+    dishes:   dishes.length > 0 ? (await refineDishes(imageBase64, ctx, signal)) ?? dishes : dishes,
   };
 }
+
+/** 料理・食品だけを上位モデルで読み直す。読めない・料理が無いと言われたら null（1 回目の結果を使う） */
+async function refineDishes(imageBase64: string, ctx: DishContext, signal?: AbortSignal): Promise<IdentifiedDish[] | null> {
+  try {
+    const raw = await callGemini(
+      [
+        { text: `あなたは食事記録のアシスタントです。写真に写っている料理・食品を読み取り、JSONのみを返してください。説明文・コードブロック記号・前後のテキストは一切不要です。
+レシート・メニュー表・値札・伝票は含めない。
+
+# dishes の書き方
+
+${buildDishGuide(ctx)}` },
+        { inline_data: { mime_type: 'image/jpeg', data: imageBase64 } },
+      ],
+      // 料理は既定の解像度で足りる。上位モデルだけを試す（軽いモデルの読み直しは 1 回目と同じなので無駄）
+      { schema: DISHES_SCHEMA, highRes: false, signal, quality: true, maxModels: 2 },
+    );
+    const dishes = dishesFromParsed(parseJson(raw), ctx.inventory.length);
+    return dishes.length > 0 ? dishes : null;
+  } catch (e) {
+    if (e instanceof CancelledError) throw e;
+    console.warn('[Meal] 料理の読み直しができなかったため、1 回目の結果を使う:', e instanceof Error ? e.message : e);
+    return null;
+  }
+}
+
+const DISHES_SCHEMA = {
+  type: 'OBJECT',
+  properties: { dishes: { type: 'ARRAY', items: DISH_ITEM_SCHEMA } },
+  required: ['dishes'],
+};
 
 export interface FoodQuery {
   name:  string;

@@ -186,6 +186,10 @@ export async function resolveModel(
 export function shouldTryAnotherModel(e: unknown): boolean {
   const status = axios.isAxiosError(e) ? e.response?.status : undefined;
   if (status === 429 || status === 404) return true; // 無料枠切れ / モデルが無い
+  // 混み合い（503）・サーバー側の失敗（500）・時間切れは、そのモデルだけの事情のことが多いので別のモデルで読み直す
+  // （上位モデルは返事が遅く混みやすい。v2.16.0 でこれが無く、写真の読み取りが失敗し続けた）
+  if (status === 500 || status === 503) return true;
+  if (axios.isAxiosError(e) && !e.response && (e.code === 'ECONNABORTED' || e.code === 'ETIMEDOUT')) return true;
   if (status === 400) {
     const msg = String(
       (axios.isAxiosError(e) ? (e.response?.data as any)?.error?.message : '') ?? '',

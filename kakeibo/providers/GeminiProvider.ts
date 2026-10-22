@@ -62,8 +62,10 @@ export interface CallOptions {
   signal?:  AbortSignal;
   /** Google 検索 grounding（`[{ google_search: {} }]`）。構造化出力と併用できないモデルがあるので schema は付けない */
   tools?:   object[];
-  /** 精度を優先して上位モデル（flash）を先に使う（料理の写真の判別）。枠切れなら lite に逃げる */
+  /** 精度を優先して上位モデル（flash）を先に使う（料理の写真の読み直し）。枠切れなら次の候補に移る */
   quality?: boolean;
+  /** 試すモデルの数の上限（既定 3）。料理の読み直しは上位モデルだけを試し、駄目なら軽いモデルの結果を使う */
+  maxModels?: number;
 }
 
 /**
@@ -125,7 +127,7 @@ export async function callGeminiDetailed(parts: object[], opts: CallOptions): Pr
   const tried: string[] = [];
   let lastError: unknown = null;
 
-  for (let attempt = 0; attempt < 3; attempt++) {
+  for (let attempt = 0; attempt < (opts.maxModels ?? 3); attempt++) {
     // モデルを乗り換える前に毎回見る。1 モデルあたり最大 60 秒かかるので、
     // ここで見ないとキャンセルしても次のモデルを試し始めてしまう
     throwIfCancelled();
