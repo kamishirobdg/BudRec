@@ -641,7 +641,7 @@ Sheets / Gmail は 429（クォータ超過）や 5xx を普通に返す。3 段
 > `with: packages: 'platform-tools'` を指定して修正済み（v1.7.0 のコミット）。ワークフローの変更は
 > PAT の制約で push できないことがある（セクション 7）。直るまでのビルドは EAS（`preview` プロファイル）で行う。
 
-`.github/workflows/build-apk.yml` が `claude/reduce-google-relogin-MCMj8` / `claude/competent-bose` /
+`.github/workflows/build-apk.yml` が `claude/reduce-google-relogin-MCMj8` /
 `main` への push、または手動実行（workflow_dispatch）で走る。所要 **約 26 分**。
 
 流れ: checkout → Node 22 / Java 21 / Android SDK → `npm ci` → `.env` 生成 →
@@ -920,7 +920,7 @@ I = 以前からの未確認（I1 オフラインの灰バナー・I2 月初の�
   `claude/gallant-elgamal`・`claude/intelligent-moser`・`claude/jolly-meninsky`・`claude/jovial-germain`・`claude/sleepy-antonelli`
 - 別アプリ（本線に無いコミットが 1 件ずつ。削除するとコードは消える。ユーザーが削除で了承）:
   `claude/nice-bardeen`（SquatCounter `a104c1b`）・`claude/serene-moser`（カウンタ `2c23806`）
-- `build-apk.yml` の push 対象に `claude/competent-bose` が残っている。ブランチを消せば害は無い（ワークフローの編集は PAT の制約で 7 章）
+- `build-apk.yml` の push 対象から `claude/competent-bose` を外した（2026-11-03。クラウドセッションから push）
 
 ## 10. コミット履歴（直近）
 
