@@ -69,7 +69,7 @@ export default function PendingReceiptsModal({
                   <Text style={styles.error} numberOfLines={2}>{item.error}</Text>
                 )}
                 {item.status === 'review' && (
-                  <Text style={styles.sub}>{item.rows?.length ?? 0} 件を読み取り</Text>
+                  <Text style={styles.sub}>{item.error ? item.error : `${item.rows?.length ?? 0} 件を読み取り`}</Text>
                 )}
                 <View style={styles.actions}>
                   {item.status === 'review' ? (

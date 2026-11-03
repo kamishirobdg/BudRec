@@ -559,6 +559,7 @@ function buildRow(p: {
     entryId: p.entryId, itemRefs: p.itemRefs, status: 'estimated', assignedBy: p.assignedBy ?? 'auto',
     photoRefs: p.photoRef ? [p.photoRef] : [],
     rev: 1, sources: p.result.tableSources ?? p.sources, updatedBy: p.updatedBy, updatedAt: p.eatenAt, choices: p.choices,
+    batchServings: p.kind === 'home' ? p.result.batchServings : undefined,
   };
 }
 

@@ -110,6 +110,8 @@ function toExpenseRow(data: ReceiptData, user: string, source: string): ExpenseR
     recurring:     false,
     items:         data.items,
     servings:      data.servings,
+    // 印字の時刻と、採用できる日付の両方があるときだけ（無ければ撮った時刻が入るので、同じレシートかの判定に使えない）
+    timePrinted:   !!data.time && /^\d{1,2}:\d{2}/.test(data.time) && acceptableDate(data.date, new Date()) !== null,
   };
 }
 

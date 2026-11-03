@@ -77,11 +77,15 @@ interface DishDraft {
   manualNutrition: boolean;
   /** この編集で包装の表示から入れた（保存できたら食品データにも入れる） */
   label?: NutritionLabel;
+  /** 自炊: 作った量が何人前か。whole はその 1 皿分（仕様書 §5.3.1） */
+  batchServings?: number;
 }
 
 const RATIOS = [0.5, 0.6, 0.7, 0.4, 0.3];
 /** 来客など、夫婦以外とも分けた品の人数（その場で食べた全員の数）。1 人 1/N ずつ食べたとみなす */
 const DINERS = [3, 4, 5, 6];
+/** 自炊で作った量（何人前）の選択肢 */
+const BATCHES = [1, 2, 3, 4, 6];
 
 /** いまの割り振りから「何人で分けたか」を読む（3 人以上で等分しているときだけ。それ以外は null） */
 function dinersOf(eaters: Eater[]): number | null {
@@ -122,6 +126,7 @@ function toDrafts(rows: MealRow[]): DishDraft[] {
       chosen: null,
       refreshed: false,
       manualNutrition: first.nutrientSource === 'manual' || first.nutrientSource === 'label',
+      batchServings: first.batchServings,
     };
   });
 }
@@ -206,7 +211,8 @@ export default function MealEditModal({ target, onClose, onSaved }: Props) {
   const contentChanged =
     drafts.length !== toDrafts(loaded).length ||
     drafts.some((d) => d.isNew || d.refreshed || d.chosen !== null || d.dish.trim() !== d.originalDish
-      || eatersKey(d.eaters) !== eatersKey(d.originalEaters));
+      || eatersKey(d.eaters) !== eatersKey(d.originalEaters)
+      || (!d.isNew && loaded.find((r) => r.dishId === d.dishId)?.batchServings !== d.batchServings));
   const changed = shareChanged || contentChanged;
   const needsReview = loaded.some((r) => r.status === 'needs_review');
 
@@ -243,6 +249,7 @@ export default function MealEditModal({ target, onClose, onSaved }: Props) {
           nutrientSource: r.official ? 'grounding' : r.tableSources ? 'food_table' : 'estimate',
           confidence: r.official ? 'high' : r.tableSources ? 'medium' : 'low',
           sources: r.tableSources ?? sources,
+          batchServings: d.kind === 'home' ? r.batchServings : undefined,
         };
       });
     } catch (e) {
@@ -258,6 +265,7 @@ export default function MealEditModal({ target, onClose, onSaved }: Props) {
       return d.eaters.map((e): MealRow => ({
         mealId, dishId: d.dishId, eatenAt, user: e.user, kind: d.kind, store: d.store,
         dish: d.dish.trim(), portion: e.portion, nutrients: scaleNutrients(d.whole, e.portion),
+        batchServings: d.kind === 'home' ? d.batchServings : undefined,
         nutrientSource: d.nutrientSource, confidence: d.confidence, entryId: d.entryId, itemRefs: resolved.itemRefs,
         // 見分けられなかった在庫を選ぶまでは確認待ちのまま
         // レシートから登録した印は、食べた人を直しても残す（「食べていない（在庫に戻す）」を出し続けるため）
@@ -689,6 +697,24 @@ export default function MealEditModal({ target, onClose, onSaved }: Props) {
                         />
                       )}
                     </View>
+                    {/* 自炊: 作った量が何人前か。変えると 1 皿分の栄養を合わせる（写真の 1 皿 = 作った量 ÷ 何人前） */}
+                    {d.kind === 'home' && !d.isNew && d.nutrientSource !== 'label' && (
+                      <View style={styles.chips}>
+                        <Text style={styles.ratioLegend}>作った量:</Text>
+                        {BATCHES.map((n) => (
+                          <Chip
+                            key={n}
+                            small
+                            label={`${n}人前`}
+                            active={Math.round(d.batchServings ?? 1) === n}
+                            onPress={() => update(d.dishId, {
+                              whole: scaleNutrients(d.whole, (d.batchServings ?? 1) / n),
+                              batchServings: n,
+                            })}
+                          />
+                        ))}
+                      </View>
+                    )}
                     {/* 来客など、ほかの人とも分けたとき: 食べた二人（か一人）がそれぞれ 1/N */}
                     <View style={styles.chips}>
                       <Text style={styles.ratioLegend}>ほかの人とも分けた:</Text>

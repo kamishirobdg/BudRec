@@ -377,6 +377,8 @@ export interface NutritionResult {
   official:  boolean;
   /** 同梱の成分表の値から求めた（自炊は食材ごとの成分表 × 量の合計）。そのときの出どころ */
   tableSources?: string[];
+  /** 自炊: 作った量が何人前か（モデルの見積もり）。nutrients はその 1 人前（写真の 1 皿）の分 */
+  batchServings?: number;
 }
 
 const NUTRIENT_LIST = NUTRIENTS.map((n) => `${n.key}（${n.label}・${n.unit}）`).join(', ');
@@ -399,11 +401,14 @@ export async function lookupNutrition(
     .join('\n');
   const prompt = `次の食事の栄養成分を求め、JSON のみを返してください（説明文は不要）。
 ${grounded ? 'チェーン店のメニューや市販の商品は、Google 検索で**店・メーカーの公式の栄養成分表示**を探して、その値を使ってください。公式の値が見つからなければ一般的な値で推定し、official を false にしてください。' : '家で作った料理なので、写真と料理名から一般的な分量・値で推定し、official は false にしてください。'}
-${hasHome ? `家で作った料理は、ingredients に使った食材と調味料（油・砂糖・しょうゆなども）を入れてください。grams と kcal は nutrients と同じ量（上の量）に使った分のグラム数（数値）とエネルギーにします。name は${TABLE_NAME_GUIDE}にします。\n` : ''}
+${hasHome ? `家で作った料理は、ingredients に使った食材と調味料（油・砂糖・しょうゆなども）を入れてください。name は${TABLE_NAME_GUIDE}にします。
+家で作った料理の「使った食材」は、**作った量全体（鍋・フライパン全体）**に使った量です。写真の 1 皿は、その一部のことがあります（作り置き・家族の分も作ったとき）。
+作った量が何人前か（写真の 1 皿の量で数えて何皿分か。1 皿だけ作ったなら 1）を batch_servings に入れ、
+nutrients と ingredients の grams・kcal は**写真の 1 皿の分**（作った量全体 ÷ batch_servings）にしてください。使った食材が書かれていなければ batch_servings は 1。\n` : ''}
 ${list}
 
 返す形:
-{"results":[{"index":0,"official":true,"nutrients":{"ENERC_KCAL":652,"PROT-":20.1, ...}}${hasHome ? ',{"index":1,"official":false,"nutrients":{...},"ingredients":[{"name":"にわとり 若どり もも 皮つき 生","grams":120,"kcal":228},{"name":"こいくちしょうゆ","grams":9,"kcal":7}]}' : ''}]}
+{"results":[{"index":0,"official":true,"nutrients":{"ENERC_KCAL":652,"PROT-":20.1, ...}}${hasHome ? ',{"index":1,"official":false,"batch_servings":4,"nutrients":{...},"ingredients":[{"name":"にわとり 若どり もも 皮つき 生","grams":120,"kcal":228},{"name":"こいくちしょうゆ","grams":9,"kcal":7}]}' : ''}]}
 
 nutrients のキーは次のとおり。値が分からないキーは null にする（0 と書かない）:
 ${NUTRIENT_LIST}`;
@@ -422,8 +427,10 @@ ${NUTRIENT_LIST}`;
     const hit = arr.find((r) => Number(r?.index) === i) ?? arr[i];
     const nutrients = sanitizeNutrients(hit?.nutrients);
     const table = q.kind === 'home' ? sumIngredients(hit?.ingredients, nutrients['ENERC_KCAL']) : null;
-    if (table) return { nutrients: table.nutrients, official: false, tableSources: table.sources };
-    return { nutrients, official: grounded && hit?.official === true };
+    const bs = Number(hit?.batch_servings);
+    const batchServings = q.kind === 'home' ? (bs >= 1 && bs <= 20 ? Math.round(bs * 10) / 10 : 1) : undefined;
+    if (table) return { nutrients: table.nutrients, official: false, tableSources: table.sources, batchServings };
+    return { nutrients, official: grounded && hit?.official === true, batchServings };
   });
   return { results, sources: res.sources };
 }

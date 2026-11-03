@@ -31,7 +31,8 @@ import {
 import { mealFromReceipt } from './ReceiptMeal';
 import { archiveMealPhoto, mealPhotoRef } from './PhotoStore';
 import { mealExists, mealsSheetName } from './MealService';
-import { existingEntryIds } from './SheetsService';
+import { existingEntryIds, getRows, sheetNameFromTimestamp } from './SheetsService';
+import { findSameReceipt } from './DuplicateDetector';
 import { ensureMealShared } from './SharedPhotos';
 import { researchSomePending } from './FoodService';
 import { fillSomeImages } from './FoodImages';
@@ -281,11 +282,16 @@ async function writeAnalysis(item: ReceiptQueue.ReceiptItem, a: StoredAnalysis):
   const messages: string[] = [];
 
   let saved: ExpenseRow[] = [];
+  /** 登録済みのレシートと同じだったので登録しなかった（「要確認」から登録もできる） */
+  let sameAs: ExpenseRow | null = null;
   if (a.receiptRows.length === 1) {
     const existing = await existingEntryIds(a.receiptRows);
     saved = a.receiptRows.filter((r) => existing.has(r.entryId ?? ''));
     const remaining = a.receiptRows.filter((r) => !existing.has(r.entryId ?? ''));
-    if (remaining.length > 0) {
+    if (remaining.length === 1) sameAs = await findRegisteredSame(remaining[0]);
+    if (sameAs) {
+      messages.push(`登録済みのレシートと同じなので登録しませんでした\n${sameAs.store} ¥${sameAs.amount.toLocaleString('ja-JP')}（${sameAs.timestamp.slice(5, 16)}）`);
+    } else if (remaining.length > 0) {
       const res = await saveReceiptRows(remaining);
       saved = [...saved, ...res.saved];
       messages.push(res.message);
@@ -304,6 +310,9 @@ async function writeAnalysis(item: ReceiptQueue.ReceiptItem, a: StoredAnalysis):
   if (a.receiptRows.length > 1) {
     // 誤読が起きやすいので保存前に見せる
     ReceiptQueue.setStatus(item.uri, 'review', { rows: a.receiptRows });
+  } else if (sameAs) {
+    // 消さずに「要確認」に残す。本当に別の買い物なら「確認」から登録できる
+    ReceiptQueue.setStatus(item.uri, 'review', { rows: a.receiptRows, error: '登録済みのレシートと同じ（登録していません）' });
   } else if (saved.length > 0) {
     ReceiptQueue.completeReceipt(item.uri, saved.map((r) => r.entryId!).filter(Boolean));
   } else {
@@ -318,6 +327,17 @@ async function writeAnalysis(item: ReceiptQueue.ReceiptItem, a: StoredAnalysis):
   if (meal?.authFailed) return 'auth-failed';
   if (meal?.sharedMeal) await ensureMealShared(meal.rows, meal.rows[0]?.updatedBy ?? '');
   return 'done';
+}
+
+/** 撮り直した同じレシートが登録済みなら、その行。読めなければ null（いつもどおり登録する。一覧の重複の警告は残る） */
+async function findRegisteredSame(row: ExpenseRow): Promise<ExpenseRow | null> {
+  if (!row.timePrinted) return null;
+  try {
+    return findSameReceipt(row, await getRows(sheetNameFromTimestamp(row.timestamp)));
+  } catch (e) {
+    console.warn('[OcrWorker] 同じレシートか確かめられなかった:', e instanceof Error ? e.message : e);
+    return null;
+  }
 }
 
 function mealMessage(meal: MealResult, title: string): string {

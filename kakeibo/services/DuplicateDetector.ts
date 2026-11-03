@@ -51,6 +51,30 @@ function memoSimilar(a: string, b: string): boolean {
   return false;
 }
 
+/** 店名の比べ方（大小文字・全角半角・空白と記号を揃える） */
+function normStore(s: string): string {
+  return s.normalize('NFKC').toLowerCase().replace(/[\s・･\-_.,()（）]/g, '');
+}
+
+/**
+ * 撮り直した同じレシートか（**自動で登録を止める**ので、警告より厳しく見る）。
+ * 金額が同じ・印字の日時が分まで同じ・店名の片方がもう片方で始まる（「LAWSON」と「LAWSON NL 新東京ビル店」）。
+ * 新しい行の日時が印字から取れていないときは判定しない（撮った時刻なので、同じ店で同じ物を 2 回買った場合と見分けられない）。
+ * 仕様書 §5.8
+ */
+export function findSameReceipt(row: ExpenseRow, existing: ExpenseRow[]): ExpenseRow | null {
+  if (!row.timePrinted || !(row.amount > 0)) return null;
+  const minute = row.timestamp.slice(0, 16);
+  const store = normStore(row.store);
+  if (!store) return null;
+  return existing.find((r) => {
+    if (r.deleted || (row.entryId && r.entryId === row.entryId)) return false;
+    if (r.amount !== row.amount || r.timestamp.slice(0, 16) !== minute) return false;
+    const other = normStore(r.store);
+    return !!other && (other.startsWith(store) || store.startsWith(other));
+  }) ?? null;
+}
+
 /** 行のユニークキー */
 function rowKey(r: ExpenseRow): string {
   return `${r.sheetName ?? ''}:${r.rowIndex ?? ''}`;

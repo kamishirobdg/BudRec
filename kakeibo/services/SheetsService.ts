@@ -45,6 +45,8 @@ export interface ExpenseRow {
   items?:        ReceiptItem[];
   /** 買ってすぐ食べる食事なら何人分か（追加時だけ。レシートから食事を登録するのに使う。仕様書 §5.7） */
   servings?:     number;
+  /** 日時がレシートの印字から取れたか（追加時だけ。同じレシートの撮り直しを見分けるのに使う） */
+  timePrinted?:  boolean;
   rowIndex?:     number;  // シート上の行番号（1-based、ヘッダー=1）。getRows で付与
   sheetName?:    string;  // 取得元シート名（YYYY-MM）。getRows で付与
 }

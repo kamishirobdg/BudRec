@@ -72,6 +72,11 @@ export interface MealRow {
    * スプレッドシート自体は二人で共有しているので、アプリ上の見え方の区別
    */
   shared?:        boolean;
+  /**
+   * 自炊の品で、作った量が何人前だったか（モデルの見積もりか、編集画面で直した値）。栄養は 1 皿分（全体 ÷ これ）。
+   * 外食・商品・古い行は undefined（仕様書 §5.3.1）
+   */
+  batchServings?: number;
   deleted?:       boolean;
   rowIndex?:      number;
   sheetName?:     string;
@@ -80,9 +85,9 @@ export interface MealRow {
 export const MEALS_HEADER = [
   'meal_id', 'dish_id', 'eaten_at', 'user', 'kind', 'store', 'dish', 'portion', 'nutrients',
   'nutrient_source', 'confidence', 'entry_id', 'item_refs', 'status', 'assigned_by', 'photo_refs',
-  'rev', 'sources', 'updated_by', 'updated_at', 'deleted', 'choices', 'shared',
+  'rev', 'sources', 'updated_by', 'updated_at', 'deleted', 'choices', 'shared', 'batch_servings',
 ];
-const MEALS_RANGE = 'A:W';
+const MEALS_RANGE = 'A:X';
 
 const HISTORY_SHEET = '_history';
 
@@ -114,6 +119,7 @@ function toCells(r: MealRow): (string | number)[] {
     r.rev, JSON.stringify(r.sources), r.updatedBy, r.updatedAt, r.deleted ? 'TRUE' : 'FALSE',
     JSON.stringify(r.choices ?? []),
     r.shared === undefined ? '' : r.shared ? 'TRUE' : 'FALSE',
+    r.batchServings === undefined ? '' : r.batchServings,
   ];
 }
 
@@ -152,6 +158,7 @@ function fromCells(c: string[], rowIndex: number, sheetName: string): MealRow {
     deleted:        (c[20] ?? '').toString().toUpperCase() === 'TRUE',
     choices:        parseJsonCell<ItemChoice[]>(c[21], []),
     shared:         c[22] === undefined || c[22] === '' ? undefined : String(c[22]).toUpperCase() === 'TRUE',
+    batchServings:  Number(c[23]) >= 1 ? Number(c[23]) : undefined,
     rowIndex,
     sheetName,
   };
@@ -261,7 +268,7 @@ export async function saveMeal(
     const row: MealRow = { ...r, mealId, rev, updatedBy: savedBy, updatedAt: now, deleted: false };
     const existing = currentByKey.get(keyOf(r));
     if (existing?.rowIndex) {
-      updates.push({ range: `'${sheetName}'!A${existing.rowIndex}:W${existing.rowIndex}`, values: [toCells(row)] });
+      updates.push({ range: `'${sheetName}'!A${existing.rowIndex}:X${existing.rowIndex}`, values: [toCells(row)] });
       saved.push({ ...row, rowIndex: existing.rowIndex, sheetName });
     } else {
       appends.push(toCells(row));
@@ -272,7 +279,7 @@ export async function saveMeal(
   for (const r of current) {
     if (nextKeys.has(keyOf(r)) || !r.rowIndex) continue;
     const row: MealRow = { ...r, rev, updatedBy: savedBy, updatedAt: now, deleted: true };
-    updates.push({ range: `'${sheetName}'!A${r.rowIndex}:W${r.rowIndex}`, values: [toCells(row)] });
+    updates.push({ range: `'${sheetName}'!A${r.rowIndex}:X${r.rowIndex}`, values: [toCells(row)] });
   }
 
   if (updates.length > 0) {
