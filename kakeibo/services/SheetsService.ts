@@ -1636,11 +1636,17 @@ export async function applyRecurringEntries(): Promise<number> {
   await upsertConfigValue(client, CONFIG_KEY_RECURRING_APPLIED_MONTH, currentMonth);
 
   try {
-    // 今月の既存 recurring エントリのキーセット
+    // **今月のシートを先に作っておく。** 無いまま 1 件目を追記すると、追記の中でシートが作られ
+    // （ensureSheetExists）、そこで前月の固定費がコピーされたうえに、ここでもう 1 回足してしまう。
+    // 2026-10・2026-11 の家賃が 2 行ずつできていた原因（2026-11-03 修正）
+    await ensureSheetExists(client, currentMonth);
+
+    // 今月の既存の固定費のキーセット。シート作成時のコピーは元の行の source をそのまま写すので、
+    // source だけでなく recurring の印でも拾う
     const currentRows = await getRows(currentMonth);
     const alreadyKeys = new Set(
       currentRows
-        .filter((r) => r.source === 'recurring')
+        .filter((r) => r.source === 'recurring' || r.recurring)
         .map((r) => `${r.store}|${r.category}|${r.user}|${r.amount}`),
     );
 
