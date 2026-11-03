@@ -80,6 +80,16 @@ interface DishDraft {
 }
 
 const RATIOS = [0.5, 0.6, 0.7, 0.4, 0.3];
+/** 来客など、夫婦以外とも分けた品の人数（その場で食べた全員の数）。1 人 1/N ずつ食べたとみなす */
+const DINERS = [3, 4, 5, 6];
+
+/** いまの割り振りから「何人で分けたか」を読む（3 人以上で等分しているときだけ。それ以外は null） */
+function dinersOf(eaters: Eater[]): number | null {
+  const p = eaters[0]?.portion ?? 1;
+  if (eaters.some((e) => Math.abs(e.portion - p) > 0.001)) return null;
+  const n = Math.round(1 / p);
+  return n >= 3 && Math.abs(p * n - 1) < 0.02 ? n : null;
+}
 
 function eatersKey(e: Eater[]): string {
   return e.map((x) => `${x.user}:${x.portion}`).sort().join(',');
@@ -679,7 +689,22 @@ export default function MealEditModal({ target, onClose, onSaved }: Props) {
                         />
                       )}
                     </View>
-                    {shared && partner && (
+                    {/* 来客など、ほかの人とも分けたとき: 食べた二人（か一人）がそれぞれ 1/N */}
+                    <View style={styles.chips}>
+                      <Text style={styles.ratioLegend}>ほかの人とも分けた:</Text>
+                      {DINERS.map((n) => (
+                        <Chip
+                          key={n}
+                          small
+                          label={`${n}人で`}
+                          active={dinersOf(d.eaters) === n}
+                          onPress={() => update(d.dishId, {
+                            eaters: d.eaters.map((e) => ({ user: e.user, portion: Math.round((1 / n) * 1000) / 1000 })),
+                          })}
+                        />
+                      ))}
+                    </View>
+                    {shared && partner && dinersOf(d.eaters) === null && (
                       <View style={styles.chips}>
                         {RATIOS.map((r) => (
                           <Chip

@@ -154,9 +154,15 @@ function MealCard({ g, me, onPress }: { g: MealGroup; me: string; onPress: () =>
       </View>
       {dishes.map((d) => {
         const eaters = g.rows.filter((r) => r.dishId === d.dishId);
-        const who = eaters.length > 1
-          ? eaters.map((e) => `${e.user}${Math.round(e.portion * 10)}`).join(':')
-          : eaters[0].user;
+        // 3 人以上で等分した品（来客など）は「〇人で」と出す
+        const total = eaters.reduce((s, e) => s + e.portion, 0);
+        const n = Math.round(1 / eaters[0].portion);
+        const diners = n >= 3 && eaters.every((e) => Math.abs(e.portion * n - 1) < 0.02) && total < 0.99 ? n : null;
+        const who = diners
+          ? `${eaters.map((e) => e.user).join('・')}（${diners}人で）`
+          : eaters.length > 1
+            ? eaters.map((e) => `${e.user}${Math.round(e.portion * 10)}`).join(':')
+            : eaters[0].user;
         return (
           <Text key={d.dishId} style={styles.dish} numberOfLines={1}>
             {d.dish}<Text style={styles.who}>　{who}</Text>
