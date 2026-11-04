@@ -6,4 +6,4 @@ my-next-app/
 private/
 
 # ビルド監視スクリプトの一時ファイル
-.build-status.txt
+.build-status*.txt
