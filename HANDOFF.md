@@ -25,6 +25,14 @@ push はユーザーの指示があるときだけ。
 - **Google スプレッドシートの連携（`mcp__Google_Sheets__*`）がクラウドセッションで使える**（2026-10-16〜）。読み取りだけ。手順と注意は 7 章
 
 ### 最近の版（新しい順）
+- **2026-11-04〜05 セキュリティ対応（ユーザーからの指摘）**: Gemini の API キーが `EXPO_PUBLIC_GEMINI_API_KEY` で APK に埋め込まれていて、
+  公開リポジトリの `.build-status*.txt`・HANDOFF・GitHub Actions の Artifacts から APK を入手した人がキーを取り出せた。
+  課金は無効（請求先アカウントなし）、30 日の Gemini API は 160 回で不審な利用は無し（ユーザーが確認）。
+  対応: 状態ファイルを追跡から外す（`c986dc3`）、HANDOFF から APK の URL を消す（`a8f9e0b`）、**中継（A1 案・Cloudflare Workers）を作った**
+  （`proxy/gemini/`。仕様書 §6.1）。アプリはキーを持たず `EXPO_PUBLIC_GEMINI_PROXY_URL` を見る。GitHub Actions もキーの代わりに中継の URL を書く。
+  **残りはユーザーの作業（指示したときに説明する）**: 新しいキーを作る（AI Studio で作るとサービスアカウントへの紐付けと「Gemini API」の制限が付く）→
+  Worker を登録して秘密の設定を入れる → `.env` と EAS の環境変数に中継の URL → ビルドして両方の端末に入れる → 古いキーを削除 →
+  GitHub Secrets の `EXPO_PUBLIC_GEMINI_API_KEY` を削除（a 案。ワークフローは残す）。新しいキーは会話に貼らない。履歴の書き換えはしない
 - v2.18.0（2026-11-03。未ビルド）: ユーザーが採用した 3 件。
   ① 来客など、夫婦以外とも分けた品（仕様書 §9-4）。食事の編集画面の品ごとに「ほかの人とも分けた: 3人で〜6人で」。食べた人の割合を 1/N。一覧には「（N人で）」。
   ② **同じレシートの撮り直しは登録しない**（#4 の A 案。§5.8）。金額・印字の日時（分）・店名の頭が同じなら登録せず「要確認」に残す。
@@ -658,7 +666,7 @@ APK は Actions の該当 run ページの Artifacts からダウンロードす
 
 ### 必須の GitHub Secrets（すべて設定済み）
 ```
-EXPO_PUBLIC_GEMINI_API_KEY
+EXPO_PUBLIC_GEMINI_PROXY_URL   （2026-11 から。Gemini のキーは入れない。EXPO_PUBLIC_GEMINI_API_KEY は削除する）
 EXPO_PUBLIC_GOOGLE_CLIENT_ID_ANDROID
 EXPO_PUBLIC_GOOGLE_CLIENT_ID_WEB
 EXPO_PUBLIC_SPREADSHEET_ID
@@ -893,7 +901,7 @@ I = 以前からの未確認（I1 オフラインの灰バナー・I2 月初の�
   記録したとき（レシートが無いとき）の店舗の補完」。位置履歴が共有スプレッドシートに残る点も設計時に考慮する。
 
 #### Play ストア公開に向けて（2026-10-16 夜に「公開しない」と決定。凍結）
-- [ ] Gemini API キーをバンドルから外す（現状 JS に埋め込まれており抽出可能）
+- [x] Gemini API キーをバンドルから外す（2026-11-05、Cloudflare Workers の中継。仕様書 §6.1）
 - [ ] スプレッドシートの自動作成（初回起動時）
 - [ ] ユーザーごとの API キー設定
 - [ ] プライバシーポリシーページ

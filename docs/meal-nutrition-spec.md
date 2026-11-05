@@ -479,6 +479,17 @@ Drive API の有効化・同意画面へのスコープ追加・二人の再ロ�
 
 ## 6. 栄養の求め方
 
+### 6.1 Gemini の呼び出し口（2026-11-05。セキュリティ対応）
+
+- アプリには Gemini の API キーを持たせない（`EXPO_PUBLIC_` の値は JS に埋め込まれ、APK から取り出せるため）。
+- Gemini はすべて中継（Cloudflare Workers。`proxy/gemini/`）から呼ぶ。アプリは Google ログインのアクセストークンを付け、
+  中継は tokeninfo で発行先（Bud-Rec の OAuth クライアント）とメールアドレス（許可した 2 人）を確かめてから、キーを付けて送る。
+- 通すのは `GET /v1beta/models`（使えるモデルの一覧）と `POST /v1beta/models/<model>:generateContent` だけ。
+  Gemini の応答（429・404・503 など）はそのまま返すので、モデルの選び直し・枠切れの扱いは前と同じ。
+- 中継が断ったときは `x-proxy-error`（auth / forbidden など）。auth ならアプリはトークンを 1 回取り直して送り直し、駄目なら再サインイン。
+- アプリの設定は `EXPO_PUBLIC_GEMINI_PROXY_URL`（秘密ではない）。キーの作り直しは中継の秘密の設定だけで済み、アプリのビルドは要らない
+
+
 | 種類 | 方法 |
 |---|---|
 | チェーン店のメニュー | grounding（店名＋レシートの品名で公式の栄養表示を検索） |

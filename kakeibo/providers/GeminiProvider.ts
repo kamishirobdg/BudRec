@@ -17,16 +17,12 @@ import {
   resolveModel,
   shouldTryAnotherModel,
 } from './geminiModels';
+import { proxyRequest } from './geminiProxy';
 
-// ─── API キー（.env の EXPO_PUBLIC_GEMINI_API_KEY に設定） ──────────────────
-// https://aistudio.google.com/apikey で取得し .env に記載
-export const GEMINI_API_KEY = process.env.EXPO_PUBLIC_GEMINI_API_KEY ?? '';
-// ─────────────────────────────────────────────────────────────────────────────
-
+// API キーはアプリに持たせない（APK から取り出せるため）。Gemini は中継（geminiProxy）経由で呼ぶ（2026-11）
 // モデル名は固定しない。ListModels で「今このキーで使えるモデル」を解決する。
 // （実測: gemini-2.0-flash はこのキーでは無料枠 0 で 429 になる）
-const endpointFor = (model: string) =>
-  `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+const pathFor = (model: string) => `/v1beta/models/${model}:generateContent`;
 
 export const geminiProvider: AIProvider = {
   name: 'gemini',
@@ -86,10 +82,6 @@ export async function callGemini(parts: object[], opts: CallOptions): Promise<st
 }
 
 export async function callGeminiDetailed(parts: object[], opts: CallOptions): Promise<GeminiResult> {
-  if (!GEMINI_API_KEY || GEMINI_API_KEY.startsWith('YOUR_')) {
-    throw new Error('GEMINI_API_KEY が未設定です');
-  }
-
   const { signal } = opts;
   const throwIfCancelled = () => {
     if (signal?.aborted) throw new CancelledError();
@@ -134,7 +126,7 @@ export async function callGeminiDetailed(parts: object[], opts: CallOptions): Pr
 
     let model: string;
     try {
-      model = await resolveModel(GEMINI_API_KEY, { exclude: tried, force: attempt > 0, prefer: opts.quality ? 'quality' : 'cost' });
+      model = await resolveModel({ exclude: tried, force: attempt > 0, prefer: opts.quality ? 'quality' : 'cost' });
     } catch (e) {
       throw toReadableError(lastError ?? e);
     }
@@ -183,9 +175,9 @@ async function postToModel(
   highRes: boolean,
   signal?: AbortSignal,
 ): Promise<GeminiResult> {
-  const res = await axios.post(
-    endpointFor(model),
-    {
+  const res = await proxyRequest<any>(pathFor(model), {
+    method: 'POST',
+    data: {
       contents: [{ parts }],
       ...(opts.tools ? { tools: opts.tools } : {}),
       generationConfig: {
@@ -197,13 +189,9 @@ async function postToModel(
         ...(highRes ? { mediaResolution: 'MEDIA_RESOLUTION_HIGH' } : {}),
       },
     },
-    {
-      params:  { key: GEMINI_API_KEY },
-      headers: { 'Content-Type': 'application/json' },
-      timeout: 60_000,
-      signal,
-    },
-  );
+    timeout: 60_000,
+    signal,
+  });
 
   const candidate = res.data?.candidates?.[0];
   // grounding を使うと本文が複数の part に分かれて返ることがある

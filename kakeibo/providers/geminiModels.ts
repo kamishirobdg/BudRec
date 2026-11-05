@@ -11,8 +11,7 @@
 
 import axios from 'axios';
 import { getItem, setItem } from '../services/Storage';
-
-const API_BASE = 'https://generativelanguage.googleapis.com/v1beta';
+import { proxyRequest } from './geminiProxy';
 
 const CACHE_KEY    = 'gemini_model_cache';
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
@@ -101,12 +100,9 @@ export async function invalidateModelCache(): Promise<void> {
   }
 }
 
-/** そのキーで generateContent が使えるモデル名の一覧 */
-export async function listAvailableModels(apiKey: string): Promise<string[]> {
-  const res = await axios.get(`${API_BASE}/models`, {
-    params: { key: apiKey, pageSize: 200 },
-    timeout: 15_000,
-  });
+/** generateContent が使えるモデル名の一覧（中継経由。キーは中継が持つ） */
+export async function listAvailableModels(): Promise<string[]> {
+  const res = await proxyRequest('/v1beta/models', { method: 'GET', params: { pageSize: 200 }, timeout: 15_000 });
   const models: { name?: string; supportedGenerationMethods?: string[] }[] =
     res.data?.models ?? [];
   return models
@@ -122,7 +118,6 @@ export async function listAvailableModels(apiKey: string): Promise<string[]> {
  * @param prefer  quality なら上位モデル（flash）を先に試す（既定は安い lite）
  */
 export async function resolveModel(
-  apiKey: string,
   opts: { exclude?: string[]; force?: boolean; prefer?: ModelPreference } = {},
 ): Promise<string> {
   const exclude = new Set(opts.exclude ?? []);
@@ -143,7 +138,7 @@ export async function resolveModel(
 
   let available: string[];
   try {
-    available = await listAvailableModels(apiKey);
+    available = await listAvailableModels();
   } catch (e) {
     // 一覧が引けなくても OCR 自体は試させる（古いキャッシュ → 既定値の順）。
     // e は axios のエラーで、リクエストの params（= APIキー）を保持したままログに出るため
