@@ -1,0 +1,5 @@
+# Bud-Rec の Gemini 中継（Cloudflare Workers）。仕組みと登録の手順は README.md。
+# キー・許可するメールアドレス・OAuth クライアント ID は `npx wrangler secret put` で入れる（ここには書かない）
+name = "budrec-gemini-proxy"
+main = "src/index.js"
+compatibility_date = "2025-09-01"

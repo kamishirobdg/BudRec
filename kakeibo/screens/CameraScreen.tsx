@@ -1,11 +1,10 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
-  Animated,
   Button,
   FlatList,
-  Image,
+  KeyboardAvoidingView,
   Modal,
   Pressable,
   ScrollView,
@@ -23,14 +22,20 @@ import {
 } from 'expo-camera';
 import * as ImagePicker from 'expo-image-picker';
 import * as Notifications from 'expo-notifications';
+import { useNavigation } from '@react-navigation/native';
 import * as CategoryService from '../services/CategoryService';
-import { appendRow, ExpenseRow } from '../services/SheetsService';
+import { ExpenseRow, existingEntryIds, getUniqueUsers } from '../services/SheetsService';
+import { AuthError } from '../services/AuthService';
 import { getCurrentUser } from '../services/UserService';
-import { getProvider } from '../providers';
 import * as ReceiptQueue from '../services/ReceiptQueueService';
+import * as OcrWorker from '../services/OcrWorker';
+import { saveReceiptRows } from '../services/ReceiptProcessing';
+import ReceiptReviewModal from './ReceiptReviewModal';
+import PendingReceiptsModal from './PendingReceiptsModal';
+import MealEditModal, { MealTarget } from './MealEditModal';
+import ZoomableImage from '../components/ZoomableImage';
 
 // 通知ハンドラ: フォアグラウンド時もバナーとリストに表示する。
-// タブ切替・バックグラウンド移行時に OCR 処理の進捗と結果を見せるため。
 Notifications.setNotificationHandler({
   handleNotification: async () => ({
     shouldShowAlert:  true,
@@ -41,227 +46,183 @@ Notifications.setNotificationHandler({
   }),
 });
 
-export default function CameraScreen() {
+interface Props {
+  onSignedOut:    () => void;
+  onStatusChange: (msg: string) => void;
+  onSuccess:      (msg: string) => void;
+  /** ヘッダーの ⚙ から設定を開く */
+  onOpenSettings?: () => void;
+}
+
+export default function CameraScreen({ onSignedOut, onStatusChange, onSuccess, onOpenSettings }: Props) {
+  const navigation = useNavigation();
   const [permission, requestPermission] = useCameraPermissions();
   const [facing] = useState<CameraType>('back');
-  const [busy, setBusy]           = useState(false);
-  const [statusMsg, setStatusMsg] = useState<string>('');
-  const [toast, setToast]         = useState<string>('');
-  const toastOpacity              = useRef(new Animated.Value(0)).current;
+  // 撮影・ギャラリー選択の最中だけ立てる。OCR の処理中も次を撮れる
+  const [capturing, setCapturing] = useState(false);
   const cameraRef                 = useRef<CameraView>(null);
 
-  // 未処理レシートの URI 一覧
-  const [pendingUris, setPendingUris] = useState<string[]>([]);
-  // 手動入力モーダルの対象レシート
-  const [manualTarget, setManualTarget] = useState<string | null>(null);
+  // 画像キューと裏の OCR の状態
+  const [items, setItems]       = useState<ReceiptQueue.ReceiptItem[]>([]);
+  const [progress, setProgress] = useState<OcrWorker.WorkerProgress>(OcrWorker.getProgress());
+  const [listOpen, setListOpen] = useState(false);
 
-  // 通知権限を起動時にリクエスト（通知なしでも動作するので静かに）
+  // 手動入力・確認の対象
+  const [manualTarget, setManualTarget] = useState<ReceiptQueue.ReceiptItem | null>(null);
+  const [review, setReview]             = useState<ReceiptQueue.ReceiptItem | null>(null);
+  const [reviewBusy, setReviewBusy]     = useState(false);
+  // 食事の確認・手入力（料理の写真から）
+  const [mealTarget, setMealTarget]     = useState<{ item: ReceiptQueue.ReceiptItem; target: MealTarget } | null>(null);
+
+  // 代理入力モード
+  const [proxyMode, setProxyMode] = useState(false);
+  const [proxyUser, setProxyUser] = useState('');
+
+  // 通知権限を起動時にリクエスト（OCR 処理中の常駐通知を出すため。拒否されても OCR は動く）
   useEffect(() => {
     Notifications.requestPermissionsAsync().catch(() => {});
   }, []);
 
-  // toast の表示・自動消滅
-  useEffect(() => {
-    if (!toast) return;
-    Animated.timing(toastOpacity, {
-      toValue: 1,
-      duration: 200,
-      useNativeDriver: true,
-    }).start();
-    const timer = setTimeout(() => {
-      Animated.timing(toastOpacity, {
-        toValue: 0,
-        duration: 300,
-        useNativeDriver: true,
-      }).start(() => setToast(''));
-    }, 3000);
-    return () => clearTimeout(timer);
-  }, [toast, toastOpacity]);
-
-  /** pending-receipts ディレクトリを読み直して state に反映 */
-  const refreshPending = useCallback(() => {
+  const refresh = useCallback(() => {
     try {
-      setPendingUris(ReceiptQueue.listPendingReceipts());
+      setItems(ReceiptQueue.listItems());
     } catch {
-      setPendingUris([]);
+      setItems([]);
     }
+    setProgress(OcrWorker.getProgress());
   }, []);
 
-  // マウント時に未処理レシートをスキャン
   useEffect(() => {
-    refreshPending();
-  }, [refreshPending]);
+    refresh();
+    return OcrWorker.subscribe(refresh);
+  }, [refresh]);
 
-  /** OCR → スプレッドシート書き込み。例外は投げるのみ、後始末しない */
-  const runOcrAndSave = async (base64: string) => {
-    setStatusMsg('OCR解析中...');
-    const categories = await CategoryService.getCategories();
-    const provider = getProvider();
-    const data = await provider.extractReceipt(base64, categories);
+  const attention = items.filter((i) => i.status !== 'queued' && i.status !== 'deferred');
+  const deferred  = items.filter((i) => i.status === 'deferred');
+  const deferredUntil = OcrWorker.nextDeferredAt();
 
-    setStatusMsg('スプレッドシートに書き込み中...');
-    const timestamp = formatTimestamp(data.date, data.time);
-    const user = await getCurrentUser();
-    const row: ExpenseRow = {
-      timestamp,
-      source:        'camera',
-      user,
-      store:         data.store,
-      category:      data.category,
-      amount:        data.amount,
-      memo:          summarizeItems(data.items),
-      countedAmount: data.amount,
-      excluded:      false,
-      confirmed:     false,
-      recurring:     false,
-    };
-    await appendRow(row);
-    setToast(
-      `記録しました\n${data.store}  ¥${data.amount.toLocaleString()}\n${data.category} · ${timestamp}`,
-    );
-  };
+  useEffect(() => {
+    if (listOpen && attention.length === 0) setListOpen(false);
+  }, [listOpen, attention.length]);
 
-  /** 2 回失敗時のダイアログ（再試行 / 手動入力 / 諦める） */
-  const showFailureDialog = (uri: string, msg: string) => {
-    Alert.alert(
-      'OCR失敗',
-      `2 回試行しましたが失敗しました:\n${msg}`,
-      [
-        {
-          text: '再試行',
-          onPress: () => {
-            processReceipt(uri);
-          },
-        },
-        {
-          text: '手動入力',
-          onPress: () => setManualTarget(uri),
-        },
-        {
-          text: '諦める',
-          style: 'destructive',
-          onPress: () => {
-            ReceiptQueue.deleteReceipt(uri);
-            refreshPending();
-          },
-        },
-      ],
-      { cancelable: false },
-    );
-  };
-
-  /**
-   * 保存済みレシートファイルを OCR 処理する。
-   * 失敗時は 1 秒待って 1 回だけ自動リトライ。それでも失敗なら 3 択ダイアログ。
-   */
-  const processReceipt = async (uri: string) => {
-    setBusy(true);
-    setStatusMsg('OCR解析中...');
-    try {
-      let base64: string;
-      try {
-        base64 = ReceiptQueue.readReceipt(uri);
-      } catch (e) {
-        Alert.alert(
-          'ファイル読み込み失敗',
-          `画像ファイルが壊れています。破棄します。\n${e instanceof Error ? e.message : String(e)}`,
-        );
-        ReceiptQueue.deleteReceipt(uri);
-        refreshPending();
-        return;
-      }
-
-      try {
-        await runOcrAndSave(base64);
-        ReceiptQueue.deleteReceipt(uri);
-        refreshPending();
-        return;
-      } catch (firstErr) {
-        console.warn('[Receipt] OCR 1回目失敗、リトライ:', firstErr);
-      }
-
-      // 自動リトライ
-      setStatusMsg('OCR再試行中...');
-      await new Promise((r) => setTimeout(r, 1000));
-      try {
-        await runOcrAndSave(base64);
-        ReceiptQueue.deleteReceipt(uri);
-        refreshPending();
-      } catch (secondErr) {
-        const msg = secondErr instanceof Error ? secondErr.message : String(secondErr);
-        showFailureDialog(uri, msg);
-      }
-    } finally {
-      setBusy(false);
-      setStatusMsg('');
+  const handleProxyToggle = useCallback(async () => {
+    if (proxyMode) {
+      setProxyMode(false);
+      setProxyUser('');
+      return;
     }
+    try {
+      const currentUser = await getCurrentUser();
+      const allUsers = await getUniqueUsers();
+      const others = allUsers.filter((u) => u !== currentUser);
+      if (others.length === 0) {
+        Alert.alert('代理入力', '他のユーザーが見つかりません。相手の端末でサインインした後に利用できます。');
+        return;
+      }
+      if (others.length === 1) {
+        setProxyUser(others[0]);
+        setProxyMode(true);
+        return;
+      }
+      Alert.alert(
+        '代理入力するユーザーを選択',
+        '',
+        others.map((u) => ({ text: u, onPress: () => { setProxyUser(u); setProxyMode(true); } })),
+      );
+    } catch {
+      Alert.alert('エラー', '代理入力の設定に失敗しました');
+    }
+  }, [proxyMode]);
+
+  useLayoutEffect(() => {
+    navigation.setOptions({
+      headerRight: () => (
+        <View style={styles.headerRight}>
+          <TouchableOpacity
+            style={[styles.proxyHeaderBtn, proxyMode && styles.proxyHeaderBtnActive]}
+            onPress={handleProxyToggle}
+          >
+            <Text style={[styles.proxyHeaderBtnText, proxyMode && styles.proxyHeaderBtnTextActive]}>
+              {proxyMode ? `代理: ${proxyUser}` : '代理入力'}
+            </Text>
+          </TouchableOpacity>
+          {onOpenSettings && (
+            <TouchableOpacity onPress={onOpenSettings} style={styles.headerGear}>
+              <Text style={styles.headerGearText}>⚙</Text>
+            </TouchableOpacity>
+          )}
+        </View>
+      ),
+    });
+  }, [navigation, proxyMode, proxyUser, handleProxyToggle, onOpenSettings]);
+
+  /** 撮影時点の代理相手で積む（後から代理入力を切り替えても変わらない） */
+  const enqueue = (base64: string) => {
+    OcrWorker.enqueue(base64, proxyMode ? proxyUser : undefined);
   };
 
   const handleShoot = async () => {
-    if (!cameraRef.current || busy) return;
-    setBusy(true);
-    setStatusMsg('撮影中...');
-
+    if (!cameraRef.current || capturing) return;
+    setCapturing(true);
     try {
       const photo = await cameraRef.current.takePictureAsync({
         base64:  true,
-        quality: 0.6,
+        // レシートの小さい文字が JPEG 圧縮で潰れると誤読になる。
+        // 複数枚を 1 枚に収めた場合は特に効くので、多少サイズが増えても品質を優先する
+        quality: 0.85,
         skipProcessing: true,
         shutterSound: false,
       });
       if (!photo?.base64) throw new Error('画像の取得に失敗しました');
-      const uri = ReceiptQueue.saveReceipt(photo.base64);
-      refreshPending();
-      // busy は processReceipt 側でも制御するので一旦 false にしておく
-      setBusy(false);
-      setStatusMsg('');
-      await processReceipt(uri);
+      enqueue(photo.base64);
     } catch (e) {
-      setBusy(false);
-      setStatusMsg('');
       Alert.alert('失敗', e instanceof Error ? e.message : String(e));
+    } finally {
+      setCapturing(false);
     }
   };
 
   const handlePickImage = async () => {
-    if (busy) return;
-
-    const result = await ImagePicker.launchImageLibraryAsync({
-      mediaTypes: ['images'],
-      base64: true,
-      quality: 0.8,
-      allowsMultipleSelection: false,
-    });
-
-    if (result.canceled || !result.assets[0]?.base64) return;
-
+    if (capturing) return;
+    // ピッカーが実際に開くまでの間も連打で多重起動されないようにする（撮影ボタンと同様）
+    setCapturing(true);
     try {
-      const uri = ReceiptQueue.saveReceipt(result.assets[0].base64);
-      refreshPending();
-      await processReceipt(uri);
+      const result = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: ['images'],
+        base64: true,
+        quality: 0.9,
+        allowsMultipleSelection: false,
+      });
+      if (result.canceled || !result.assets[0]?.base64) return;
+      enqueue(result.assets[0].base64);
     } catch (e) {
       Alert.alert('失敗', e instanceof Error ? e.message : String(e));
+    } finally {
+      setCapturing(false);
     }
   };
 
-  /** pending バナーから一括処理 */
-  const handleProcessPending = async () => {
-    if (busy || pendingUris.length === 0) return;
-    // スナップショットをコピーしてから 1 件ずつ順に処理
-    const snapshot = [...pendingUris];
-    for (const uri of snapshot) {
-      // 途中で失敗 → 3択ダイアログが出るのでそこで止まる。
-      // ダイアログ閉じた後は refreshPending で次の件がバナーに残るのでユーザーが再開できる
-      await processReceipt(uri);
-    }
+  const handleDiscard = (item: ReceiptQueue.ReceiptItem) => {
+    Alert.alert('破棄しますか？', undefined, [
+      { text: 'キャンセル', style: 'cancel' },
+      {
+        text: '破棄する',
+        style: 'destructive',
+        onPress: () => {
+          ReceiptQueue.deleteReceipt(item.uri);
+          refresh();
+        },
+      },
+    ]);
   };
 
-  /** pending 全破棄（2 段階確認） */
-  const handleDiscardPending = () => {
-    if (pendingUris.length === 0) return;
+  /** 要確認の全破棄（2 段階確認）。OCR 待ちの画像には触らない */
+  const handleDiscardAll = () => {
+    if (attention.length === 0) return;
+    const targets = [...attention];
     Alert.alert(
       '全て破棄しますか？',
-      `${pendingUris.length} 件の未処理レシートを全て削除します。`,
+      `${targets.length} 件の画像を全て削除します。`,
       [
         { text: 'キャンセル', style: 'cancel' },
         {
@@ -277,8 +238,9 @@ export default function CameraScreen() {
                   text: '破棄する',
                   style: 'destructive',
                   onPress: () => {
-                    ReceiptQueue.deleteAllReceipts();
-                    refreshPending();
+                    for (const t of targets) ReceiptQueue.deleteReceipt(t.uri);
+                    setListOpen(false);
+                    refresh();
                   },
                 },
               ],
@@ -289,20 +251,74 @@ export default function CameraScreen() {
     );
   };
 
+  const showAuthAlert = () => {
+    Alert.alert('再サインインが必要です', 'セッションが期限切れです。再度サインインしてください。', [
+      { text: 'OK', onPress: onSignedOut },
+    ]);
+  };
+
+  /** 確認・手動入力から保存する。成功したら画像を消す */
+  const saveFromItem = async (uri: string, rows: ExpenseRow[]): Promise<boolean> => {
+    onStatusChange(
+      rows.length > 1
+        ? `スプレッドシートに書き込み中... (${rows.length}件)`
+        : 'スプレッドシートに書き込み中...',
+    );
+    try {
+      // 確認画面から保存している途中でアプリが終了されると、確認待ちのまま残る。行の ID は振り分けのときに
+      // 振ってあるので、もう一度保存されたら書けている行は飛ばす（二重に登録しない）。
+      // 調べられなければ（圏外など）全部書く（書き込みは未送信キューに回る）
+      const existing = await existingEntryIds(rows).catch(() => new Set<string>());
+      const done = rows.filter((r) => r.entryId && existing.has(r.entryId));
+      const rest = rows.filter((r) => !(r.entryId && existing.has(r.entryId)));
+      const result = rest.length > 0
+        ? await saveReceiptRows(rest)
+        : { message: '登録済みです', entryIds: [] as string[], saved: [] as ExpenseRow[] };
+      const msg = result.message;
+      const entryIds = [...done.map((r) => r.entryId!), ...result.entryIds];
+      const saved = [...done, ...result.saved];
+      ReceiptQueue.completeReceipt(uri, entryIds);
+      // 前後の時間の食事にレシートをひも付け直す（待たずに裏で進める）
+      void OcrWorker.linkSavedReceipts(saved);
+      refresh();
+      onSuccess(msg);
+      return true;
+    } catch (e) {
+      if (e instanceof AuthError) {
+        showAuthAlert();
+        return false;
+      }
+      Alert.alert('保存失敗', e instanceof Error ? e.message : String(e));
+      return false;
+    } finally {
+      onStatusChange('');
+    }
+  };
+
+  /** 読み取り結果の確認モーダルで「登録する」 */
+  const handleReviewCommit = async (kept: ExpenseRow[]) => {
+    if (!review) return;
+
+    // 全部「登録しない」＝このレシートは要らない。画像ごと片付ける
+    if (kept.length === 0) {
+      ReceiptQueue.deleteReceipt(review.uri);
+      setReview(null);
+      refresh();
+      return;
+    }
+
+    setReviewBusy(true);
+    try {
+      if (await saveFromItem(review.uri, kept)) setReview(null);
+    } finally {
+      setReviewBusy(false);
+    }
+  };
+
   /** 手動入力モーダルから保存 */
   const handleManualSave = async (entry: ExpenseRow) => {
     if (!manualTarget) return;
-    try {
-      await appendRow(entry);
-      ReceiptQueue.deleteReceipt(manualTarget);
-      setManualTarget(null);
-      refreshPending();
-      setToast(
-        `手動入力を記録しました\n${entry.store}  ¥${entry.amount.toLocaleString()}`,
-      );
-    } catch (e) {
-      Alert.alert('保存失敗', e instanceof Error ? e.message : String(e));
-    }
+    if (await saveFromItem(manualTarget.uri, [entry])) setManualTarget(null);
   };
 
   if (!permission) {
@@ -332,62 +348,116 @@ export default function CameraScreen() {
         mute
       />
 
-      {/* 未処理レシートバナー */}
-      {pendingUris.length > 0 && !busy && (
-        <View style={styles.pendingBanner}>
-          <Text style={styles.pendingBannerText}>
-            未処理レシート {pendingUris.length} 件
-          </Text>
-          <View style={styles.pendingBannerActions}>
-            <TouchableOpacity
-              style={styles.pendingBtn}
-              onPress={handleProcessPending}
-            >
-              <Text style={styles.pendingBtnText}>処理する</Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={[styles.pendingBtn, styles.pendingBtnDanger]}
-              onPress={handleDiscardPending}
-            >
-              <Text style={[styles.pendingBtnText, styles.pendingBtnDangerText]}>
-                破棄
-              </Text>
-            </TouchableOpacity>
-          </View>
+      {/* 代理入力モードバナー */}
+      {proxyMode && (
+        <View style={styles.proxyBanner}>
+          <Text style={styles.proxyBannerText}>代理入力中: {proxyUser}</Text>
         </View>
       )}
 
+      {/* 中止・失敗・確認待ちの画像 */}
+      {attention.length > 0 && (
+        <TouchableOpacity style={styles.pendingBanner} onPress={() => setListOpen(true)}>
+          <Text style={styles.pendingBannerText}>要確認 {attention.length} 件</Text>
+          <Text style={styles.pendingBannerChevron}>›</Text>
+        </TouchableOpacity>
+      )}
+
       <View style={styles.overlay}>
-        {busy ? (
+        {deferred.length > 0 && !progress.running && (
+          <View style={styles.statusBox}>
+            <Text style={styles.statusText}>
+              推定待ち {deferred.length} 件（{formatClock(deferredUntil)} 以降に自動で処理）
+            </Text>
+          </View>
+        )}
+        {progress.running && (
           <View style={styles.statusBox}>
             <ActivityIndicator color="#fff" />
-            <Text style={styles.statusText}>{statusMsg}</Text>
-          </View>
-        ) : (
-          <View style={styles.buttonRow}>
-            <TouchableOpacity style={styles.shootBtn} onPress={handleShoot}>
-              <Text style={styles.shootBtnText}>撮影して記録</Text>
-            </TouchableOpacity>
-            <TouchableOpacity style={styles.galleryBtn} onPress={handlePickImage}>
-              <Text style={styles.galleryBtnText}>ギャラリーから選択</Text>
+            <Text style={styles.statusText}>
+              OCR処理中 {Math.min(progress.done + 1, progress.total)}/{progress.total}
+            </Text>
+            <TouchableOpacity style={styles.cancelOcrBtn} onPress={OcrWorker.cancel}>
+              <Text style={styles.cancelOcrBtnText}>中止</Text>
             </TouchableOpacity>
           </View>
         )}
+        <View style={styles.buttonRow}>
+          <TouchableOpacity
+            style={[styles.shootBtn, capturing && styles.btnDisabled]}
+            onPress={handleShoot}
+            disabled={capturing}
+          >
+            <Text style={styles.shootBtnText}>撮影して記録</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[styles.galleryBtn, capturing && styles.btnDisabled]}
+            onPress={handlePickImage}
+            disabled={capturing}
+          >
+            <Text style={styles.galleryBtnText}>ギャラリーから選択</Text>
+          </TouchableOpacity>
+        </View>
       </View>
 
-      {!!toast && (
-        <Animated.View
-          pointerEvents="none"
-          style={[styles.toast, { opacity: toastOpacity }]}
-        >
-          <Text style={styles.toastText}>{toast}</Text>
-        </Animated.View>
-      )}
+      <PendingReceiptsModal
+        visible={listOpen}
+        items={attention}
+        onClose={() => setListOpen(false)}
+        onResume={(item) => OcrWorker.requeue([item.uri])}
+        onResumeAll={() => {
+          OcrWorker.requeue(attention.filter((i) => i.status !== 'review').map((i) => i.uri));
+          setListOpen(false);
+        }}
+        onManual={(item) => {
+          setListOpen(false);
+          // 読み取れなかった写真は、レシートか料理かも分からないので選んでもらう。
+          // レシートを読み取って書き始めていた写真は、レシートとして入れると二重に登録しうるので出さない
+          const receiptStarted = (item.analysis?.receiptRows.length ?? 0) > 0;
+          Alert.alert('何として記録しますか？', undefined, [
+            { text: 'キャンセル', style: 'cancel' },
+            ...(receiptStarted ? [] : [{ text: 'レシート', onPress: () => setManualTarget(item) }]),
+            {
+              text: '食事',
+              onPress: () => setMealTarget({
+                item, target: { mode: 'new', photoUri: item.uri, shotAt: item.shotAt ?? Date.now(), proxyUser: item.proxyUser },
+              }),
+            },
+          ]);
+        }}
+        onReview={(item) => { setListOpen(false); setReview(item); }}
+        onDiscard={handleDiscard}
+        onDiscardAll={handleDiscardAll}
+      />
 
       <ManualEntryModal
-        imageUri={manualTarget}
+        imageUri={manualTarget?.uri ?? null}
         onClose={() => setManualTarget(null)}
         onSave={handleManualSave}
+        proxyUser={manualTarget?.proxyUser}
+      />
+
+      {/* 食事の確認（判別に困ったもの）・手入力 */}
+      <MealEditModal
+        target={mealTarget?.target ?? null}
+        onClose={() => setMealTarget(null)}
+        onSaved={() => {
+          // 確認・手入力が済んだので OCR 待ちのフォルダから外す（食事の写真は保存先に移してある）
+          if (mealTarget) ReceiptQueue.deleteReceipt(mealTarget.item.uri);
+          setMealTarget(null);
+          refresh();
+        }}
+      />
+
+      {/* 複数レシートを読み取ったときの確認・編集 */}
+      <ReceiptReviewModal
+        visible={review !== null}
+        title="読み取り結果の確認"
+        rows={review?.rows ?? []}
+        mode="confirm"
+        busy={reviewBusy}
+        onClose={() => setReview(null)}
+        onCommit={handleReviewCommit}
       />
     </View>
   );
@@ -401,10 +471,12 @@ function ManualEntryModal({
   imageUri,
   onClose,
   onSave,
+  proxyUser,
 }: {
-  imageUri: string | null;
-  onClose:  () => void;
-  onSave:   (entry: ExpenseRow) => void;
+  imageUri:   string | null;
+  onClose:    () => void;
+  onSave:     (entry: ExpenseRow) => void;
+  proxyUser?: string;
 }) {
   const [timestamp, setTimestamp]   = useState('');
   const [store, setStore]           = useState('');
@@ -431,11 +503,13 @@ function ManualEntryModal({
     setCategory('');
     setAmount('');
     setMemo('');
-    getCurrentUser().then(setCurrentUserState).catch(() => setCurrentUserState(''));
+    if (!proxyUser) {
+      getCurrentUser().then(setCurrentUserState).catch(() => setCurrentUserState(''));
+    }
     CategoryService.getCategories()
       .then(setCategories)
       .catch(() => setCategories([]));
-  }, [imageUri]);
+  }, [imageUri, proxyUser]);
 
   if (!imageUri) return null;
 
@@ -455,8 +529,8 @@ function ManualEntryModal({
     }
     onSave({
       timestamp,
-      source:        'manual',
-      user:          currentUser,
+      source:        proxyUser ? 'proxy_manual' : 'manual',
+      user:          proxyUser ?? currentUser,
       store:         store.trim(),
       category:      category.trim(),
       amount:        amt,
@@ -507,74 +581,80 @@ function ManualEntryModal({
     >
       <SafeAreaView style={{ flex: 1, backgroundColor: '#fff' }}>
         <View style={styles.modalHeader}>
-          <Text style={styles.modalHeaderTitle}>手動入力</Text>
+          <Text style={styles.modalHeaderTitle}>
+            {proxyUser ? `手動入力（${proxyUser}の代理）` : '手動入力'}
+          </Text>
           <Button title="閉じる" onPress={onClose} />
         </View>
 
-        <ScrollView contentContainerStyle={styles.manualScroll}>
-          <Image
-            source={{ uri: imageUri }}
-            style={styles.manualImage}
-            resizeMode="contain"
-          />
-
-          <View style={styles.fieldBox}>
-            <Text style={styles.fieldLabel}>日時</Text>
-            <TextInput
-              style={styles.fieldInput}
-              value={timestamp}
-              onChangeText={setTimestamp}
-              placeholder="YYYY/MM/DD HH:MM:SS"
-            />
+        {/* Modal 内では Android の adjustResize が効かないため、キーボードぶんの高さを
+            自前で削る。包まないと下部の金額・メモがキーボードに隠れて見えない
+            （明細編集・読み取り確認モーダルと同じ対策） */}
+        <KeyboardAvoidingView style={styles.fill} behavior="height">
+          {/* 入力中も見えるよう、画像はスクロールさせず上部に固定する */}
+          <View style={styles.manualImageBox}>
+            <ZoomableImage uri={imageUri} height={220} />
           </View>
+          <ScrollView
+            style={styles.fill}
+            contentContainerStyle={styles.manualScroll}
+            keyboardShouldPersistTaps="handled"
+          >
+            <View style={styles.fieldBox}>
+              <Text style={styles.fieldLabel}>日時</Text>
+              <TextInput
+                style={styles.fieldInput}
+                value={timestamp}
+                onChangeText={setTimestamp}
+                placeholder="YYYY/MM/DD HH:MM:SS"
+              />
+            </View>
 
-          <View style={styles.fieldBox}>
-            <Text style={styles.fieldLabel}>店舗</Text>
-            <TextInput
-              style={styles.fieldInput}
-              value={store}
-              onChangeText={setStore}
-            />
-          </View>
+            <View style={styles.fieldBox}>
+              <Text style={styles.fieldLabel}>店舗</Text>
+              <TextInput
+                style={styles.fieldInput}
+                value={store}
+                onChangeText={setStore}
+              />
+            </View>
 
-          <View style={styles.fieldBox}>
-            <Text style={styles.fieldLabel}>カテゴリ</Text>
-            <TouchableOpacity
-              style={styles.pickerButton}
-              onPress={() => setCategoryPickerOpen(true)}
-            >
-              <Text style={styles.pickerButtonText}>
-                {category || '(未選択)'} ▾
-              </Text>
-            </TouchableOpacity>
-          </View>
+            <View style={styles.fieldBox}>
+              <Text style={styles.fieldLabel}>カテゴリ</Text>
+              <TouchableOpacity
+                style={styles.pickerButton}
+                onPress={() => setCategoryPickerOpen(true)}
+              >
+                <Text style={styles.pickerButtonText}>
+                  {category || '(未選択)'} ▾
+                </Text>
+              </TouchableOpacity>
+            </View>
 
-          <View style={styles.fieldBox}>
-            <Text style={styles.fieldLabel}>金額</Text>
-            <TextInput
-              style={styles.fieldInput}
-              value={amount}
-              onChangeText={setAmount}
-              keyboardType="number-pad"
-            />
-          </View>
+            <View style={styles.fieldBox}>
+              <Text style={styles.fieldLabel}>金額</Text>
+              <TextInput
+                style={styles.fieldInput}
+                value={amount}
+                onChangeText={setAmount}
+                keyboardType="number-pad"
+              />
+            </View>
 
-          <View style={styles.fieldBox}>
-            <Text style={styles.fieldLabel}>メモ</Text>
-            <TextInput
-              style={[styles.fieldInput, { minHeight: 60, textAlignVertical: 'top' }]}
-              value={memo}
-              onChangeText={setMemo}
-              multiline
-            />
-          </View>
+            <View style={styles.fieldBox}>
+              <Text style={styles.fieldLabel}>メモ</Text>
+              <TextInput
+                style={[styles.fieldInput, { minHeight: 60, textAlignVertical: 'top' }]}
+                value={memo}
+                onChangeText={setMemo}
+                multiline
+              />
+            </View>
 
-          <View style={{ height: 8 }} />
-          <Button title="保存" onPress={handleSave} />
-          <Text style={styles.manualNote}>
-            ※ 保存後にレシート画像は削除されます
-          </Text>
-        </ScrollView>
+            <View style={{ height: 8 }} />
+            <Button title="保存" onPress={handleSave} />
+          </ScrollView>
+        </KeyboardAvoidingView>
       </SafeAreaView>
 
       {/* カテゴリ選択モーダル */}
@@ -666,31 +746,17 @@ function ManualEntryModal({
 
 // ─── utils ───────────────────────────────────────────────────────────────────
 
-/**
- * レシートから抽出した日付・時刻で 'YYYY/MM/DD HH:MM:SS' 形式の timestamp を作る。
- */
-function formatTimestamp(receiptDate: string, receiptTime?: string): string {
-  const now = new Date();
-  const datePart = /^\d{4}-\d{2}-\d{2}$/.test(receiptDate)
-    ? receiptDate.replace(/-/g, '/')
-    : `${now.getFullYear()}/${pad(now.getMonth() + 1)}/${pad(now.getDate())}`;
-  let timePart: string;
-  if (receiptTime && /^\d{1,2}:\d{2}(:\d{2})?$/.test(receiptTime)) {
-    const [h, m, s] = receiptTime.split(':');
-    timePart = `${pad(Number(h))}:${pad(Number(m))}:${pad(Number(s ?? 0))}`;
-  } else {
-    timePart = `${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
-  }
-  return `${datePart} ${timePart}`;
-}
-
 function pad(n: number): string {
   return String(n).padStart(2, '0');
 }
 
-function summarizeItems(items?: { name: string; price: number }[]): string {
-  if (!items || items.length === 0) return '';
-  return items.map((it) => `${it.name}:${it.price}`).join(', ');
+/** 'M/D HH:MM'（今日なら 'HH:MM'） */
+function formatClock(ms: number | null): string {
+  if (ms === null) return '';
+  const d = new Date(ms);
+  const now = new Date();
+  const hm = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  return d.toDateString() === now.toDateString() ? hm : `${d.getMonth() + 1}/${d.getDate()} ${hm}`;
 }
 
 const styles = StyleSheet.create({
@@ -716,11 +782,20 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     paddingVertical:   12,
     borderRadius:      8,
+    marginBottom:      16,
   },
   statusText: {
     color:    '#fff',
     fontSize: 14,
   },
+  cancelOcrBtn: {
+    borderWidth:  1,
+    borderColor:  'rgba(255,255,255,0.6)',
+    borderRadius: 14,
+    paddingHorizontal: 12,
+    paddingVertical:    4,
+  },
+  cancelOcrBtnText: { color: '#fff', fontSize: 13, fontWeight: 'bold' },
   buttonRow: {
     alignItems: 'center',
     gap: 12,
@@ -748,6 +823,7 @@ const styles = StyleSheet.create({
     color: '#fff',
     fontSize: 14,
   },
+  btnDisabled: { opacity: 0.5 },
   center: {
     flex: 1,
     backgroundColor: '#fff',
@@ -761,29 +837,6 @@ const styles = StyleSheet.create({
     fontSize:  14,
     color:     '#666',
   },
-  toast: {
-    position: 'absolute',
-    top:      48,
-    left:     16,
-    right:    16,
-    backgroundColor: 'rgba(34,197,94,0.95)',
-    borderRadius:    12,
-    paddingHorizontal: 20,
-    paddingVertical:   16,
-    shadowColor:    '#000',
-    shadowOpacity:  0.3,
-    shadowRadius:   8,
-    shadowOffset:   { width: 0, height: 4 },
-    elevation:      8,
-  },
-  toastText: {
-    color:      '#fff',
-    fontSize:   16,
-    fontWeight: 'bold',
-    textAlign:  'center',
-    lineHeight: 22,
-  },
-
   pendingBanner: {
     position: 'absolute',
     top: 48,
@@ -798,34 +851,55 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     elevation: 6,
   },
+  headerRight:    { flexDirection: 'row', alignItems: 'center' },
+  headerGear:     { paddingRight: 16, paddingLeft: 4, paddingVertical: 4 },
+  headerGearText: { fontSize: 20 },
+  proxyHeaderBtn: {
+    marginRight: 12,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: '#888',
+  },
+  proxyHeaderBtnActive: {
+    backgroundColor: '#16a34a',
+    borderColor: '#16a34a',
+  },
+  proxyHeaderBtnText: {
+    fontSize: 13,
+    color: '#444',
+  },
+  proxyHeaderBtnTextActive: {
+    color: '#fff',
+    fontWeight: 'bold',
+  },
+  proxyBanner: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    backgroundColor: 'rgba(22, 163, 74, 0.9)',
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    alignItems: 'center',
+    zIndex: 10,
+  },
+  proxyBannerText: {
+    color: '#fff',
+    fontSize: 14,
+    fontWeight: 'bold',
+  },
   pendingBannerText: {
     color: '#1f2937',
     fontSize: 14,
     fontWeight: 'bold',
     flexShrink: 1,
   },
-  pendingBannerActions: {
-    flexDirection: 'row',
-    gap: 8,
-  },
-  pendingBtn: {
-    backgroundColor: '#fff',
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    borderRadius: 6,
-  },
-  pendingBtnText: {
+  pendingBannerChevron: {
     color: '#1f2937',
-    fontSize: 13,
+    fontSize: 22,
     fontWeight: 'bold',
-  },
-  pendingBtnDanger: {
-    backgroundColor: '#fff',
-    borderWidth: 1,
-    borderColor: '#dc2626',
-  },
-  pendingBtnDangerText: {
-    color: '#dc2626',
   },
 
   // 手動入力モーダル
@@ -839,15 +913,9 @@ const styles = StyleSheet.create({
     borderBottomColor: '#eee',
   },
   modalHeaderTitle: { fontSize: 18, fontWeight: 'bold' },
+  fill: { flex: 1 },
   manualScroll: { padding: 16 },
-  manualImage: {
-    width: '100%',
-    height: 240,
-    backgroundColor: '#f3f4f6',
-    borderRadius: 8,
-    marginBottom: 16,
-  },
-  manualNote: { fontSize: 11, color: '#888', marginTop: 12, textAlign: 'center' },
+  manualImageBox: { paddingHorizontal: 16, paddingTop: 12 },
 
   fieldBox:   { marginBottom: 12 },
   fieldLabel: { fontSize: 12, color: '#666', marginBottom: 4 },
